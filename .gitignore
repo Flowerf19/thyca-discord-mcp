@@ -8,3 +8,6 @@ dist/
 build/
 .env
 audit.jsonl
+outbox.jsonl
+outbox_state.json
+outbox_state.json.tmp

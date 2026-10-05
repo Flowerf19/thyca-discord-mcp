@@ -56,6 +56,15 @@ class TaskRegistry:
             except asyncio.CancelledError:
                 pass
 
+    async def unregister(self, name: str) -> None:
+        """Stop a task (waiting for it) and remove it from the registry.
+
+        Unknown names raise KeyError; unregistering an idle task just removes it.
+        """
+        await self.stop(name)
+        del self._loops[name]
+        del self._intervals[name]
+
     def status(self, name: str) -> TaskInfo:
         loop = self._get(name)
         return TaskInfo(
