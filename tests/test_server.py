@@ -3,9 +3,20 @@
 Uses the native FastMCP public API (``list_tools``/``call_tool``) and the real
 installed lifespan (``mcp.settings.lifespan``) with a fake Discord bot — no
 network, no real .env/outbox/audit files (all paths are tmp fixtures).
+
+v5 isolation: this module covers the base 12-tool MCP protocol only. The
+``running_server`` helper (and every direct-lifespan test) patches
+``thyca_discord_mcp.server.Responder`` with ``FakeResponder`` and parks the
+always-on auto loops before their first tick, so no worker logic runs here.
+``FakeResponder.guard_ack`` is a deliberate no-op: these tests isolate the
+underlying ack monotonic API only — the mandatory production guard is proven
+with the real Responder in tests/test_server_responder.py. The patch lives
+only in this module (never a global autouse fixture) so it cannot hide the
+real worker elsewhere.
 """
 
 import asyncio
+import hashlib
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -47,19 +58,25 @@ EXPECTED_TOOLS = [
 
 
 class FakeUser:
-    def __init__(self, uid, display_name):
+    def __init__(self, uid, display_name, bot=False):
         self.id = uid
         self.display_name = display_name
+        self.bot = bot
 
 
 class FakeMessage:
-    def __init__(self, mid, author, content="", channel_id=CHANNEL_ID, guild_id=GUILD_ID):
+    def __init__(
+        self, mid, author, content="", channel_id=CHANNEL_ID, guild_id=GUILD_ID, reference=None
+    ):
         self.id = mid
         self.author = author
         self.content = content
         self.channel = SimpleNamespace(id=channel_id)
         self.guild = SimpleNamespace(id=guild_id) if guild_id is not None else None
-        self.jump_url = f"https://discord/ch/{channel_id}/{mid}"
+        # Native SDK jump-URL shape (verified discord.py format); DMs use @me.
+        scope = guild_id if guild_id is not None else "@me"
+        self.jump_url = f"https://discord.com/channels/{scope}/{channel_id}/{mid}"
+        self.reference = reference
 
 
 class FakeGuild:
@@ -86,7 +103,7 @@ class FakeBot:
         ready_exc=None,
         close_exc=None,
     ):
-        self.user = user or FakeUser(BOT_UID, "ThycaBot")
+        self.user = user or FakeUser(BOT_UID, "ThycaBot", bot=True)
         self._guild = guild
         self._fetch_map = dict(fetch_map or {})
         self._connect_exc = connect_exc
@@ -189,13 +206,14 @@ def make_text_channel(cid, guild_id=GUILD_ID, history=None):
     channel.guild = SimpleNamespace(id=guild_id)
     sent: list[FakeMessage] = []
 
-    async def fake_send(content):
+    async def fake_send(content, **kwargs):
         msg = FakeMessage(
             9000 + len(sent),
-            FakeUser(BOT_UID, "ThycaBot"),
+            FakeUser(BOT_UID, "ThycaBot", bot=True),
             content,
             channel_id=cid,
             guild_id=guild_id,
+            reference=kwargs.get("reference"),
         )
         sent.append(msg)
         return msg
@@ -206,26 +224,100 @@ def make_text_channel(cid, guild_id=GUILD_ID, history=None):
     return channel
 
 
-@pytest.fixture
-def settings(tmp_path):
-    return Settings(
+class FakeResponder:
+    """No-op worker stand-in: keeps v4 MCP-protocol tests isolated (see module doc)."""
+
+    def __init__(self, settings, bot):
+        self.settings = settings
+        self.bot = bot
+        self.ticks = 0
+        self.closed = False
+
+    async def tick(self):
+        self.ticks += 1
+        return {"status": "idle"}
+
+    async def close(self):
+        self.closed = True
+
+    def guard_ack(self, up_to_seq):  # noqa: ARG002 - signature mirrors Responder
+        return None  # no-op: v4 file isolates the underlying ack monotonic API only
+
+    def correlated_job(self, source_message_id, job_ref, channel_id):
+        raise AssertionError("v4 isolation: correlated send is covered in test_server_responder")
+
+
+class FailingCloseResponder(FakeResponder):
+    """FakeResponder whose close() fails: cleanup-failure shutdown coverage."""
+
+    async def close(self):
+        raise RuntimeError("responder close boom")
+
+
+class RefusingGuardResponder(FakeResponder):
+    """FakeResponder whose guard always refuses: proves responder state clears."""
+
+    def guard_ack(self, up_to_seq):  # noqa: ARG002 - signature mirrors Responder
+        raise ValueError("ack beyond safe prefix")
+
+
+class FailingRemoveListenerBot(FakeBot):
+    """FakeBot whose remove_listener fails: teardown-isolation coverage."""
+
+    def remove_listener(self, func, name):
+        self.events.append("remove_listener")
+        raise RuntimeError("remove boom")
+
+
+def _settings_kwargs(tmp_path):
+    """Fixture kwargs: tmp/fake-only, immune to ambient .env and env vars."""
+    return dict(
+        # No real dotenv/config reads: constructor pins everything the suite
+        # depends on (init args beat env, and _env_file=None disables .env).
+        _env_file=None,
         discord_token="test-token",
         owner_uid=OWNER_UID,
         guild_id=GUILD_ID,
         default_channel_id=CHANNEL_ID,
+        session_id="discord-test",
         audit_path=tmp_path / "audit.jsonl",
         outbox_path=tmp_path / "outbox.jsonl",
         outbox_state_path=tmp_path / "outbox_state.json",
         watch_channel_ids=[CHANNEL_ID],
+        responder_check_seconds=1.0,
+        recovery_poll_seconds=30.0,
+        # v5 worker paths stay tmp-only even though FakeResponder never reads them.
+        thyca_session_mapping_path=tmp_path / "discord_session.json",
+        delivery_state_path=tmp_path / "delivery_state.json",
     )
+
+
+def _make_settings(tmp_path, **overrides):
+    kwargs = _settings_kwargs(tmp_path)
+    kwargs.update(overrides)
+    return Settings(**kwargs)
+
+
+@pytest.fixture
+def settings(tmp_path):
+    return _make_settings(tmp_path)
 
 
 @asynccontextmanager
 async def running_server(monkeypatch, settings, bot):
-    """Enter the real installed lifespan with build_bot patched to a fake."""
+    """Enter the real installed lifespan with build_bot + Responder patched to fakes.
+
+    The always-on auto loops are parked immediately after enter: there is no
+    await between their start() calls inside the lifespan and these stops, so
+    their first tick can never run. v4 protocol assertions stay race-free;
+    default-on auto behavior is proven in tests/test_server_responder.py.
+    """
     monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
+        for name in ("auto-reply", "auto-reply-recovery"):
+            await ctx["tasks"].stop(name, allow_protected=True)
         yield mcp, ctx, bot
 
 
@@ -321,7 +413,8 @@ async def test_add_poll_task_default_channel(settings, monkeypatch):
         assert status["running"] is True
         assert status["interval_seconds"] == 60.0
         names = {t["name"] for t in await call_json(mcp, "list_tasks")}
-        assert names == {"heartbeat", "poll-main"}
+        # v5: the two protected auto loops are always registered by default.
+        assert names == {"heartbeat", "auto-reply", "auto-reply-recovery", "poll-main"}
         assert await call_json(mcp, "remove_poll_task", {"name": "poll-main"}) == {
             "removed": "poll-main"
         }
@@ -483,7 +576,7 @@ async def test_poll_tags_self_owner_other(settings, monkeypatch):
         hstate["messages"] = [  # newest-first, as Discord returns them
             FakeMessage(203, _other(), "from other"),
             FakeMessage(202, _owner(), "from owner"),
-            FakeMessage(201, FakeUser(BOT_UID, "ThycaBot"), "from self"),
+            FakeMessage(201, FakeUser(BOT_UID, "ThycaBot", bot=True), "from self"),
         ]
         await tick()
         got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
@@ -540,7 +633,9 @@ async def test_realtime_capture_and_filtering(settings, monkeypatch):
         await handler(FakeMessage(1, _owner(), "do it"))  # kept: owner
         await handler(FakeMessage(2, _other(), ""))  # kept: empty content
         await handler(FakeMessage(7, _other(), None))  # kept: None content -> ""
-        await handler(FakeMessage(3, FakeUser(BOT_UID, "ThycaBot"), "self"))  # dropped: self
+        await handler(
+            FakeMessage(3, FakeUser(BOT_UID, "ThycaBot", bot=True), "self")
+        )  # dropped: self
         await handler(FakeMessage(4, _other(), "x", guild_id=999))  # dropped: scope
         await handler(FakeMessage(5, _other(), "x", guild_id=None))  # dropped: DM
         await handler(FakeMessage(6, _other(), "x", channel_id=123))  # dropped: unwatched
@@ -627,6 +722,7 @@ async def test_send_message_scoped_helper_regression(settings, monkeypatch):
 async def test_lifespan_startup_order_and_listener(settings, monkeypatch):
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         # Listener registered after build, before login/connect; login before connect.
@@ -634,6 +730,10 @@ async def test_lifespan_startup_order_and_listener(settings, monkeypatch):
         assert "on_message" in bot.listeners
         assert ctx["bot"] is bot
         assert ctx["tasks"].status("heartbeat").running is True
+        # v5 always-on: real Responder slot + both protected loops running.
+        assert isinstance(ctx["responder"], FakeResponder)
+        assert ctx["tasks"].status("auto-reply").running is True
+        assert ctx["tasks"].status("auto-reply-recovery").running is True
     assert ctx["tasks"].status("heartbeat").running is False
     assert "remove_listener" in bot.events
     assert bot.is_closed()
@@ -651,6 +751,7 @@ async def test_lifespan_early_gateway_failure(settings, monkeypatch):
 
     bot.wait_until_ready = hang_ready
     monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="gateway failed before ready"):
         async with mcp.settings.lifespan(mcp):
@@ -679,6 +780,7 @@ async def test_lifespan_login_failure_closes_bot_and_listener(settings, monkeypa
         login_exc=discord.LoginFailure("bad token"),
     )
     monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(discord.LoginFailure, match="bad token"):
         async with mcp.settings.lifespan(mcp):
@@ -703,6 +805,7 @@ async def test_lifespan_ready_failure_cleans_gateway(settings, monkeypatch):
 
     bot.connect = spy_connect
     monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="ready boom"):
         async with mcp.settings.lifespan(mcp):
@@ -741,6 +844,7 @@ async def test_lifespan_cancel_during_readiness_wait_cleans_all(settings, monkey
     bot.wait_until_ready = hang_ready
     bot.connect = spy_connect
     monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
     mcp = create_server(settings)
 
     async def _run():
@@ -771,6 +875,7 @@ async def test_lifespan_cancel_during_login_cleans_all(settings, monkeypatch):
 
     bot.login = gated_login
     monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
     mcp = create_server(settings)
 
     async def _run():
@@ -803,6 +908,7 @@ async def test_lifespan_close_error_still_settles_tasks(settings, monkeypatch):
 
     bot.connect = spy_connect
     monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="close boom"):
         async with mcp.settings.lifespan(mcp) as ctx:
@@ -830,6 +936,7 @@ async def test_lifespan_startup_refuses_state_behind_log(settings, monkeypatch):
     log_before = settings.outbox_path.read_bytes()
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(OutboxError, match="behind the log"):
         async with mcp.settings.lifespan(mcp):
@@ -852,6 +959,7 @@ async def test_lifespan_startup_refuses_malformed_log(settings, monkeypatch):
     log_before = settings.outbox_path.read_bytes()
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(OutboxError, match="corrupt outbox log"):
         async with mcp.settings.lifespan(mcp):
@@ -869,7 +977,9 @@ async def test_lifespan_shutdown_stops_dynamic_loops(settings, monkeypatch):
     async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
         await call_json(mcp, "add_poll_task", {"name": "p1"})
         await call_json(mcp, "add_poll_task", {"name": "p2"})
-        assert all(t.running for t in ctx["tasks"].list_tasks())
+        # running_server parks the always-on auto loops; user loops still run.
+        running = {t.name for t in ctx["tasks"].list_tasks() if t.running}
+        assert running == {"heartbeat", "p1", "p2"}
     assert all(not t.running for t in ctx["tasks"].list_tasks())
     for name in ("heartbeat", "p1", "p2"):
         task = ctx["tasks"]._loops[name].get_task()
@@ -965,7 +1075,12 @@ async def test_add_poll_task_refuses_corrupt_state(settings, monkeypatch):
         settings.outbox_state_path.write_text("corrupt{", encoding="utf-8")
         with pytest.raises(ToolError, match="corrupt"):
             await mcp.call_tool("add_poll_task", {"name": "p"})
-        assert {t.name for t in ctx["tasks"].list_tasks()} == {"heartbeat"}
+        # v5: the two protected auto loops are always registered by default.
+        assert {t.name for t in ctx["tasks"].list_tasks()} == {
+            "heartbeat",
+            "auto-reply",
+            "auto-reply-recovery",
+        }
     assert find_audit(read_audit(settings), "add_poll_task", False)
 
 
@@ -981,3 +1096,341 @@ async def test_fresh_outbox_unaffected_by_guard(settings, monkeypatch):
         await tick()  # first-tick path, cursor advances from nothing
         assert get_poll_cursor(settings.outbox_state_path, CHANNEL_ID) == 5
         assert await call_json(mcp, "ack_outbox", {"up_to_seq": 1}) == {"acked": 1}
+
+
+# --- v5 phase 1: capture metadata (author_is_bot, reply_to_message_id) --------
+
+
+def _other_bot(uid=888, name="OtherBot"):
+    return FakeUser(uid, name, bot=True)
+
+
+async def test_realtime_other_bot_captured_with_true(settings, monkeypatch):
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        (handler,) = bot.listeners["on_message"]
+        await handler(FakeMessage(11, _owner(), "human owner"))
+        await handler(FakeMessage(12, _other(), "human other"))
+        await handler(FakeMessage(13, _other_bot(), "bot beep"))
+        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        rows = [(e["message_id"], e["actor_kind"], e["author_is_bot"]) for e in got["entries"]]
+        assert rows == [
+            (11, "owner", False),
+            (12, "other", False),
+            (13, "other", True),  # other bots still captured (v4 contract)
+        ]
+        assert all(e["reply_to_message_id"] is None for e in got["entries"])
+
+
+async def test_realtime_self_excluded_regardless_of_bot_flag(settings, monkeypatch):
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        (handler,) = bot.listeners["on_message"]
+        await handler(FakeMessage(21, FakeUser(BOT_UID, "ThycaBot", bot=True), "self"))
+        await handler(FakeMessage(22, FakeUser(BOT_UID, "ThycaBot", bot=False), "self"))
+        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        assert got["entries"] == []
+        assert got["latest"] == 0
+
+
+async def test_realtime_reply_reference_recorded(settings, monkeypatch):
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        (handler,) = bot.listeners["on_message"]
+        ref = SimpleNamespace(message_id=31)
+        await handler(FakeMessage(32, _other(), "reply", reference=ref))
+        await handler(FakeMessage(33, _other(), "top-level"))
+        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        assert [(e["message_id"], e["reply_to_message_id"]) for e in got["entries"]] == [
+            (32, 31),
+            (33, None),
+        ]
+        assert [e["author_is_bot"] for e in got["entries"]] == [False, False]
+
+
+async def test_poll_self_and_other_bots_kept_with_true(settings, monkeypatch):
+    hist, _calls, hstate = make_history()
+    channel = make_text_channel(CHANNEL_ID, history=hist)
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        _, tick = await add_and_hold(mcp, ctx, "p")
+        hstate["messages"] = [  # newest-first, as Discord returns them
+            FakeMessage(43, _other_bot(), "other bot"),
+            FakeMessage(42, _owner(), "owner"),
+            FakeMessage(41, FakeUser(BOT_UID, "ThycaBot", bot=True), "self"),
+        ]
+        await tick()
+        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        assert [(e["message_id"], e["actor_kind"], e["author_is_bot"]) for e in got["entries"]] == [
+            (41, "self", True),  # poll keeps self, unlike realtime
+            (42, "owner", False),
+            (43, "other", True),
+        ]
+
+
+async def test_poll_reply_reference_recorded(settings, monkeypatch):
+    hist, _calls, hstate = make_history()
+    channel = make_text_channel(CHANNEL_ID, history=hist)
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        _, tick = await add_and_hold(mcp, ctx, "p")
+        hstate["messages"] = [  # newest-first, as Discord returns them
+            FakeMessage(52, _other(), "top", reference=None),
+            FakeMessage(51, _other(), "reply", reference=SimpleNamespace(message_id=50)),
+        ]
+        await tick()
+        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        assert [(e["message_id"], e["reply_to_message_id"]) for e in got["entries"]] == [
+            (51, 50),
+            (52, None),
+        ]
+
+
+# --- v5: reserved system tasks, protected loops, metadata-only send audit ----
+
+
+@pytest.mark.parametrize("reserved", ["auto-reply", "auto-reply-recovery"])
+async def test_add_poll_task_rejects_reserved_auto_names(settings, monkeypatch, reserved):
+    # Reserved-name rejection runs before channel resolution: even an
+    # out-of-guild channel reports "reserved", and nothing is registered.
+    evil = make_text_channel(666, guild_id=999)
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID), 666: evil}))
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        with pytest.raises(ToolError, match="reserved"):
+            await mcp.call_tool("add_poll_task", {"name": reserved, "channel_id": 666})
+        assert {t.name for t in ctx["tasks"].list_tasks()} == {
+            "heartbeat",
+            "auto-reply",
+            "auto-reply-recovery",
+        }
+    assert find_audit(read_audit(settings), "add_poll_task", False)
+
+
+async def test_stop_task_refuses_protected_loops(settings, monkeypatch):
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
+    # Unparked lifespan: the protected loops must be running to prove the
+    # refusal is about protection, not idleness.
+    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
+    mcp = create_server(settings)
+    async with mcp.settings.lifespan(mcp) as ctx:
+        assert ctx["tasks"].status("auto-reply").running is True
+        with pytest.raises(ToolError, match="protected"):
+            await mcp.call_tool("stop_task", {"name": "auto-reply"})
+        with pytest.raises(ToolError, match="protected"):
+            await mcp.call_tool("stop_task", {"name": "auto-reply-recovery"})
+        assert ctx["tasks"].status("auto-reply").running is True
+        assert ctx["tasks"].status("auto-reply-recovery").running is True
+    assert find_audit(read_audit(settings), "stop_task", False)
+
+
+async def test_remove_poll_task_refuses_protected_loops(settings, monkeypatch):
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        with pytest.raises(ToolError, match="protected"):
+            await mcp.call_tool("remove_poll_task", {"name": "auto-reply"})
+        with pytest.raises(ToolError, match="protected"):
+            await mcp.call_tool("remove_poll_task", {"name": "auto-reply-recovery"})
+        assert {t.name for t in ctx["tasks"].list_tasks()} == {
+            "heartbeat",
+            "auto-reply",
+            "auto-reply-recovery",
+        }
+    assert find_audit(read_audit(settings), "remove_poll_task", False)
+
+
+async def test_start_task_restarts_stopped_protected_loop(settings, monkeypatch):
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        # running_server parks the auto loops; the tool may restart them.
+        assert ctx["tasks"].status("auto-reply").running is False
+        status = await call_json(mcp, "start_task", {"name": "auto-reply"})
+        assert status["running"] is True
+        with pytest.raises(ToolError, match="already running"):
+            await mcp.call_tool("start_task", {"name": "auto-reply"})
+
+
+async def test_send_message_audit_is_metadata_only(settings, monkeypatch):
+    channel = make_text_channel(CHANNEL_ID)
+    evil = make_text_channel(666, guild_id=999)
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel, 666: evil}))
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        res = await call_json(mcp, "send_message", {"content": "hi SECRET_CANARY_X7"})
+        assert res["channel_id"] == CHANNEL_ID
+        assert set(res) == {"message_id", "channel_id", "jump_url"}  # legacy shape kept
+        with pytest.raises(ToolError, match="refusing to send outside scoped guild"):
+            await mcp.call_tool(
+                "send_message", {"content": "nope SECRET_CANARY_X7", "channel_id": 666}
+            )
+    audit_text = settings.audit_path.read_text(encoding="utf-8")
+    assert "SECRET_CANARY_X7" not in audit_text
+    assert '"content":' not in audit_text  # no raw content key in send audits
+    ok_recs = find_audit(read_audit(settings), "send_message", True)
+    assert len(ok_recs) == 1
+    assert ok_recs[0]["args"]["content_len"] == len("hi SECRET_CANARY_X7")
+    assert (
+        ok_recs[0]["args"]["content_sha256"] == hashlib.sha256(b"hi SECRET_CANARY_X7").hexdigest()
+    )
+    assert ok_recs[0]["args"]["channel_id"] == CHANNEL_ID
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"source_message_id": 123}, {"job_ref": "job-1-2-3"}],
+)
+async def test_send_message_rejects_partial_correlation(settings, monkeypatch, extra):
+    channel = make_text_channel(CHANNEL_ID)
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        with pytest.raises(ToolError, match="must be paired"):
+            await mcp.call_tool("send_message", {"content": "hi", **extra})
+        assert channel.sent == []  # rejected before any SDK send
+    recs = find_audit(read_audit(settings), "send_message", False)
+    assert len(recs) == 1
+    assert recs[0]["args"]["error_kind"] == "validation_error"
+    assert recs[0]["error"] == "send_message failed kind=validation_error"
+
+
+# --- v5 fixes: cleanup never replaces the primary outcome (finding 3) -------
+
+
+async def test_lifespan_cancel_during_login_with_cleanup_failure_stays_cancelled(
+    settings, monkeypatch
+):
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
+    login_entered = asyncio.Event()
+
+    async def gated_login(token):  # noqa: ARG002 - signature mirrors discord.py
+        bot.events.append("login")
+        login_entered.set()  # lifespan is now parked inside login
+        await asyncio.sleep(3600)
+
+    bot.login = gated_login
+    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FailingCloseResponder)
+    mcp = create_server(settings)
+
+    async def _run():
+        async with mcp.settings.lifespan(mcp):
+            pass  # pragma: no cover - cancelled while logging in
+
+    task = asyncio.create_task(_run(), name="lifespan-under-test")
+    await asyncio.wait_for(login_entered.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await task
+    assert task.cancelled()  # the cleanup failure did NOT replace the cancellation
+    secondaries = getattr(excinfo.value, "thyca_cleanup_errors", ())
+    assert len(secondaries) == 1
+    assert isinstance(secondaries[0], RuntimeError)
+    assert "responder close boom" in str(secondaries[0])
+    assert bot.is_closed()
+    assert bot.listeners.get("on_message") == []
+    assert bot.events == ["add_listener", "login", "remove_listener", "close"]
+    assert _leftover_gateway_tasks() == []
+
+
+async def test_lifespan_startup_failure_with_cleanup_failures_keeps_primary(settings, monkeypatch):
+    bot = FakeBot(
+        FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}),
+        login_exc=discord.LoginFailure("bad token"),
+        close_exc=RuntimeError("bot close boom"),
+    )
+    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FailingCloseResponder)
+    mcp = create_server(settings)
+    with pytest.raises(discord.LoginFailure, match="bad token") as excinfo:
+        async with mcp.settings.lifespan(mcp):
+            pass  # pragma: no cover - login must raise first
+    # Both cleanup failures retained as secondary evidence; primary intact.
+    secondaries = getattr(excinfo.value, "thyca_cleanup_errors", ())
+    assert [str(e) for e in secondaries] == ["responder close boom", "bot close boom"]
+    assert bot.is_closed()
+    assert bot.listeners.get("on_message") == []
+    assert bot.events == ["add_listener", "login", "remove_listener", "close"]
+    assert _leftover_gateway_tasks() == []
+
+
+# --- v5 fixes: teardown steps independently protected (finding 4) ------------
+
+
+async def test_lifespan_listener_removal_failure_still_tears_down(settings, monkeypatch):
+    channel = make_text_channel(CHANNEL_ID)
+    bot = FailingRemoveListenerBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
+    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("thyca_discord_mcp.server.Responder", RefusingGuardResponder)
+    mcp = create_server(settings)
+    with pytest.raises(RuntimeError, match="remove boom"):
+        async with mcp.settings.lifespan(mcp):
+            # Guard active while running: the refusing responder rejects ACK.
+            with pytest.raises(ToolError, match="beyond safe prefix"):
+                await mcp.call_tool("ack_outbox", {"up_to_seq": 0})
+    # Removal failed, but every remaining step still ran: bot closed, no
+    # gateway leaks, and BOTH state entries cleared (send sees no bot, ack
+    # sees no guard). The cleanup failure still surfaces on a clean exit.
+    assert bot.is_closed()
+    assert "close" in bot.events
+    assert _leftover_gateway_tasks() == []
+    with pytest.raises(ToolError, match="not ready"):
+        await mcp.call_tool("send_message", {"content": "x"})
+    assert await call_json(mcp, "ack_outbox", {"up_to_seq": 0}) == {"acked": 0}
+
+
+# --- v5 fixes: tmp/fake-only settings, no real dotenv/env reads (finding 8) --
+
+
+def test_settings_fixture_disables_dotenv_source(tmp_path, monkeypatch):
+    """The fixture construction must not select or read any dotenv file."""
+    import pathlib
+
+    from pydantic_settings.sources import DotEnvSettingsSource
+
+    selected: list = []
+    env_stats: list = []
+    file_reads: list = []
+    orig_init = DotEnvSettingsSource.__init__
+    orig_is_file = pathlib.Path.is_file
+
+    def spy_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        selected.append(self.env_file)
+
+    def spy_is_file(self):
+        if self.name == ".env":
+            env_stats.append(str(self))
+        return orig_is_file(self)
+
+    def no_real_reads(self, *args, **kwargs):
+        # Guard: the control below must attempt (not perform) a real read.
+        file_reads.append(True)
+        return {}
+
+    monkeypatch.setattr(DotEnvSettingsSource, "__init__", spy_init)
+    monkeypatch.setattr(pathlib.Path, "is_file", spy_is_file)
+    monkeypatch.setattr(DotEnvSettingsSource, "_read_env_file", no_real_reads)
+    _make_settings(tmp_path)
+    assert selected == [None]  # dotenv source disabled
+    assert env_stats == []  # never even stats a dotenv path
+    assert file_reads == []  # zero real file reads
+
+    # Control: the same kwargs WITHOUT _env_file select the project .env and
+    # stat its path (any actual read stays blocked by the guard above).
+    selected.clear()
+    env_stats.clear()
+    file_reads.clear()
+    legacy_kwargs = _settings_kwargs(tmp_path)
+    legacy_kwargs.pop("_env_file")
+    Settings(**legacy_kwargs)
+    assert len(selected) == 1 and selected[0] is not None
+    assert env_stats != []
+
+
+def test_settings_fixture_pins_env_sensitive_defaults(tmp_path, monkeypatch):
+    """Explicit fixture values win over ambient environment variables."""
+    monkeypatch.setenv("SESSION_ID", "env-hijack")
+    monkeypatch.setenv("RESPONDER_CHECK_SECONDS", "999")
+    monkeypatch.setenv("RECOVERY_POLL_SECONDS", "999")
+    made = _make_settings(tmp_path)
+    assert made.session_id == "discord-test"
+    assert made.responder_check_seconds == 1.0
+    assert made.recovery_poll_seconds == 30.0

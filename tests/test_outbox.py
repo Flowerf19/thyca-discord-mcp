@@ -472,3 +472,133 @@ def test_build_message_entry_self_wins_on_misconfiguration():
         watch_channel_ids=[7],
     )
     assert entry is None
+
+
+def test_build_message_entry_legacy_call_omits_optional_fields():
+    # v5 capture metadata: legacy callers omit both keys; absence means
+    # unknown, never assumed human by a future worker.
+    entry = build_message_entry(
+        scope_guild_id=100,
+        guild_id=100,
+        channel_id=7,
+        message_id=55,
+        author_uid=3,
+        author_name="Rando",
+        content="hey",
+        bot_uid=1,
+        owner_uid=2,
+        watch_channel_ids=[7],
+    )
+    assert entry is not None
+    assert "author_is_bot" not in entry
+    assert "reply_to_message_id" not in entry
+
+
+def test_build_message_entry_human_and_bot_exact_bool():
+    base = {
+        "scope_guild_id": 100,
+        "guild_id": 100,
+        "channel_id": 7,
+        "message_id": 55,
+        "bot_uid": 1,
+        "owner_uid": 2,
+        "watch_channel_ids": [7],
+    }
+    human = build_message_entry(
+        **base,
+        author_uid=2,
+        author_name="Owner",
+        content="hi",
+        author_is_bot=False,
+        reply_to_message_id=None,
+    )
+    assert human is not None
+    assert human["author_is_bot"] is False
+    assert human["reply_to_message_id"] is None
+    assert human["actor_kind"] == "owner"
+
+    other_bot = build_message_entry(
+        **base,
+        author_uid=9,
+        author_name="OtherBot",
+        content="beep",
+        author_is_bot=True,
+        reply_to_message_id=None,
+    )
+    assert other_bot is not None
+    assert other_bot["author_is_bot"] is True
+    assert other_bot["reply_to_message_id"] is None
+    # UID-based actor classification is unchanged: a non-self bot is "other".
+    assert other_bot["actor_kind"] == "other"
+
+
+def test_build_message_entry_reply_reference_recorded():
+    base = {
+        "scope_guild_id": 100,
+        "guild_id": 100,
+        "channel_id": 7,
+        "message_id": 56,
+        "bot_uid": 1,
+        "owner_uid": 2,
+        "watch_channel_ids": [7],
+    }
+    reply = build_message_entry(
+        **base,
+        author_uid=3,
+        author_name="Rando",
+        content="re",
+        author_is_bot=False,
+        reply_to_message_id=55,
+    )
+    assert reply is not None
+    assert reply["reply_to_message_id"] == 55
+
+    no_ref = build_message_entry(
+        **base,
+        author_uid=3,
+        author_name="Rando",
+        content="top",
+        author_is_bot=False,
+        reply_to_message_id=None,
+    )
+    assert no_ref is not None
+    assert no_ref["reply_to_message_id"] is None
+
+
+def test_build_message_entry_self_excluded_regardless_of_bot_flag():
+    base = {
+        "scope_guild_id": 100,
+        "guild_id": 100,
+        "channel_id": 7,
+        "message_id": 55,
+        "author_uid": 1,
+        "author_name": "ThycaBot",
+        "content": "self",
+        "bot_uid": 1,
+        "owner_uid": 2,
+        "watch_channel_ids": [7],
+    }
+    assert build_message_entry(**base, author_is_bot=True) is None
+    assert build_message_entry(**base, author_is_bot=False) is None
+    assert build_message_entry(**base) is None
+
+
+def test_append_read_mixed_legacy_and_v5_entries(tmp_path):
+    outbox_path, state_path = _paths(tmp_path)
+    legacy = append_entry(outbox_path, state_path, **_fields(message_id=101))
+    assert "author_is_bot" not in legacy
+    assert "reply_to_message_id" not in legacy
+    v5 = append_entry(
+        outbox_path,
+        state_path,
+        **_fields(message_id=102, author_uid=9, author_name="OtherBot"),
+        author_is_bot=True,
+        reply_to_message_id=101,
+    )
+    assert v5["author_is_bot"] is True
+    assert v5["reply_to_message_id"] == 101
+    got = read_entries(outbox_path, state_path, unread_only=False)
+    assert [e["message_id"] for e in got["entries"]] == [101, 102]
+    assert "author_is_bot" not in got["entries"][0]
+    assert got["entries"][1]["author_is_bot"] is True
+    assert got["entries"][1]["reply_to_message_id"] == 101

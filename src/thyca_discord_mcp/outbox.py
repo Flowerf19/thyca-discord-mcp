@@ -324,6 +324,8 @@ def build_message_entry(
     bot_uid: int,
     owner_uid: int,
     watch_channel_ids: list[int],
+    author_is_bot: bool | None = None,
+    reply_to_message_id: int | None = None,
 ) -> dict[str, Any] | None:
     """Build a realtime entry's fields, or None when the message must not be captured.
 
@@ -331,6 +333,12 @@ def build_message_entry(
     the bot's own messages, and unwatched channels. Owner/other messages are kept
     even with empty content. Poll entries (which keep ``self`` messages) are built
     separately by the poll tick in T4 using :func:`classify_actor` directly.
+
+    v5 capture metadata (optional, backward compatible): when ``author_is_bot``
+    is provided (native ``message.author.bot``), both ``author_is_bot`` and
+    ``reply_to_message_id`` (native ``message.reference.message_id`` or None)
+    are persisted. Legacy callers omitting ``author_is_bot`` get entries
+    without either key; absence means unknown, never assumed human.
     """
     if guild_id != scope_guild_id:
         return None
@@ -339,7 +347,7 @@ def build_message_entry(
         return None
     if channel_id not in watch_channel_ids:
         return None
-    return {
+    entry: dict[str, Any] = {
         "type": "message",
         "channel_id": channel_id,
         "message_id": message_id,
@@ -348,3 +356,7 @@ def build_message_entry(
         "actor_kind": actor.kind.value,
         "content": content if content else "",
     }
+    if author_is_bot is not None:
+        entry["author_is_bot"] = author_is_bot
+        entry["reply_to_message_id"] = reply_to_message_id
+    return entry

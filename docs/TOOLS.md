@@ -1,4 +1,4 @@
-# MCP tools — v1 + v4 implemented; v2/v3 proposed
+# MCP tools — v1 + v4 implemented; v5 in-progress (V5 source, plan open); v2/v3 proposed
 
 Scope guard (all tools): operate only on the configured `GUILD_ID`.
 Every call is audited to `audit.jsonl`. Destructive tools run without confirm
@@ -24,7 +24,7 @@ Background: `heartbeat` loop snapshots member count every 5 min.
 
 ## v4 — implemented: outbox + poll tasks
 
-This server sends no push/notifications over MCP, so it **captures** and the agent
+This V4 deployed writer sends no push/notifications over MCP, so it **captures** and the agent
 **pulls**. The server never summarizes (no LLM inside): capture is faithful,
 summarizing is the agent's job when it reads the outbox.
 
@@ -58,8 +58,11 @@ summarizing is the agent's job when it reads the outbox.
 - Task definitions are memory-only (lost on restart, not restored); poll cursors
   persist in `outbox_state.json`. Single writer: one process / one loop.
 - If state and log disagree (state loss, corruption), startup refuses to boot
-  and ack/poll paths fail loudly and refuse to write — restore `outbox_state.json`
-  from backup, do not ack past it.
+  and ack/poll paths fail loudly and refuse to write — state is never silently
+  reset. Authoritative ACK, journal, and receipts are preserved: restore ONLY from
+  a matching valid backup PLUS external delivery reconciliation and explicit
+  operator approval — never a stale ACK rewind, never deleting state, do not ack
+  past it. (V4 corruption still fails closed, unchanged.)
 
 ### Identity and profile rules (hard)
 
@@ -90,6 +93,63 @@ summarizing is the agent's job when it reads the outbox.
 > verify every Discord sender with MCP `whoami(author_uid)` on the metadata UID,
 > and operate ONLY in the approved live channel (see below). This server sends
 > no push/notifications — the agent must pull with `read_outbox`.
+
+## v5 — in progress (V5 source, backend deployed + operating): auto-reply correlation + guards
+
+No new tool names: the surface stays 12 tools (a 6-item source cleanup changed
+no tool names, args, or guards — only internals; public worker surface stays
+`tick`/`close`). What changes is how
+`send_message` correlates, how `ack_outbox` guards, and which tasks are
+protected. Status and proof live in `.agents/plans/v5-auto-reply.md` (still
+`in-progress`; T4 DONE, T5 deployment + owner happy-path verified, T6 evidence
+PARTIAL; V5 source was uncommitted at doc time, owner has authorized
+review → fix → commit after final independent review + passed checks). The
+backend IS deployed and auto-reply is operating now (seed
+COMPLETED, two live turns with receipts, ACK 31, controlled restart with no
+resubmission — running pre-cleanup code, this request did no restart); live
+failure-injection gaps remain — see the plan.
+
+### Agent-owned correlated send (worker never sends)
+
+- `send_message(content, channel_id?, source_message_id?, job_ref?)`:
+  correlation params are an optional pair — both or neither. A paired call is an
+  agent-owned auto reply for exactly one delivery job; an unpaired call is a
+  manual send, unchanged from v4 and never attached to a job.
+- `source_message_id` is `StrictInt`: only JSON ints pass the MCP boundary.
+  Bools and digit-strings are rejected (a lax int would coerce `True` → 1 before
+  the helper's guard runs). `job_ref` is the worker-issued random nonce (uuid4
+  hex); it frames the prompt and correlates the Trace — never authenticates the
+  caller.
+- Exactly-once is NOT promised: the shared native MCP pool carries no caller
+  identity. Lifecycle per job: intent journaled BEFORE the SDK send (the exact
+  POST text fingerprinted as SHA-256 + char length, `len(text) <= 4000`, never
+  truncated or stored raw) → SDK receipt kept as CANDIDATE (own SID + turn index
+  + native Trace tool result must all match 1:1) → worker-owned completion.
+  Timeouts and disconnects mark the job `uncertain` — a late SDK receipt is still
+  recorded as evidence, never blind-retried. Only a definitive native 409 with
+  zero intents/receipts/trace requeues to `queued`.
+- Manual sends stay allowed and uncorrelated; a manual send is never a job
+  receipt and never advances auto ACK.
+
+### ACK + task guards
+
+- `ack_outbox` keeps the v4 rules and adds the controller guard: any seq beyond
+  the safe processed prefix (historical or completed/skipped jobs only, gaps
+  legal) is rejected, never clamped. Never ack before processing.
+- `auto-reply` and `auto-reply-recovery` are protected native loops: normal
+  `stop_task` / `remove_poll_task` refuse them (internal shutdown alone may force
+  them). `heartbeat` may be stopped (v4 compat) but may never be removed.
+  `add_poll_task` still requires intervals ≥ 30 s and refuses all three reserved
+  names. Responder tick default 1.0 s, request timeout 900.0 s, recovery poll
+  ≥ 30 s (default 30.0 s); control is via the existing task tools and native loop
+  flags, not new CLI subcommands.
+- Journal discipline: missing/corrupt delivery state fails closed. The one-time
+  exclusive operator fresh-state initialization already ran (COMPLETED:
+  historical MID index at baseline ACK 21 + exactly the two authorized SKIPs,
+  seq 22 / `1556471434610483303` and seq 23 / `1556471963957067780`, ACK 23)
+  — do NOT rerun it, and do NOT rerun the helper dry-run (it rejects when
+  delivery state exists). Later arrivals must not be discarded, and there is no
+  autoreset, no journal-deletion fallback, and no blind ACK.
 
 ## v2 — proposed: messages & channels
 
@@ -130,10 +190,13 @@ summarizing is the agent's job when it reads the outbox.
 - Live scope stays strict: guild `1067690340359880724` / channel `1395103735725821982`
   only — no other channel, even in the same guild. Every call enforces the guild scope
   guard on the server.
-- No autonomous watcher-to-LLM bridge: capturing (realtime + poll) never launches LLM
-  turns. The consumer pulls with `read_outbox`, processes in seq order, dedupes by
-  `message_id`, then acks. This server sends no push/notifications.
+- No autonomous watcher-to-LLM bridge in the V4 deployed writer: capturing (realtime
+  + poll) itself never launches LLM turns — capture contains no LLM. The consumer pulls
+  with `read_outbox`, processes in seq order, dedupes by `message_id`, then acks.
+  (The V5 source adds a worker that automatically POSTs a native turn per
+  eligible event; see the v5 section above.) This server sends no MCP push/notifications.
 - v2 (messages/channels) and v3 (members/roles) remain PROPOSED drafts; the current
   implemented surface is the 12 v1+v4 tools only — v2/v3 mutation/admin/destructive
   operations remain proposed and untested; existing read-only channel/member listings
-  were exercised in the native 12-tool E2E.
+  were exercised in the native 12-tool E2E. V5 correlation/guards add no tool names
+  (still 12); the plan stays in-progress with T6 evidence PARTIAL (see above).

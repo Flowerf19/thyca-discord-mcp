@@ -11,3 +11,7 @@ audit.jsonl
 outbox.jsonl
 outbox_state.json
 outbox_state.json.tmp
+delivery_state.json
+delivery_state.json.tmp
+delivery_state.json.tmp.*
+.delivery_state.json.*.tmp
