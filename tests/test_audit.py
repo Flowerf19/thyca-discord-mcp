@@ -1,6 +1,6 @@
 import json
 
-from thyca_discord_mcp.audit import append_audit
+from modum.audit import append_audit
 
 
 def test_append_audit_writes_jsonl(tmp_path):

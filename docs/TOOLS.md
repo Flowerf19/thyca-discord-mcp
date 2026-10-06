@@ -1,4 +1,4 @@
-# MCP tools — v1 + v4 implemented; v5 in-progress (V5 source, plan open); v2/v3 proposed
+# MCP tools — v1 + v4 implemented (12 preserved); v5 in-progress; Modum adds 2 (14 total, source-only); v2/v3 proposed
 
 Scope guard (all tools): operate only on the configured `GUILD_ID`.
 Every call is audited to `audit.jsonl`. Destructive tools run without confirm
@@ -85,9 +85,11 @@ summarizing is the agent's job when it reads the outbox.
 - This is agent policy guidance. The server does not authenticate the MCP caller —
   it enforces only the guild scope guard.
 - All Discord memory shares the one session labeled `discord-main`: the operator
-  reuses the ONE existing native generated session ID titled `discord-main` via the
+  reuses the ONE existing native generated session ID via the
   private mapping `~/.thyca/discord_session.json` (0600) — not one session per message.
   The audit tag stays the literal label `discord-main` (audit label != native ID).
+  Session identity is the pinned SID, never the native display title (cosmetic,
+  renamable in the native UI).
 
 > Operator safer-start prompt: have the agent read this whole file first, then
 > verify every Discord sender with MCP `whoami(author_uid)` on the metadata UID,
@@ -150,6 +152,150 @@ failure-injection gaps remain — see the plan.
   — do NOT rerun it, and do NOT rerun the helper dry-run (it rejects when
   delivery state exists). Later arrivals must not be discarded, and there is no
   autoreset, no journal-deletion fallback, and no blind ACK.
+- Session identity pin (in source; historical checkpoint — earlier 'still
+  pre-fix' superseded by external restart observed 2026-10-05 18:58+07, no
+  retroactive deploy approval): the worker gates
+  all three snapshot checks on `native_id_match` only. The native display title is
+  cosmetic and ignored; `expected_title` stays an optional diagnostic (`title_match`
+  metadata only, never an ACK or durable-write gate, never title-as-auth). The
+  internal audit label and `session_id` stay `discord-main`, separate from the native
+  UI title. No date/clock auto-reset, no new-SID creation, rollover, or fallback.
+
+### Deleted source (no-reply) — source-only; rollout pending (historical V5 checkpoint; active current is `src/modum/`)
+
+- Gates: existence is proven before the LLM POST (worker `_submit_queued` via
+  injected `source_checker`, default real-SDK `build_source_checker`) and again
+  before the correlated MCP send (tool pre-send read). Symbols:
+  `source_messages.py` (`build_source_checker`, `check_source_message`,
+  `_resolve_text_channel`; re-exported via the `server_helpers` alias),
+  `Responder(source_checker=...)`, `skip_job(..., reason="source_deleted")`.
+- Proof (strict): exact `fetch_message` GET bound to the approved
+  guild/channel/MID raising native NotFound status 404 + code 10008; on GET
+  success the returned MID/channel/guild must match. All else —
+  `SourceUnavailable`, permission/403, other 404 codes (e.g. 10003), timeouts,
+  5xx, scope mismatch — holds `queued`/`pending` (pre-POST, no nonce) or a
+  bounded MCP error (pre-intent, no SDK send). Single GET read: no history
+  scan or content processing; needs ViewChannel + ReadMessageHistory.
+  Cancellation propagates.
+- Skip: `source_deleted` is durable zero-evidence (no delivered MID) and wins
+  over late native POST/result/snapshot/trace outcomes. Refused on ANY
+  intent/receipt/trace or `uncertain`/`completed` stage — partial sends hold
+  `uncertain` (receipts kept, further chunks withheld); after any SDK call ALL
+  errors stay `uncertain`. If the agent never calls MCP send after a
+  mid-generation deletion, the controller can hold `uncertain` (no
+  always-unblocks-FIFO claim). Tool `skipped`/`source_deleted` means the agent
+  stops ALL replies for that source (no retries, no unthreaded/manual
+  fallback); unrelated manual sends stay allowed.
+- Kept: storage v1 + new skip enum (aliases/unknown fields preserved); reply
+  `MessageReference(fail_if_not_exists=True)`. Reply policy only — no
+  AI-history/message-body deletion; owner/clone/shared-memory design tabled.
+- Status, dated 2026-10-05: FINAL 503 PASS in 12.78 s (464 baseline + 39
+  source-deleted: 36 + 3 guard), Ruff check clean, 33 formatted, diff check
+  clean. Both hardenings DONE and checked (fresh post-GET latch +
+  correlated_job guard both paths; `source_deleted`-only tombstone
+  contradiction rejection, legacy unchanged; INERT schema mirrored, not wired;
+  3 new regressions failed pre-patch, pass fixed). 500 stays a dated
+  initial-feature historical marker; 464/455 stay historical. Initial review
+  `0ca0d96d-8efe-46c` stays historical; final review `0887b525-8634-4c6`
+  complete: no findings, APPROVE of source handling after fixes only. Reviewer
+  reran 39 feature tests + 3 guard regressions, lint/format/diff checks and cold
+  imports; no deploy/live acceptance implied.
+  Source-only; rollout pending. T5/T6 gaps open (see plan).
+
+## Modum — source complete (never deployed): `read_context` + `record_no_reply` (14 total)
+
+Current source surface is 14 tools: the 12 v1+v4 names above are preserved
+with the v5 correlation/guards, plus 2 new Modum `need_context` tools below.
+Both are verified in `src/modum/server.py` (`create_server` scope) with
+`StrictInt` IDs, `responder.correlated_job` gating, and delivery guards; this
+section states actual function contracts, not guesses. Python namespace is
+`modum`; external distribution/CLI stays `thyca-discord-mcp`. Plan
+`.agents/plans/modum-jev-integration-refactor.md` is `done` for authorized
+SOURCE work only; the separate V5 live plan remains partial. Whole integration
+SOURCE reviews COMPLETE (two approvals); T4 DONE
+(checked + reviewed); T5 migration COMPLETE (old dir absent, 28 `modum`
+files); T6 audit COMPLETE (no additional genuine removal justified);
+T7 package/routing/privacy approved with no findings. Recovery review found
+one Minor late-skip tick-status gap (durable skip/ACK already safe); parent
+reproduced and fixed it with eight portable cases. Full offline checks now
+1243 pass; independent core fix and whole guidance/package follow-ups approved
+with no open findings. Bound recovery checks the durable
+source-deleted skip after trace success/error, before interpreting the result;
+no extra trace fetch on that skip, cancellation still propagates.
+Source authorization is not production activation; no merge/live/paid/deploy/
+restart/commit.
+
+For snapshot selection, prompt-size limits, native session memory, freshness,
+and privacy boundaries, see [Conversation context and memory](CONTEXT.md).
+The contracts below describe the additional tools; their results do not
+replace the frozen Jev snapshot or automatically trigger another classification.
+
+### `read_context` — read-only approved-channel context for a correlated turn
+
+- Signature (actual): `read_context(source_message_id: StrictInt, job_ref: str,`
+  `before_message_id: StrictInt | None = None, limit: StrictInt = 20,`
+  `channel_id: int | None = None)`. Defaults: `before_message_id` None means
+  before the source; `limit` 20; `channel_id` None means the default channel.
+- Bounds (all `StrictInt`, bools rejected): `limit` 1..20; `source_message_id`
+  strict positive; `before_message_id` when present strict positive and
+  `<= source_message_id` (never future); `channel_id` must equal the default
+  channel (other channels out of scope). Auto controller must be running and
+  `correlated_job(source, job, channel)` must accept; shared MCP correlation
+  selects the job but never authenticates the caller.
+- Source-before read: `channel.history(limit, before=bound, oldest_first=False)`
+  where `bound` is `before_message_id` or the source; results returned old→new
+  chronological. Only the scoped guild/channel; no other channel, DM, or
+  profile fetch. Thyca-only additional context — never auto-forwarded to the
+  classifier. Profiles/`USER.md`/native private context stay forbidden.
+- Per-message validation: MID strict positive and `< bound` (future rejected),
+  channel/guild IDs must match scope, author UID strict positive, author name
+  str, content str `<=4000`, reply ref optional strict positive, timestamp via
+  native `isoformat()` or non-empty str. Any violation is a bounded
+  `validation_error` with no body echo beyond the validated payload.
+- Returns: `{source_message_id, job_ref, channel_id, messages, count}` where
+  each message is `{message_id, author_uid, author_name, content,
+  reply_to_message_id, timestamp}` with whole bodies (never truncated).
+- Audit metadata only: pre-acceptance unvalidated correlation metadata, then
+  exact IDs + `before`/`limit` after correlation, plus `returned_count` and
+  `message_ids`; bodies never enter the audit, only IDs/counts.
+- Errors (bounded `ValueError`, audited `error_kind`): `validation_error`,
+  auto controller not running, correlation rejected, delivery uncertain
+  (`send_blocked`), channel unavailable, history unavailable, future message,
+  channel/guild mismatch, invalid author/content/reply/timestamp. Read-only:
+  no mutation, no ACK, no send, no profile export.
+
+### `record_no_reply` — explicit no-reply declaration (journaled, nonterminal)
+
+- Signature (actual): `record_no_reply(source_message_id: StrictInt, job_ref: str,`
+  `reason: str, channel_id: int | None = None)`. `reason` is exactly
+  `no_reply_needed`|`missing_context`. Default channel when omitted.
+- Gates: channel must equal default; source strict positive; `job_ref`
+  non-empty; responder running; `correlated_job` accepts; delivery `get_job`
+  exists with matching `job_ref`; zero send evidence (no intents/receipts/
+  trace). Source freshness is a last pre-declaration GET: proven deleted with
+  zero evidence takes durable `skipped`/`source_deleted` (no declaration);
+  unproven existence (`SourceUnavailable`, 403, other 404 codes, timeouts, 5xx)
+  is a bounded `source unavailable` hold with no mutation. Post-await latch +
+  nonce guard, then `delivery.record_no_reply` (midflight bound `need_context` +
+  exact nonce + KNOWN stored first-user fingerprint + zero evidence + reason
+  enum). A present declaration forbids any new send intent.
+- Status is `declared` (journaled `{job_ref, reason, ts}`, immutable idempotent),
+  NEVER terminal and NEVER an ACK at tool time; the worker completes via native
+  Trace proof (`complete_observation` with bound index + nonempty unique traced
+  tool IDs) to `observed` ACK. `0 receipts` alone never proves `observe`; proof
+  is the bound Jev decision or the exact Thyca declaration + whole trace.
+- Returns: `{status: declared, channel_id, source_message_id, job_ref, reason}`
+  or `{status: skipped, reason: source_deleted, channel_id, source_message_id}`
+  when the source is proven deleted. Agent must then stop ALL replies for that
+  source (no retries, no unthreaded/manual fallback); unrelated manual sends
+  stay allowed.
+- Audit: pre-acceptance length/hash metadata until correlation accepts, then
+  exact IDs + reason; failures audit `error_kind` with no raw-body echo.
+- Errors: `validation_error`, correlation rejected, delivery uncertain, send
+  evidence present, channel unavailable, source unavailable, skip/declaration
+  rejected. Declaration load requires NON-NULL fingerprint for new fields;
+  old jobs missing optional new fields stay preserved with no legacy-null
+  contradiction. Correlation nonce is NOT caller ACL; no exactly-once claim.
 
 ## v2 — proposed: messages & channels
 
@@ -195,8 +341,13 @@ failure-injection gaps remain — see the plan.
   with `read_outbox`, processes in seq order, dedupes by `message_id`, then acks.
   (The V5 source adds a worker that automatically POSTs a native turn per
   eligible event; see the v5 section above.) This server sends no MCP push/notifications.
-- v2 (messages/channels) and v3 (members/roles) remain PROPOSED drafts; the current
-  implemented surface is the 12 v1+v4 tools only — v2/v3 mutation/admin/destructive
-  operations remain proposed and untested; existing read-only channel/member listings
-  were exercised in the native 12-tool E2E. V5 correlation/guards add no tool names
-  (still 12); the plan stays in-progress with T6 evidence PARTIAL (see above).
+- v2 (messages/channels) and v3 (members/roles) remain PROPOSED drafts; the V4
+  historical snapshot was the 12 v1+v4 tools only — v2/v3 mutation/admin/
+  destructive operations remain proposed and untested; existing read-only
+  channel/member listings were exercised in the native 12-tool E2E. V5
+  correlation/guards add no tool names beyond its 12; the plan stays
+  in-progress with T6 evidence PARTIAL (see above). Current source is 14 tools
+  (12 preserved + Modum `read_context` + `record_no_reply`, source-only
+  complete, integration SOURCE reviews complete, T4 DONE checked/reviewed;
+  T5 COMPLETE, T6 audit complete without additional source deletion;
+  T7 final reviews complete, Minor fixed and independently approved).

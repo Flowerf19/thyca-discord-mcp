@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from thyca_discord_mcp.config import PROJECT_ROOT, Settings
+from modum.config import PROJECT_ROOT, Settings
 
 
 def test_settings_from_env(monkeypatch):

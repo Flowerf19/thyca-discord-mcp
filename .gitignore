@@ -15,3 +15,7 @@ delivery_state.json
 delivery_state.json.tmp
 delivery_state.json.tmp.*
 .delivery_state.json.*.tmp
+jev_state.json
+jev_state.json.tmp
+jev_state.json.tmp.*
+.jev_state.json.*.tmp

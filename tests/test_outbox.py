@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from thyca_discord_mcp.outbox import (
+from modum.outbox import (
     OutboxError,
     ack_entries,
     append_entry,

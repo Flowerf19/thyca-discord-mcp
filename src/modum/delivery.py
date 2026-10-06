@@ -10,8 +10,17 @@ Single JSON file (``delivery_state.json`` by convention, any path allowed)::
       "authorized_skips": [{"channel_id","message_id","seq","author_uid",
                             "actor_kind","reason"}],
       "jobs": {"<channel>:<mid>": {job}},
+      "jev_ledger_id": None|<32hex ledger marker>,
       ...unknown top-level keys preserved
     }
+
+Top-level ``jev_ledger_id`` is an OPTIONAL activation-storage marker
+(None when unbound; old files missing the key load as None). It binds
+the delivery file to one immutable private Jev ledger (exact 32hex).
+Router persists it AFTER exclusive ledger init+fsync BEFORE any paid
+call; a later marker+missing ledger file fails BEFORE auto-create, and
+a mismatching ledger file id fails, preventing budget reset/rebill
+after loss. Ordinary metadata only; never a raw path or chat.
 
 Job (all IDs are strict positive ints, never bool)::
 
@@ -19,7 +28,7 @@ Job (all IDs are strict positive ints, never bool)::
       "channel_id","message_id","author_uid","actor_kind","seq",
       "seq_aliases": [extra seqs for same MID, sorted, unique],
       "stage": queued|turn_submitting|inflight|delivering|sent|
-               completed|skipped|uncertain,
+               completed|skipped|uncertain|observed,
       "job_ref": str|None, "pre_turn_index": int|None,
       "turn_index": int|None,
       "submitted_text_sha256": str|None, "submitted_text_len": int|None,
@@ -29,12 +38,17 @@ Job (all IDs are strict positive ints, never bool)::
                          "reply_to_message_id","ts"}],
       "trace_refs": None|{"tool_call_ids","ts"},
       "skip_reason": None|str, "error": None|{"kind","http_status","ts"},
+      "jev_decision": None|{"participation","context_sha256",
+                         "attempt_id","model"},
+      "no_reply_declaration": None|{"job_ref","reason","ts"},
+      "observation": None|{"origin","ts"},
       "created_at","updated_at", ...unknown job keys preserved
     }
 
 Metadata only: intents store length/hash, receipts store IDs/URL, errors
-store coarse ``kind`` + optional HTTP status. No message body, reply text,
-profile, or freeform provider error is ever accepted or stored.
+store coarse ``kind`` + optional HTTP status, Jev stores compact
+participation/context-sha/attempt/model only. No message body, reply text,
+Jev answers, profile, or freeform provider error is ever accepted/stored.
 
 Durability model (single-process / single asyncio loop only):
 - Pure sync file state. No HTTP, workers, LLM, Discord calls, locks,
@@ -67,7 +81,8 @@ Permissions / paths (minimal, no framework):
   must be a regular file once created.
 - Errors carry bounded field/path/key metadata only, never entry content.
 
-Stages / transitions (terminal: completed, skipped, uncertain):
+Stages / transitions (terminal: completed, skipped, uncertain, observed;
+ safe ACK: completed, skipped, observed; uncertain never ACKs):
 - ``queued`` -> ``turn_submitting`` (mark_turn_submitting; ``pre_turn_index
   = None`` means a KNOWN empty native session, never an unknown/faked
   index), ``turn_submitting`` -> ``inflight`` (mark_inflight binds the
@@ -75,7 +90,7 @@ Stages / transitions (terminal: completed, skipped, uncertain):
   ``turn_submitting``/``inflight``/``delivering``/``sent`` -> ``delivering``
   (record_send_intent, one per send_ref, multi-chunk allowed; a deferred
   SDK callback during the synchronous POST await records real sends while
-  ``turn_index`` is still None),
+  ``turn_index`` is still None; refused when a no_reply_declaration exists),
   ``delivering`` -> ``sent`` (record_send_receipt when ALL intents have
   receipts), ``sent`` -> ``completed`` (complete_job, receipts already
   durable, caller verified native Trace externally),
@@ -84,9 +99,15 @@ Stages / transitions (terminal: completed, skipped, uncertain):
   non-empty verified tool_call_ids are supplied; the stored error is
   cleared), ``turn_submitting``/``inflight`` -> ``queued``
   (requeue_definitive_busy, ONLY a definitive native POST 409 with zero
-  intents/receipts/trace),
+  intents/receipts/trace/declaration; a declaration always refuses),
   any non-terminal -> ``skipped`` (skip_job, explicit reason),
-  any non-terminal -> ``uncertain`` (mark_uncertain, coarse kind).
+  any non-terminal -> ``uncertain`` (mark_uncertain, coarse kind),
+  ``queued`` -> ``observed`` (observe_job, ONLY a bound Jev ``observe``
+  with zero nonce/index/fingerprint/evidence plus durable Jev proof),
+  ``inflight``/zero-evidence-``uncertain`` -> ``observed``
+  (complete_observation, ONLY a bound Jev ``need_context`` + exact
+  no_reply_declaration + bound matching turn_index + nonempty unique
+  traced tool_call_ids; clears an uncertain error).
 - Terminal stages never rewind. Idempotent repeats require EXACT same
   payload, otherwise conflict fails. Receipts require a prior intent;
   complete requires ALL intents receipted (2 confirmed + 1 pending
@@ -130,11 +151,25 @@ Public contracts (stable names for future writers):
 - ``complete_job(..., *, turn_index, tool_call_ids)`` (``sent`` or the
   explicit ``uncertain`` path above; ``uncertain`` completion clears the
   stored error).
+- ``bind_jev_decision(path, ch, mid, *, context_sha256, attempt_id, model,
+  participation) -> dict`` (fresh queued only; compact metadata, exact
+  idempotent; never raw answers).
+- ``bind_jev_ledger(path, *, ledger_id) -> dict`` (top-level activation
+  marker; None -> exact 32hex once, exact repeat idempotent, different
+  id conflicts; never touches SID/jobs/ACK; old files load None).
+- ``observe_job(path, ch, mid) -> dict`` (queued + bound Jev observe +
+  zero evidence -> observed with Jev proof).
+- ``record_no_reply(path, ch, mid, *, job_ref, reason) -> dict``
+  (turn_submitting/inflight + bound need_context + exact nonce + zero
+  evidence; immutable; never terminals/ACKs alone).
+- ``complete_observation(path, ch, mid, *, turn_index, tool_call_ids)``
+  (inflight or zero-evidence uncertain + need_context + exact declaration
+  + bound index + nonempty unique traced IDs -> observed with Thyca proof).
 - ``skip_job(..., *, reason)``, ``mark_uncertain(..., *, kind,
   http_status=None)``.
 - ``processed_seq_prefix(path, ordered_entries, current_acked) -> int``
   highest ACTUAL seen seq whose MID is historical or whose job is
-  completed/skipped with exact (channel,mid,seq) match; stops at the
+  completed/skipped/observed with exact (channel,mid,seq) match; stops at the
   first unresolved entry, gaps allowed. ``ordered_entries`` MUST be the
   FULL unfiltered unread outbox prefix from the caller -- omitted rows
   CANNOT be detected here. Optional ``author_uid``/``actor_kind`` fields
@@ -150,782 +185,72 @@ from __future__ import annotations
 import copy
 import json
 import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-DELIVERY_VERSION = 1
-
-STAGES = frozenset(
-    {
-        "queued",
-        "turn_submitting",
-        "inflight",
-        "delivering",
-        "sent",
-        "completed",
-        "skipped",
-        "uncertain",
-    }
+from .delivery_schema import (  # noqa: F401 - intentional canonical re-exports, same objects
+    ACTOR_KINDS,
+    DELIVERY_VERSION,
+    JEV_MODEL_PINNED,
+    JEV_PARTICIPATIONS,
+    MAX_ID_LEN,
+    MAX_URL_LEN,
+    NO_REPLY_REASONS,
+    OBSERVATION_ORIGINS,
+    SAFE_TERMINAL_STAGES,
+    SHA256_HEX_LEN,
+    SKIP_REASONS,
+    STAGES,
+    SUBMITTED_TEXT_MAX,
+    TERMINAL_STAGES,
+    UNCERTAIN_KINDS,
+    DeliveryDurabilityUncertain,
+    DeliveryError,
+    _has_whitespace,
+    _is_attempt_id,
+    _is_hex,
+    _is_sha256_hex,
+    _is_strict_int,
+    _job_key,
+    _parse_job_key,
+    _submitted_pair_ok,
+    _validate_authorized_skip,
+    _validate_historical,
+    _validate_id_string,
+    _validate_intent,
+    _validate_jev_decision,
+    _validate_job,
+    _validate_no_reply_declaration,
+    _validate_observation,
+    _validate_receipt,
+    _validate_state,
 )
-TERMINAL_STAGES = frozenset({"completed", "skipped", "uncertain"})
-ACTOR_KINDS = frozenset({"owner", "other", "self"})
-SKIP_REASONS = frozenset(
-    {
-        "operator_approved_drop",
-        "out_of_scope",
-        "bot_filtered",
-        "duplicate_superseded",
-    }
+from .delivery_storage import (
+    _create_state_exclusive as _storage_create_state_exclusive,
 )
-UNCERTAIN_KINDS = frozenset(
-    {
-        "timeout",
-        "busy",
-        "http_error",
-        "transport_error",
-        "trace_unverified",
-        "delivery_unknown",
-    }
+from .delivery_storage import (
+    _ensure_parent_dir,
+    _fsync_parent_dir,
+    _load_state,
 )
-
-MAX_ID_LEN = 128
-MAX_URL_LEN = 512
-# SHA-256 hex fingerprint length for content_hash and submitted_text_sha256.
-SHA256_HEX_LEN = 64
-# Native turn text bound (mirrors native TEXT_MAX). Core only validates the
-# stored fingerprint length; the caller enforces the Discord/native limit
-# before POST and never truncates.
-SUBMITTED_TEXT_MAX = 4000
-
-
-class DeliveryError(ValueError):
-    """Corrupt delivery state or an invalid delivery operation."""
-
-
-class DeliveryDurabilityUncertain(DeliveryError):
-    """Post-commit directory fsync failed; namespace durability unknown.
-
-    Raised only AFTER os.replace/os.link succeeded. The new state file
-    exists and validates, but the directory entry may not survive power
-    loss. committed=True always. Never carries raw OSError text. Callers
-    must not blind-retry, rewind, or delete the committed file; operator
-    reconciliation is required.
-    """
-
-    def __init__(self, path: Path | str) -> None:
-        self.kind = "durability_uncertain"
-        self.committed = True
-        super().__init__(f"delivery state {path}: commit succeeded but directory fsync failed")
+from .delivery_storage import (
+    _save_state as _storage_save_state,
+)
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _is_strict_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _job_key(channel_id: int, message_id: int) -> str:
-    return f"{channel_id}:{message_id}"
-
-
-def _parse_job_key(key: Any) -> tuple[int, int] | None:
-    if not isinstance(key, str):
-        return None
-    parts = key.split(":")
-    if len(parts) != 2:
-        return None
-    try:
-        channel_id = int(parts[0])
-        message_id = int(parts[1])
-    except (TypeError, ValueError):
-        return None
-    if channel_id <= 0 or message_id <= 0:
-        return None
-    # Canonical form only: no leading zeros / whitespace.
-    if parts[0] != str(channel_id) or parts[1] != str(message_id):
-        return None
-    return channel_id, message_id
-
-
-def _is_hex(value: str) -> bool:
-    if not value:
-        return False
-    for ch in value:
-        if ch not in "0123456789abcdefABCDEF":
-            return False
-    return True
-
-
-def _has_whitespace(value: str) -> bool:
-    for ch in value:
-        if ch.isspace():
-            return True
-    return False
-
-
-def _validate_id_string(value: Any) -> str | None:
-    """Non-empty bounded ID without whitespace; None when invalid (no echo)."""
-    if not isinstance(value, str):
-        return None
-    if not (1 <= len(value) <= MAX_ID_LEN):
-        return None
-    if value.strip() != value or not value:
-        return None
-    if _has_whitespace(value):
-        return None
-    return value
-
-
-def _ensure_parent_dir(path: Path) -> None:
-    """Create only missing parents as 0700; never touch existing parents."""
-    parent = path.parent
-    if parent.exists():
-        if parent.is_symlink() or not parent.is_dir():
-            raise DeliveryError(f"delivery parent {parent} is not a directory")
-        return
-    # Collect missing chain top-down so only newly created dirs get 0700.
-    missing: list[Path] = []
-    cursor = parent
-    while not cursor.exists():
-        missing.append(cursor)
-        cursor = cursor.parent
-        if len(missing) > 64:
-            raise DeliveryError(f"delivery parent {parent} is too deep")
-    if cursor.is_symlink() or not cursor.is_dir():
-        raise DeliveryError(f"delivery parent {cursor} is not a directory")
-    for directory in reversed(missing):
-        try:
-            directory.mkdir(mode=0o700)
-        except FileExistsError:
-            if directory.is_symlink() or not directory.is_dir():
-                raise DeliveryError(f"delivery parent {directory} is not a directory") from None
-            continue
-        # mkdir mode is masked by umask; chmod only this newly owned dir.
-        os.chmod(directory, 0o700)
-
-
-def _fsync_parent_dir(parent: Path, state_path: Path) -> None:
-    """Fsync the parent directory after a file commit (namespace durability).
-
-    Must be called AFTER os.replace/os.link. On failure raises
-    DeliveryDurabilityUncertain (committed=True) without raw OSError text.
-    """
-    fd = None
-    try:
-        fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-    except OSError:
-        raise DeliveryDurabilityUncertain(state_path) from None
-    try:
-        try:
-            os.fsync(fd)
-        except OSError:
-            raise DeliveryDurabilityUncertain(state_path) from None
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-
-
-def _is_sha256_hex(value: Any) -> bool:
-    """Exact 64-char hex (SHA-256 fingerprint); never echoes the value."""
-    if not isinstance(value, str):
-        return False
-    if len(value) != SHA256_HEX_LEN:
-        return False
-    return _is_hex(value)
-
-
-def _submitted_pair_ok(sha: Any, length: Any) -> bool:
-    """True when the fingerprint pair is both-None or both valid.
-
-    A valid pair is an exact 64-hex SHA-256 with a strict positive length
-    of at most SUBMITTED_TEXT_MAX characters (native turn bound).
-    """
-    if sha is None and length is None:
-        return True
-    if not _is_sha256_hex(sha):
-        return False
-    return _is_strict_int(length) and 1 <= length <= SUBMITTED_TEXT_MAX
-
-
-def _validate_historical(raw: Any, path: Path) -> dict[int, list[int]]:
-    if not isinstance(raw, dict):
-        raise DeliveryError(
-            f"corrupt delivery state {path}: 'historical_message_ids' must be an object"
-        )
-    out: dict[int, list[int]] = {}
-    for key, value in raw.items():
-        if isinstance(key, bool):
-            raise DeliveryError(f"corrupt delivery state {path}: bad historical channel")
-        if isinstance(key, int):
-            channel_id = key
-        elif isinstance(key, str):
-            try:
-                channel_id = int(key)
-            except (TypeError, ValueError):
-                raise DeliveryError(
-                    f"corrupt delivery state {path}: bad historical channel"
-                ) from None
-            if key != str(channel_id):
-                raise DeliveryError(f"corrupt delivery state {path}: bad historical channel")
-        else:
-            raise DeliveryError(f"corrupt delivery state {path}: bad historical channel")
-        if not _is_strict_int(channel_id) or channel_id <= 0:
-            raise DeliveryError(f"corrupt delivery state {path}: bad historical channel")
-        if channel_id in out:
-            raise DeliveryError(f"corrupt delivery state {path}: duplicate historical channel")
-        if not isinstance(value, list):
-            raise DeliveryError(f"corrupt delivery state {path}: bad historical id list")
-        mids: list[int] = []
-        seen: set[int] = set()
-        for item in value:
-            if not _is_strict_int(item) or item <= 0:
-                raise DeliveryError(f"corrupt delivery state {path}: bad historical message id")
-            if item in seen:
-                raise DeliveryError(
-                    f"corrupt delivery state {path}: duplicate historical message id"
-                )
-            seen.add(item)
-            mids.append(item)
-        out[channel_id] = mids
-    return out
-
-
-def _validate_authorized_skip(
-    raw: Any, path: Path, baseline_acked: int, index: int
-) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise DeliveryError(
-            f"corrupt delivery state {path}: authorized skip #{index} must be an object"
-        )
-    for name in (
-        "channel_id",
-        "message_id",
-        "seq",
-        "author_uid",
-        "actor_kind",
-        "reason",
-    ):
-        if name not in raw:
-            raise DeliveryError(
-                f"corrupt delivery state {path}: authorized skip #{index} missing key {name!r}"
-            )
-    record = dict(raw)
-    for name in ("channel_id", "message_id", "seq", "author_uid"):
-        value = raw[name]
-        if not _is_strict_int(value) or value <= 0:
-            raise DeliveryError(
-                f"corrupt delivery state {path}: authorized skip #{index} "
-                f"field {name!r} must be a positive int"
-            )
-        record[name] = value
-    if record["seq"] <= baseline_acked:
-        raise DeliveryError(
-            f"corrupt delivery state {path}: authorized skip #{index} "
-            "seq must exceed baseline_acked"
-        )
-    if not isinstance(raw["actor_kind"], str) or raw["actor_kind"] not in ACTOR_KINDS:
-        raise DeliveryError(
-            f"corrupt delivery state {path}: authorized skip #{index} has invalid actor_kind"
-        )
-    record["actor_kind"] = raw["actor_kind"]
-    if not isinstance(raw["reason"], str) or raw["reason"] not in SKIP_REASONS:
-        raise DeliveryError(
-            f"corrupt delivery state {path}: authorized skip #{index} has invalid reason"
-        )
-    record["reason"] = raw["reason"]
-    return record
-
-
-def _validate_intent(raw: Any, path: Path, key: str, index: int) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} intent #{index} must be an object"
-        )
-    for name in ("send_ref", "content_len", "content_hash", "ts"):
-        if name not in raw:
-            raise DeliveryError(
-                f"corrupt delivery state {path}: job {key} intent #{index} missing key {name!r}"
-            )
-    item = dict(raw)
-    if _validate_id_string(raw["send_ref"]) is None:
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} intent #{index} has invalid send_ref"
-        )
-    item["send_ref"] = raw["send_ref"]
-    content_len = raw["content_len"]
-    # Technical scalar: strict positive int only. No business cap; the
-    # Discord/native 2000-char send limit is enforced by the caller.
-    if not _is_strict_int(content_len) or content_len < 1:
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} intent #{index} has invalid content_len"
-        )
-    item["content_len"] = content_len
-    content_hash = raw["content_hash"]
-    if not _is_sha256_hex(content_hash):
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} intent #{index} has invalid content_hash"
-        )
-    item["content_hash"] = content_hash
-    if not isinstance(raw["ts"], str) or not raw["ts"]:
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} intent #{index} has invalid ts"
-        )
-    item["ts"] = raw["ts"]
-    return item
-
-
-def _validate_receipt(
-    raw: Any, path: Path, key: str, index: int, job_channel_id: int
-) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} receipt #{index} must be an object"
-        )
-    for name in (
-        "send_ref",
-        "sent_message_id",
-        "delivered_channel_id",
-        "jump_url",
-        "reply_to_message_id",
-        "ts",
-    ):
-        if name not in raw:
-            raise DeliveryError(
-                f"corrupt delivery state {path}: job {key} receipt #{index} missing key {name!r}"
-            )
-    item = dict(raw)
-    if _validate_id_string(raw["send_ref"]) is None:
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} receipt #{index} has invalid send_ref"
-        )
-    item["send_ref"] = raw["send_ref"]
-    sent_mid = raw["sent_message_id"]
-    if not _is_strict_int(sent_mid) or sent_mid <= 0:
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} receipt #{index} has invalid sent_message_id"
-        )
-    item["sent_message_id"] = sent_mid
-    delivered = raw["delivered_channel_id"]
-    if not _is_strict_int(delivered) or delivered <= 0:
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} receipt #{index} "
-            "has invalid delivered_channel_id"
-        )
-    if delivered != job_channel_id:
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} receipt #{index} "
-            "delivered_channel_id mismatch"
-        )
-    item["delivered_channel_id"] = delivered
-    jump_url = raw["jump_url"]
-    if (
-        not isinstance(jump_url, str)
-        or not (1 <= len(jump_url) <= MAX_URL_LEN)
-        or jump_url.strip() != jump_url
-        or _has_whitespace(jump_url)
-        or not jump_url.startswith("https://")
-    ):
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} receipt #{index} has invalid jump_url"
-        )
-    item["jump_url"] = jump_url
-    reply_to = raw["reply_to_message_id"]
-    if reply_to is not None and (not _is_strict_int(reply_to) or reply_to <= 0):
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} receipt #{index} "
-            "has invalid reply_to_message_id"
-        )
-    item["reply_to_message_id"] = reply_to
-    if not isinstance(raw["ts"], str) or not raw["ts"]:
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} receipt #{index} has invalid ts"
-        )
-    item["ts"] = raw["ts"]
-    return item
-
-
-def _validate_job(raw: Any, key: str, path: Path) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise DeliveryError(f"corrupt delivery state {path}: job {key} must be an object")
-    required = (
-        "channel_id",
-        "message_id",
-        "author_uid",
-        "actor_kind",
-        "seq",
-        "seq_aliases",
-        "stage",
-        "job_ref",
-        "pre_turn_index",
-        "turn_index",
-        "send_intents",
-        "send_receipts",
-        "trace_refs",
-        "skip_reason",
-        "error",
-        "created_at",
-        "updated_at",
-    )
-    for name in required:
-        if name not in raw:
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} missing key {name!r}")
-    job = dict(raw)
-    for name in ("channel_id", "message_id", "author_uid", "seq"):
-        value = raw[name]
-        if not _is_strict_int(value) or value <= 0:
-            raise DeliveryError(
-                f"corrupt delivery state {path}: job {key} field {name!r} must be a positive int"
-            )
-        job[name] = value
-    if key != _job_key(job["channel_id"], job["message_id"]):
-        raise DeliveryError(f"corrupt delivery state {path}: job {key} key mismatch")
-    if not isinstance(raw["actor_kind"], str) or raw["actor_kind"] not in ACTOR_KINDS:
-        raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid actor_kind")
-    job["actor_kind"] = raw["actor_kind"]
-    aliases = raw["seq_aliases"]
-    if not isinstance(aliases, list):
-        raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid seq_aliases")
-    seen_alias: set[int] = set()
-    clean_aliases: list[int] = []
-    for item in aliases:
-        if not _is_strict_int(item) or item <= 0:
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid seq_alias")
-        if item == job["seq"] or item in seen_alias:
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} has duplicate seq_alias")
-        seen_alias.add(item)
-        clean_aliases.append(item)
-    job["seq_aliases"] = clean_aliases
-    stage = raw["stage"]
-    if not isinstance(stage, str) or stage not in STAGES:
-        raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid stage")
-    job["stage"] = stage
-    job_ref = raw["job_ref"]
-    if job_ref is not None and _validate_id_string(job_ref) is None:
-        raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid job_ref")
-    job["job_ref"] = job_ref
-    for name in ("pre_turn_index", "turn_index"):
-        value = raw[name]
-        if value is not None and (not _is_strict_int(value) or value < 0):
-            raise DeliveryError(
-                f"corrupt delivery state {path}: job {key} field {name!r} "
-                "must be a non-negative int or null"
-            )
-        job[name] = value
-    intents_raw = raw["send_intents"]
-    if not isinstance(intents_raw, list):
-        raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid send_intents")
-    intents = [_validate_intent(item, path, key, i) for i, item in enumerate(intents_raw)]
-    intent_refs = [item["send_ref"] for item in intents]
-    if len(set(intent_refs)) != len(intent_refs):
-        raise DeliveryError(f"corrupt delivery state {path}: job {key} has duplicate send_ref")
-    job["send_intents"] = intents
-    receipts_raw = raw["send_receipts"]
-    if not isinstance(receipts_raw, list):
-        raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid send_receipts")
-    receipts = [
-        _validate_receipt(item, path, key, i, job["channel_id"])
-        for i, item in enumerate(receipts_raw)
-    ]
-    receipt_refs = [item["send_ref"] for item in receipts]
-    if len(set(receipt_refs)) != len(receipt_refs):
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} has duplicate receipt send_ref"
-        )
-    for ref in receipt_refs:
-        if ref not in set(intent_refs):
-            raise DeliveryError(
-                f"corrupt delivery state {path}: job {key} has receipt without intent"
-            )
-    job["send_receipts"] = receipts
-    trace = raw["trace_refs"]
-    if trace is not None:
-        if not isinstance(trace, dict):
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid trace_refs")
-        if "tool_call_ids" not in trace or "ts" not in trace:
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} trace_refs missing key")
-        tool_ids = trace["tool_call_ids"]
-        if not isinstance(tool_ids, list):
-            raise DeliveryError(
-                f"corrupt delivery state {path}: job {key} has invalid tool_call_ids"
-            )
-        for tool_id in tool_ids:
-            if _validate_id_string(tool_id) is None:
-                raise DeliveryError(
-                    f"corrupt delivery state {path}: job {key} has invalid tool_call_id"
-                )
-        if not isinstance(trace["ts"], str) or not trace["ts"]:
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid trace ts")
-        job["trace_refs"] = dict(trace)
-    else:
-        job["trace_refs"] = None
-    skip_reason = raw["skip_reason"]
-    if skip_reason is not None and (
-        not isinstance(skip_reason, str) or skip_reason not in SKIP_REASONS
-    ):
-        raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid skip_reason")
-    job["skip_reason"] = skip_reason
-    error = raw["error"]
-    if error is not None:
-        if not isinstance(error, dict):
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid error")
-        if "kind" not in error or "http_status" not in error or "ts" not in error:
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} error missing key")
-        if not isinstance(error["kind"], str) or error["kind"] not in UNCERTAIN_KINDS:
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid error kind")
-        status = error["http_status"]
-        if status is not None and (not _is_strict_int(status) or not (100 <= status <= 599)):
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid http_status")
-        if not isinstance(error["ts"], str) or not error["ts"]:
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid error ts")
-        job["error"] = dict(error)
-    else:
-        job["error"] = None
-    for name in ("created_at", "updated_at"):
-        if not isinstance(raw[name], str) or not raw[name]:
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} has invalid {name}")
-        job[name] = raw[name]
-    # Optional submission fingerprint (exact Native POST text hash/len, never raw).
-    # Missing keys mean an older state file: treat as None for compatibility.
-    sub_sha = raw.get("submitted_text_sha256")
-    sub_len = raw.get("submitted_text_len")
-    if not _submitted_pair_ok(sub_sha, sub_len):
-        raise DeliveryError(
-            f"corrupt delivery state {path}: job {key} has invalid submitted fingerprint"
-        )
-    job["submitted_text_sha256"] = sub_sha
-    job["submitted_text_len"] = sub_len
-    # Stage invariants (fail corrupt, never silently fix).
-    # pre_turn_index None means KNOWN zero prior user turns (empty history)
-    # once job_ref is set; queued fresh jobs always have None/None/None.
-    # turn_index None in delivering/sent means sends were recorded during a
-    # synchronous POST await before the native index was bound.
-    all_receipted = len(receipts) == len(intents) and len(intents) > 0
-    if stage == "queued":
-        if (
-            job_ref is not None
-            or job["pre_turn_index"] is not None
-            or job["turn_index"] is not None
-            or intents
-            or receipts
-            or trace is not None
-            or skip_reason is not None
-            or error is not None
-            or job["submitted_text_sha256"] is not None
-            or job["submitted_text_len"] is not None
-        ):
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} queued must be fresh")
-    elif stage == "turn_submitting":
-        if (
-            job_ref is None
-            or job["turn_index"] is not None
-            or intents
-            or receipts
-            or trace is not None
-            or skip_reason is not None
-            or error is not None
-        ):
-            raise DeliveryError(
-                f"corrupt delivery state {path}: job {key} turn_submitting invariant"
-            )
-    elif stage == "inflight":
-        if (
-            job_ref is None
-            or job["turn_index"] is None
-            or intents
-            or receipts
-            or trace is not None
-            or skip_reason is not None
-            or error is not None
-        ):
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} inflight invariant")
-    elif stage == "delivering":
-        if (
-            job_ref is None
-            or not intents
-            or all_receipted
-            or trace is not None
-            or skip_reason is not None
-            or error is not None
-        ):
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} delivering invariant")
-    elif stage == "sent":
-        if (
-            job_ref is None
-            or not all_receipted
-            or trace is not None
-            or skip_reason is not None
-            or error is not None
-        ):
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} sent invariant")
-    elif stage == "completed":
-        if (
-            job_ref is None
-            or job["turn_index"] is None
-            or not all_receipted
-            or trace is None
-            or skip_reason is not None
-            or error is not None
-        ):
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} completed invariant")
-    elif stage == "skipped":
-        if skip_reason is None or trace is not None or error is not None:
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} skipped invariant")
-    elif stage == "uncertain":
-        if error is None or trace is not None or skip_reason is not None:
-            raise DeliveryError(f"corrupt delivery state {path}: job {key} uncertain invariant")
-    return job
-
-
-def _validate_state(raw: Any, path: Path) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise DeliveryError(f"corrupt delivery state {path}: top level must be an object")
-    for name in (
-        "version",
-        "native_session_id",
-        "baseline_acked",
-        "historical_message_ids",
-        "authorized_skips",
-        "jobs",
-    ):
-        if name not in raw:
-            raise DeliveryError(f"corrupt delivery state {path}: missing key {name!r}")
-    state = dict(raw)
-    version = raw["version"]
-    if not _is_strict_int(version) or version != DELIVERY_VERSION:
-        raise DeliveryError(f"corrupt delivery state {path}: unsupported version")
-    state["version"] = DELIVERY_VERSION
-    sid = raw["native_session_id"]
-    if (
-        not isinstance(sid, str)
-        or not (1 <= len(sid) <= MAX_ID_LEN)
-        or sid.strip() != sid
-        or not sid
-        or _has_whitespace(sid)
-    ):
-        raise DeliveryError(f"corrupt delivery state {path}: invalid native_session_id")
-    state["native_session_id"] = sid
-    baseline = raw["baseline_acked"]
-    if not _is_strict_int(baseline) or baseline < 0:
-        raise DeliveryError(
-            f"corrupt delivery state {path}: 'baseline_acked' must be a non-negative int"
-        )
-    state["baseline_acked"] = baseline
-    historical = _validate_historical(raw["historical_message_ids"], path)
-    state["historical_message_ids"] = historical
-    skips_raw = raw["authorized_skips"]
-    if not isinstance(skips_raw, list):
-        raise DeliveryError(f"corrupt delivery state {path}: 'authorized_skips' must be a list")
-    skips = [_validate_authorized_skip(item, path, baseline, i) for i, item in enumerate(skips_raw)]
-    skip_keys = [(s["channel_id"], s["message_id"]) for s in skips]
-    if len(set(skip_keys)) != len(skip_keys):
-        raise DeliveryError(f"corrupt delivery state {path}: duplicate authorized skip")
-    skip_seqs = [s["seq"] for s in skips]
-    if len(set(skip_seqs)) != len(skip_seqs):
-        raise DeliveryError(f"corrupt delivery state {path}: duplicate authorized skip seq")
-    historical_pairs = {(ch, mid) for ch, mids in historical.items() for mid in mids}
-    for i, item in enumerate(skips):
-        if (item["channel_id"], item["message_id"]) in historical_pairs:
-            raise DeliveryError(
-                f"corrupt delivery state {path}: authorized skip #{i} overlaps historical"
-            )
-    state["authorized_skips"] = skips
-    jobs_raw = raw["jobs"]
-    if not isinstance(jobs_raw, dict):
-        raise DeliveryError(f"corrupt delivery state {path}: 'jobs' must be an object")
-    jobs: dict[str, dict[str, Any]] = {}
-    for key in jobs_raw:
-        if _parse_job_key(key) is None:
-            raise DeliveryError(f"corrupt delivery state {path}: bad job key")
-    for key, value in jobs_raw.items():
-        jobs[key] = _validate_job(value, key, path)
-    # Global seq uniqueness across different jobs (aliases may grow per job).
-    seq_owner: dict[int, str] = {}
-    for key, job in jobs.items():
-        for seq in [job["seq"], *job["seq_aliases"]]:
-            owner = seq_owner.get(seq)
-            if owner is not None and owner != key:
-                raise DeliveryError(f"corrupt delivery state {path}: duplicate seq across jobs")
-            seq_owner[seq] = key
-    # Authorized skips must stay in exact sync with their skipped jobs
-    # (approved record tuple is immutable: seq/author/actor/reason).
-    # Later legit seq aliases on the job are fine; any mismatch is
-    # corrupt load -- bounded error, never a silent repair.
-    for i, item in enumerate(skips):
-        skip_key = _job_key(item["channel_id"], item["message_id"])
-        job = jobs.get(skip_key)
-        if (
-            job is None
-            or job["stage"] != "skipped"
-            or job["seq"] != item["seq"]
-            or job["author_uid"] != item["author_uid"]
-            or job["actor_kind"] != item["actor_kind"]
-            or job["skip_reason"] != item["reason"]
-        ):
-            raise DeliveryError(f"corrupt delivery state {path}: authorized skip #{i} job mismatch")
-    state["jobs"] = jobs
-    return state
-
-
-def _load_state(path: str | Path) -> dict[str, Any]:
-    file = Path(path)
-    if file.is_symlink():
-        raise DeliveryError(f"delivery state {file} must not be a symlink")
-    if not file.exists():
-        raise DeliveryError(f"delivery state {file} is missing; initialize explicitly")
-    if not file.is_file():
-        raise DeliveryError(f"delivery state {file} is not a regular file")
-    try:
-        raw = json.loads(file.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        # Bounded position metadata only; never echo the raw file body.
-        raise DeliveryError(
-            f"corrupt delivery state {file}: invalid JSON at line {e.lineno} col {e.colno}"
-        ) from None
-    return _validate_state(raw, file)
-
-
 def _save_state(path: str | Path, state: dict[str, Any]) -> None:
-    """Atomically replace an existing state file via a private temp inode."""
-    file = Path(path)
-    if file.is_symlink():
-        raise DeliveryError(f"delivery state {file} must not be a symlink")
-    if not file.exists():
-        raise DeliveryError(f"delivery state {file} is missing; initialize explicitly")
-    if not file.is_file():
-        raise DeliveryError(f"delivery state {file} is not a regular file")
-    parent = file.parent
-    if parent.is_symlink() or not parent.is_dir():
-        raise DeliveryError(f"delivery parent {parent} is not a directory")
-    fd, tmp_name = tempfile.mkstemp(dir=str(parent), prefix=file.name + ".tmp.")
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, file)
-    except BaseException:
-        # Pre-commit failure: clean up ONLY our own temp inode. A silent
-        # unlink failure can leave one known owned orphan tmp; it never
-        # means the state is uncommitted, and the state file itself is
-        # untouched (original bytes preserved).
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-    # Committed via os.replace (the temp path is already gone). The
-    # directory entry needs its own fsync for namespace durability; on
-    # failure raise DeliveryDurabilityUncertain WITHOUT rewinding,
-    # deleting the committed file, or carrying raw OSError text.
-    _fsync_parent_dir(parent, file)
+    """Atomically replace an existing state file (root forwarding wrapper).
+
+    Forwards to storage with the CURRENT root fsync hook explicitly, so
+    patching ``delivery._fsync_parent_dir`` faults all mutation commits.
+    The hook is looked up freshly at each call (never a bound default).
+    """
+    _storage_save_state(path, state, fsync_parent_dir=_fsync_parent_dir)
 
 
 def _new_job(
@@ -957,6 +282,9 @@ def _new_job(
         "trace_refs": None,
         "skip_reason": skip_reason,
         "error": None,
+        "jev_decision": None,
+        "no_reply_declaration": None,
+        "observation": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -1029,39 +357,11 @@ def initialize_delivery_state(
         "historical_message_ids": historical,
         "authorized_skips": skips,
         "jobs": jobs,
+        "jev_ledger_id": None,
     }
     # Validate the assembled state before touching disk.
     state = _validate_state(json.loads(json.dumps(state)), file)
-    fd, tmp_name = tempfile.mkstemp(dir=str(file.parent), prefix=file.name + ".tmp.")
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        try:
-            os.link(tmp_path, file)
-        except FileExistsError as e:
-            raise DeliveryError(
-                f"delivery state {file} already exists; refusing to overwrite"
-            ) from e
-    except BaseException:
-        # Own temp cleanup only; the state path is never touched here.
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-    # Exclusive hard-link commit succeeded: drop our temp link (best
-    # effort), then fsync the parent for namespace durability. A failing
-    # directory fsync raises DeliveryDurabilityUncertain with the state
-    # already present; later init still refuses it (exclusive bootstrap).
-    try:
-        tmp_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-    _fsync_parent_dir(file.parent, file)
+    _storage_create_state_exclusive(file, state, fsync_parent_dir=_fsync_parent_dir)
     return copy.deepcopy(state)
 
 
@@ -1289,12 +589,15 @@ def requeue_definitive_busy(
     guard hit after a real SDK intent must preserve the bytes and refuse).
     Only ``turn_submitting``/``inflight`` can requeue; an already-``queued``
     job fails explicitly (never a silent reset of an accepted job), and
-    ``uncertain``/``delivering``/``sent``/``completed``/``skipped`` are
-    refused. Any status other than strict-int 409 (503/408/None/str/bool)
-    is refused. Clears job_ref/pre_turn_index/turn_index/fingerprint/error;
-    keeps primary source, seq aliases, created timestamp and unknown fields,
-    and refreshes the updated timestamp. A NEW
-    attempt uses a fresh job_ref. No automatic POST is ever triggered.
+    ``uncertain``/``delivering``/``sent``/``completed``/``skipped``/``observed``
+    are refused. Any status other than strict-int 409 (503/408/None/str/bool)
+    is refused. A definitive busy can never carry a no_reply_declaration
+    (the turn was never accepted); a present declaration fails loudly and
+    is never cleared here. Clears job_ref/pre_turn_index/turn_index/
+    fingerprint/error; keeps the durable jev_decision, primary source,
+    seq aliases, created timestamp and unknown fields, and refreshes the
+    updated timestamp. A NEW attempt uses a fresh job_ref. No automatic
+    POST is ever triggered.
     """
     file = Path(path)
     if not _is_strict_int(http_status) or http_status != 409:
@@ -1306,6 +609,8 @@ def requeue_definitive_busy(
         raise DeliveryError(f"delivery state {file}: job {key} stage {job['stage']} cannot requeue")
     if job["send_intents"] or job["send_receipts"] or job["trace_refs"] is not None:
         raise DeliveryError(f"delivery state {file}: job {key} has send evidence; cannot requeue")
+    if job.get("no_reply_declaration") is not None or job.get("observation") is not None:
+        raise DeliveryError(f"delivery state {file}: job {key} has no_reply proof; cannot requeue")
     job["job_ref"] = None
     job["pre_turn_index"] = None
     job["turn_index"] = None
@@ -1352,6 +657,10 @@ def record_send_intent(
             raise DeliveryError(f"delivery state {file}: job {key} send_ref conflict")
     if job["stage"] in TERMINAL_STAGES:
         raise DeliveryError(f"delivery state {file}: job {key} stage {job['stage']} is terminal")
+    # A declared no-reply forbids any new send: the agent explicitly proved
+    # zero-send intent for this nonce; a later send would contradict it.
+    if job.get("no_reply_declaration") is not None:
+        raise DeliveryError(f"delivery state {file}: job {key} has no_reply proof; cannot send")
     # turn_submitting is allowed: a deferred SDK callback during the
     # synchronous POST await records REAL sends before the bind (stage
     # -> delivering with turn_index still None). No send budget exists.
@@ -1425,7 +734,7 @@ def record_send_receipt(
             ):
                 return copy.deepcopy(job)
             raise DeliveryError(f"delivery state {file}: job {key} receipt conflict")
-    if job["stage"] in ("completed", "skipped"):
+    if job["stage"] in ("completed", "skipped", "observed"):
         raise DeliveryError(f"delivery state {file}: job {key} stage {job['stage']} is terminal")
     intent_refs = {item["send_ref"] for item in job["send_intents"]}
     if send_ref not in intent_refs:
@@ -1528,18 +837,32 @@ def skip_job(
     *,
     reason: str,
 ) -> dict[str, Any]:
-    """Move any non-terminal job -> ``skipped`` with an explicit reason."""
+    """Move any non-terminal job -> ``skipped`` with an explicit reason.
+
+    ``source_deleted`` is the proven-no-send gate: it is refused whenever
+    the freshly reloaded job shows ANY send evidence (intents, receipts,
+    or trace refs) or an ``uncertain``/``completed`` stage, so a partly
+    delivered job can never be terminalized as "no send". The idempotent
+    repeat stays valid only with the same reason and zero evidence. All
+    other reasons keep their approved behavior. Only stage/skip_reason/
+    updated_at change; job_ref, fingerprints, aliases, timestamps, and
+    unknown fields are preserved.
+    """
     file = Path(path)
     if not isinstance(reason, str) or reason not in SKIP_REASONS:
         raise DeliveryError(f"invalid skip reason for delivery state {file}")
     state = _load_state(file)
     key = _require_job(state, file, channel_id, message_id)
     job = state["jobs"][key]
+    if reason == "source_deleted" and (
+        job["send_intents"] or job["send_receipts"] or job["trace_refs"] is not None
+    ):
+        raise DeliveryError(f"delivery state {file}: job {key} has send evidence; cannot skip")
     if job["stage"] == "skipped":
         if job["skip_reason"] == reason:
             return copy.deepcopy(job)
         raise DeliveryError(f"delivery state {file}: job {key} skip reason mismatch")
-    if job["stage"] in ("completed", "uncertain"):
+    if job["stage"] in ("completed", "uncertain", "observed"):
         raise DeliveryError(f"delivery state {file}: job {key} stage {job['stage']} cannot skip")
     job["skip_reason"] = reason
     job["stage"] = "skipped"
@@ -1572,7 +895,7 @@ def mark_uncertain(
         if existing.get("kind") == kind and existing.get("http_status") == http_status:
             return copy.deepcopy(job)
         raise DeliveryError(f"delivery state {file}: job {key} uncertain payload mismatch")
-    if job["stage"] in ("completed", "skipped"):
+    if job["stage"] in ("completed", "skipped", "observed"):
         raise DeliveryError(
             f"delivery state {file}: job {key} stage {job['stage']} cannot mark uncertain"
         )
@@ -1583,12 +906,306 @@ def mark_uncertain(
     return copy.deepcopy(job)
 
 
+def bind_jev_ledger(
+    path: str | Path,
+    *,
+    ledger_id: str,
+) -> dict[str, Any]:
+    """Bind the top-level Jev ledger marker once (activation storage proof).
+
+    ``ledger_id`` is an exact 32hex immutable marker for the private Jev
+    ledger file. Only an unbound state (``jev_ledger_id is None``, incl.
+    old files missing the key) can bind; the write is atomic (temp
+    inode + fsync + replace + parent fsync) with unknown top-level
+    fields preserved. An exact repeat is idempotent with no file
+    rewrite; a different id conflicts loudly with no overwrite. Never
+    touches SID/jobs/ACK. Router persists this AFTER exclusive private
+    ledger init+fsync BEFORE any paid call; ordinary metadata only.
+    """
+    file = Path(path)
+    if not _is_attempt_id(ledger_id):
+        raise DeliveryError(f"invalid ledger_id for delivery state {file}")
+    state = _load_state(file)
+    existing = state.get("jev_ledger_id")
+    if existing is None:
+        state["jev_ledger_id"] = ledger_id
+        _save_state(file, state)
+        return copy.deepcopy(state)
+    if existing == ledger_id:
+        return copy.deepcopy(state)
+    raise DeliveryError(f"delivery state {file}: jev ledger conflict")
+
+
+def bind_jev_decision(
+    path: str | Path,
+    channel_id: int,
+    message_id: int,
+    *,
+    context_sha256: str,
+    attempt_id: str,
+    model: str,
+    participation: str,
+) -> dict[str, Any]:
+    """Bind a compact Jev classification to a fresh ``queued`` job.
+
+    Stores only ``{participation, context_sha256, attempt_id, model}`` --
+    never raw answers, probabilities, or message text. ``context_sha256``
+    is the exact 64-hex canonical-context fingerprint, ``attempt_id`` an
+    exact 32-hex UUID hex, ``model`` exactly ``jev-1.13.0``, and
+    ``participation`` one of ``respond``/``observe``/``need_context``.
+    Only a fresh queued job with zero evidence (no nonce/index/
+    fingerprint/intents/receipts/trace/declaration/observation) can bind;
+    an exact repeat is idempotent, any different payload conflicts.
+    """
+    file = Path(path)
+    if not _is_sha256_hex(context_sha256):
+        raise DeliveryError(f"invalid context_sha256 for delivery state {file}")
+    if not _is_attempt_id(attempt_id):
+        raise DeliveryError(f"invalid attempt_id for delivery state {file}")
+    if not isinstance(model, str) or model != JEV_MODEL_PINNED:
+        raise DeliveryError(f"invalid jev model for delivery state {file}")
+    if not isinstance(participation, str) or participation not in JEV_PARTICIPATIONS:
+        raise DeliveryError(f"invalid jev participation for delivery state {file}")
+    state = _load_state(file)
+    key = _require_job(state, file, channel_id, message_id)
+    job = state["jobs"][key]
+    if job["stage"] != "queued":
+        raise DeliveryError(
+            f"delivery state {file}: job {key} stage {job['stage']} cannot bind jev"
+        )
+    if (
+        job["job_ref"] is not None
+        or job["pre_turn_index"] is not None
+        or job["turn_index"] is not None
+        or job["submitted_text_sha256"] is not None
+        or job["submitted_text_len"] is not None
+        or job["send_intents"]
+        or job["send_receipts"]
+        or job["trace_refs"] is not None
+        or job.get("no_reply_declaration") is not None
+        or job.get("observation") is not None
+    ):
+        raise DeliveryError(f"delivery state {file}: job {key} is not fresh; cannot bind jev")
+    existing = job.get("jev_decision")
+    if existing is not None:
+        if (
+            existing.get("participation") == participation
+            and existing.get("context_sha256") == context_sha256
+            and existing.get("attempt_id") == attempt_id
+            and existing.get("model") == model
+        ):
+            return copy.deepcopy(job)
+        raise DeliveryError(f"delivery state {file}: job {key} jev decision conflict")
+    job["jev_decision"] = {
+        "participation": participation,
+        "context_sha256": context_sha256,
+        "attempt_id": attempt_id,
+        "model": model,
+    }
+    job["updated_at"] = _now_iso()
+    _save_state(file, state)
+    return copy.deepcopy(job)
+
+
+def observe_job(
+    path: str | Path,
+    channel_id: int,
+    message_id: int,
+) -> dict[str, Any]:
+    """Terminalize a Jev-``observe`` queued job as auditable zero-send.
+
+    Only a ``queued`` job with a bound Jev ``observe`` decision and zero
+    nonce/index/fingerprint/intents/receipts/trace/declaration can observe.
+    Atomically sets stage ``observed`` plus a durable
+    ``observation={origin: jev, ts}``. An already-observed Jev job is
+    idempotent; any other stage, a non-observe decision, or ANY send
+    evidence fails. Never infers from receipt absence: the bound Jev proof
+    plus zero evidence is the proof.
+    """
+    file = Path(path)
+    state = _load_state(file)
+    key = _require_job(state, file, channel_id, message_id)
+    job = state["jobs"][key]
+    if job["stage"] == "observed":
+        obs = job.get("observation") or {}
+        if obs.get("origin") == "jev":
+            return copy.deepcopy(job)
+        raise DeliveryError(f"delivery state {file}: job {key} observed origin mismatch")
+    if job["stage"] != "queued":
+        raise DeliveryError(f"delivery state {file}: job {key} stage {job['stage']} cannot observe")
+    jev = job.get("jev_decision")
+    if jev is None or jev.get("participation") != "observe":
+        raise DeliveryError(f"delivery state {file}: job {key} has no jev observe proof")
+    if (
+        job["job_ref"] is not None
+        or job["pre_turn_index"] is not None
+        or job["turn_index"] is not None
+        or job["submitted_text_sha256"] is not None
+        or job["submitted_text_len"] is not None
+        or job["send_intents"]
+        or job["send_receipts"]
+        or job["trace_refs"] is not None
+        or job.get("no_reply_declaration") is not None
+        or job.get("observation") is not None
+    ):
+        raise DeliveryError(f"delivery state {file}: job {key} has evidence; cannot observe")
+    job["observation"] = {"origin": "jev", "ts": _now_iso()}
+    job["stage"] = "observed"
+    job["updated_at"] = _now_iso()
+    _save_state(file, state)
+    return copy.deepcopy(job)
+
+
+def record_no_reply(
+    path: str | Path,
+    channel_id: int,
+    message_id: int,
+    *,
+    job_ref: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Record a midflight Thyca no-reply declaration (no terminal, no ACK).
+
+    Only a ``turn_submitting``/``inflight`` job with a bound Jev
+    ``need_context`` decision, an exact matching nonce, a KNOWN stored
+    first-user fingerprint (exact prompt.strip SHA-256 + char len from
+    the real Router POST), and zero intents/receipts/trace can declare.
+    ``reason`` is ``no_reply_needed``/``missing_context``. The stored
+    ``{job_ref, reason, ts}`` is immutable and idempotent; it does NOT
+    terminalize or ACK -- only :func:`complete_observation` with traced
+    tool proof does. A present declaration forbids any new send intent.
+    """
+    file = Path(path)
+    if _validate_id_string(job_ref) is None:
+        raise DeliveryError(f"invalid job_ref for delivery state {file}")
+    if not isinstance(reason, str) or reason not in NO_REPLY_REASONS:
+        raise DeliveryError(f"invalid no_reply reason for delivery state {file}")
+    state = _load_state(file)
+    key = _require_job(state, file, channel_id, message_id)
+    job = state["jobs"][key]
+    existing = job.get("no_reply_declaration")
+    if existing is not None:
+        if existing.get("job_ref") == job_ref and existing.get("reason") == reason:
+            return copy.deepcopy(job)
+        raise DeliveryError(f"delivery state {file}: job {key} no_reply conflict")
+    if job["stage"] not in ("turn_submitting", "inflight"):
+        raise DeliveryError(
+            f"delivery state {file}: job {key} stage {job['stage']} cannot declare no_reply"
+        )
+    jev = job.get("jev_decision")
+    if jev is None or jev.get("participation") != "need_context":
+        raise DeliveryError(f"delivery state {file}: job {key} has no need_context proof")
+    if job["job_ref"] is None or job["job_ref"] != job_ref:
+        raise DeliveryError(f"delivery state {file}: job {key} job_ref mismatch")
+    # NEW zero-send proof: the declaring POST must have persisted its
+    # first-user fingerprint (all real Router POSTs do). Missing/zero/
+    # invalid binding can never declare, terminalize, or ACK.
+    _sub_sha = job.get("submitted_text_sha256")
+    _sub_len = job.get("submitted_text_len")
+    if not (
+        _is_sha256_hex(_sub_sha)
+        and _is_strict_int(_sub_len)
+        and 1 <= _sub_len <= SUBMITTED_TEXT_MAX
+    ):
+        raise DeliveryError(f"delivery state {file}: job {key} has no submitted proof")
+    if job["send_intents"] or job["send_receipts"] or job["trace_refs"] is not None:
+        raise DeliveryError(f"delivery state {file}: job {key} has send evidence; cannot declare")
+    if job.get("observation") is not None:
+        raise DeliveryError(f"delivery state {file}: job {key} already observed")
+    job["no_reply_declaration"] = {"job_ref": job_ref, "reason": reason, "ts": _now_iso()}
+    job["updated_at"] = _now_iso()
+    _save_state(file, state)
+    return copy.deepcopy(job)
+
+
+def complete_observation(
+    path: str | Path,
+    channel_id: int,
+    message_id: int,
+    *,
+    turn_index: int,
+    tool_call_ids: list[str],
+) -> dict[str, Any]:
+    """Complete a declared no-reply after traced ``record_no_reply`` proof.
+
+    Only an ``inflight`` job (or a zero-evidence ``uncertain`` job) with a
+    bound Jev ``need_context`` decision, an exact matching declaration
+    nonce, a KNOWN stored first-user fingerprint (exact prompt.strip
+    SHA-256 + char len), zero intents/receipts, and a bound matching
+    ``turn_index`` can complete. ``tool_call_ids`` must be nonempty
+    unique valid IDs from the caller's verified native Trace (core checks
+    format/matching only). Stores ``trace_refs`` plus
+    ``observation={origin: thyca}``, sets stage ``observed``, and clears
+    an uncertain error. Existing ambiguous uncertain jobs without an
+    exact declaration proof are never touched. Unlike legacy completed,
+    this NEW terminal has no None-fingerprint compat: missing/zero/
+    invalid binding never terminals/ACKs.
+    """
+    file = Path(path)
+    if not _is_strict_int(turn_index) or turn_index < 0:
+        raise DeliveryError(f"invalid turn_index for delivery state {file}")
+    if not isinstance(tool_call_ids, list) or not tool_call_ids:
+        raise DeliveryError(f"invalid tool_call_ids for delivery state {file}")
+    for tool_id in tool_call_ids:
+        if _validate_id_string(tool_id) is None:
+            raise DeliveryError(f"invalid tool_call_id for delivery state {file}")
+    if len(set(tool_call_ids)) != len(tool_call_ids):
+        raise DeliveryError(f"invalid tool_call_ids for delivery state {file}")
+    state = _load_state(file)
+    key = _require_job(state, file, channel_id, message_id)
+    job = state["jobs"][key]
+    if job["stage"] == "observed":
+        obs = job.get("observation") or {}
+        existing = job.get("trace_refs") or {}
+        if (
+            obs.get("origin") == "thyca"
+            and job["turn_index"] == turn_index
+            and existing.get("tool_call_ids") == list(tool_call_ids)
+        ):
+            return copy.deepcopy(job)
+        raise DeliveryError(f"delivery state {file}: job {key} observed payload mismatch")
+    if job["stage"] not in ("inflight", "uncertain"):
+        raise DeliveryError(
+            f"delivery state {file}: job {key} stage {job['stage']} cannot complete observation"
+        )
+    jev = job.get("jev_decision")
+    if jev is None or jev.get("participation") != "need_context":
+        raise DeliveryError(f"delivery state {file}: job {key} has no need_context proof")
+    decl = job.get("no_reply_declaration")
+    if decl is None or job["job_ref"] is None or decl.get("job_ref") != job["job_ref"]:
+        raise DeliveryError(f"delivery state {file}: job {key} has no no_reply proof")
+    # NEW terminal proof: stored first-user fingerprint must be present
+    # and valid (no legacy None compat). Structurally missing binding
+    # never terminals/ACKs even when SID/index/trace were verified.
+    _csub_sha = job.get("submitted_text_sha256")
+    _csub_len = job.get("submitted_text_len")
+    if not (
+        _is_sha256_hex(_csub_sha)
+        and _is_strict_int(_csub_len)
+        and 1 <= _csub_len <= SUBMITTED_TEXT_MAX
+    ):
+        raise DeliveryError(f"delivery state {file}: job {key} has no submitted proof")
+    if job["send_intents"] or job["send_receipts"] or job["trace_refs"] is not None:
+        raise DeliveryError(f"delivery state {file}: job {key} has send evidence; cannot observe")
+    if job["turn_index"] != turn_index:
+        raise DeliveryError(f"delivery state {file}: job {key} turn_index mismatch")
+    if job.get("observation") is not None:
+        raise DeliveryError(f"delivery state {file}: job {key} already observed")
+    job["trace_refs"] = {"tool_call_ids": list(tool_call_ids), "ts": _now_iso()}
+    job["observation"] = {"origin": "thyca", "ts": _now_iso()}
+    job["error"] = None
+    job["stage"] = "observed"
+    job["updated_at"] = _now_iso()
+    _save_state(file, state)
+    return copy.deepcopy(job)
+
+
 def processed_seq_prefix(
     path: str | Path,
     ordered_entries: list[dict[str, Any]],
     current_acked: int,
 ) -> int:
-    """Highest ACTUAL seen seq resolved via historical/completed/skipped.
+    """Highest ACTUAL seen seq resolved via historical/completed/skipped/observed.
 
     Caller precondition: ``ordered_entries`` is the AUTHORITATIVE FULL
     UNFILTERED unread outbox prefix (this helper CANNOT detect omitted
@@ -1601,8 +1218,10 @@ def processed_seq_prefix(
     whose KNOWN source (primary/alias of a job) is a different MID than
     the row supplies is a contradiction and raises -- never a silent stop
     and never a bypass of historical resolution. The first entry whose MID
-    is not historical and whose job is not ``completed``/``skipped`` with
-    an exact (channel, mid, seq) match stops the prefix. Historical MIDs
+    is not historical and whose job is not ``completed``/``skipped``/``observed``
+    with an exact (channel, mid, seq) match stops the prefix. Observed jobs
+    count only after load validation proved zero send evidence plus a valid
+    Jev or Thyca observation proof. Historical MIDs
     without a job get format checks only (deployment-proven baseline).
     Never mutates the file; errors carry field/index metadata only, never
     entry content.
@@ -1688,7 +1307,7 @@ def processed_seq_prefix(
             result = seq
             continue
         job = jobs.get(_job_key(*pair))
-        if job is None or job["stage"] not in ("completed", "skipped"):
+        if job is None or job["stage"] not in ("completed", "skipped", "observed"):
             break
         if seq not in set([job["seq"], *job["seq_aliases"]]):
             break

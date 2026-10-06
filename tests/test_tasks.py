@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from thyca_discord_mcp.tasks import (
+from modum.tasks import (
     AUTO_RECOVERY_TASK_NAME,
     AUTO_REPLY_TASK_NAME,
     TaskRegistry,

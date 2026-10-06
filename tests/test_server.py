@@ -4,9 +4,9 @@ Uses the native FastMCP public API (``list_tools``/``call_tool``) and the real
 installed lifespan (``mcp.settings.lifespan``) with a fake Discord bot — no
 network, no real .env/outbox/audit files (all paths are tmp fixtures).
 
-v5 isolation: this module covers the base 12-tool MCP protocol only. The
+v5 isolation: this module covers the base 14-tool MCP protocol only. The
 ``running_server`` helper (and every direct-lifespan test) patches
-``thyca_discord_mcp.server.Responder`` with ``FakeResponder`` and parks the
+``modum.server.Responder`` with ``FakeResponder`` and parks the
 always-on auto loops before their first tick, so no worker logic runs here.
 ``FakeResponder.guard_ack`` is a deliberate no-op: these tests isolate the
 underlying ack monotonic API only — the mandatory production guard is proven
@@ -26,15 +26,15 @@ import discord
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
-from thyca_discord_mcp.config import Settings
-from thyca_discord_mcp.outbox import (
+from modum.config import Settings
+from modum.outbox import (
     OutboxError,
     append_entry,
     get_poll_cursor,
     read_entries,
     set_poll_cursor,
 )
-from thyca_discord_mcp.server import create_server
+from modum.server import create_server
 
 BOT_UID = 111
 OWNER_UID = 222
@@ -42,6 +42,26 @@ GUILD_ID = 333
 CHANNEL_ID = 444
 
 EXPECTED_TOOLS = [
+    "ack_outbox",
+    "add_poll_task",
+    "guild_info",
+    "list_members",
+    "list_tasks",
+    "list_text_channels",
+    "read_context",
+    "read_outbox",
+    "record_no_reply",
+    "remove_poll_task",
+    "send_message",
+    "start_task",
+    "stop_task",
+    "whoami",
+]
+
+# Pre-routing tools: every one of the old 12 must remain with compatible
+# behavior; the 2 additions (read_context, record_no_reply) are covered in
+# tests/test_observation_server.py.
+EXPECTED_LEGACY_TOOLS = [
     "ack_outbox",
     "add_poll_task",
     "guild_info",
@@ -199,12 +219,21 @@ def make_history(messages=(), exc=None):
     return history, calls, state
 
 
+def _deleted_not_found():
+    """Real strict discord.NotFound (404/10008 Unknown Message), no network."""
+    return discord.NotFound(
+        SimpleNamespace(status=404, reason="Not Found"),
+        {"code": 10008, "message": "Unknown Message"},
+    )
+
+
 def make_text_channel(cid, guild_id=GUILD_ID, history=None):
-    """Spec'd TextChannel mock: passes isinstance, records sends."""
+    """Spec'd TextChannel mock: passes isinstance, records sends, proves reads."""
     channel = MagicMock(spec=discord.TextChannel)
     channel.id = cid
     channel.guild = SimpleNamespace(id=guild_id)
     sent: list[FakeMessage] = []
+    store: dict = {"deleted": set(), "exc": None, "calls": []}
 
     async def fake_send(content, **kwargs):
         msg = FakeMessage(
@@ -218,9 +247,26 @@ def make_text_channel(cid, guild_id=GUILD_ID, history=None):
         sent.append(msg)
         return msg
 
+    async def fake_fetch(mid):
+        # READ support for the pre-send existence proof (ID/scope only).
+        store["calls"].append(mid)
+        if store["exc"] is not None:
+            raise store["exc"]
+        if mid in store["deleted"]:
+            raise _deleted_not_found()
+        return FakeMessage(
+            mid,
+            FakeUser(OWNER_UID, "Owner"),
+            "",
+            channel_id=cid,
+            guild_id=guild_id,
+        )
+
     channel.send = fake_send
+    channel.fetch_message = fake_fetch
     channel.history = history or make_history()[0]
     channel.sent = sent
+    channel.source_store = store
     return channel
 
 
@@ -312,8 +358,8 @@ async def running_server(monkeypatch, settings, bot):
     their first tick can never run. v4 protocol assertions stay race-free;
     default-on auto behavior is proven in tests/test_server_responder.py.
     """
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", FakeResponder)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         for name in ("auto-reply", "auto-reply-recovery"):
@@ -391,7 +437,7 @@ async def test_new_tool_descriptions_carry_essentials(settings):
 async def test_identity_policy_visible_in_tool_descriptions(settings):
     mcp = create_server(settings)
     descs = {t.name: t.description or "" for t in await mcp.list_tools()}
-    assert sorted(descs) == EXPECTED_TOOLS  # still 12 tools
+    assert sorted(descs) == EXPECTED_TOOLS  # 14 tools: old 12 intact + 2 routing additions
     for name in ("whoami", "read_outbox", "send_message"):
         desc = descs[name]
         assert str(settings.owner_uid) in desc  # parameterized owner UID (222 in tests)
@@ -721,8 +767,8 @@ async def test_send_message_scoped_helper_regression(settings, monkeypatch):
 
 async def test_lifespan_startup_order_and_listener(settings, monkeypatch):
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", FakeResponder)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         # Listener registered after build, before login/connect; login before connect.
@@ -750,8 +796,8 @@ async def test_lifespan_early_gateway_failure(settings, monkeypatch):
         await asyncio.sleep(3600)
 
     bot.wait_until_ready = hang_ready
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="gateway failed before ready"):
         async with mcp.settings.lifespan(mcp):
@@ -779,8 +825,8 @@ async def test_lifespan_login_failure_closes_bot_and_listener(settings, monkeypa
         FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}),
         login_exc=discord.LoginFailure("bad token"),
     )
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(discord.LoginFailure, match="bad token"):
         async with mcp.settings.lifespan(mcp):
@@ -804,8 +850,8 @@ async def test_lifespan_ready_failure_cleans_gateway(settings, monkeypatch):
         await orig_connect()
 
     bot.connect = spy_connect
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="ready boom"):
         async with mcp.settings.lifespan(mcp):
@@ -843,8 +889,8 @@ async def test_lifespan_cancel_during_readiness_wait_cleans_all(settings, monkey
 
     bot.wait_until_ready = hang_ready
     bot.connect = spy_connect
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", FakeResponder)
     mcp = create_server(settings)
 
     async def _run():
@@ -874,8 +920,8 @@ async def test_lifespan_cancel_during_login_cleans_all(settings, monkeypatch):
         await login_release.wait()
 
     bot.login = gated_login
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", FakeResponder)
     mcp = create_server(settings)
 
     async def _run():
@@ -907,8 +953,8 @@ async def test_lifespan_close_error_still_settles_tasks(settings, monkeypatch):
         await orig_connect()
 
     bot.connect = spy_connect
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="close boom"):
         async with mcp.settings.lifespan(mcp) as ctx:
@@ -935,8 +981,8 @@ async def test_lifespan_startup_refuses_state_behind_log(settings, monkeypatch):
     state_before = settings.outbox_state_path.read_bytes()
     log_before = settings.outbox_path.read_bytes()
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(OutboxError, match="behind the log"):
         async with mcp.settings.lifespan(mcp):
@@ -958,8 +1004,8 @@ async def test_lifespan_startup_refuses_malformed_log(settings, monkeypatch):
     state_before = settings.outbox_state_path.read_bytes()
     log_before = settings.outbox_path.read_bytes()
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(OutboxError, match="corrupt outbox log"):
         async with mcp.settings.lifespan(mcp):
@@ -1210,8 +1256,8 @@ async def test_stop_task_refuses_protected_loops(settings, monkeypatch):
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     # Unparked lifespan: the protected loops must be running to prove the
     # refusal is about protection, not idleness.
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FakeResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", FakeResponder)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         assert ctx["tasks"].status("auto-reply").running is True
@@ -1306,8 +1352,8 @@ async def test_lifespan_cancel_during_login_with_cleanup_failure_stays_cancelled
         await asyncio.sleep(3600)
 
     bot.login = gated_login
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FailingCloseResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", FailingCloseResponder)
     mcp = create_server(settings)
 
     async def _run():
@@ -1336,8 +1382,8 @@ async def test_lifespan_startup_failure_with_cleanup_failures_keeps_primary(sett
         login_exc=discord.LoginFailure("bad token"),
         close_exc=RuntimeError("bot close boom"),
     )
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", FailingCloseResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", FailingCloseResponder)
     mcp = create_server(settings)
     with pytest.raises(discord.LoginFailure, match="bad token") as excinfo:
         async with mcp.settings.lifespan(mcp):
@@ -1357,8 +1403,8 @@ async def test_lifespan_startup_failure_with_cleanup_failures_keeps_primary(sett
 async def test_lifespan_listener_removal_failure_still_tears_down(settings, monkeypatch):
     channel = make_text_channel(CHANNEL_ID)
     bot = FailingRemoveListenerBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    monkeypatch.setattr("thyca_discord_mcp.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("thyca_discord_mcp.server.Responder", RefusingGuardResponder)
+    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("modum.server.Responder", RefusingGuardResponder)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="remove boom"):
         async with mcp.settings.lifespan(mcp):

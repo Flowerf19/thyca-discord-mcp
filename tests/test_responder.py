@@ -15,12 +15,15 @@ import json
 import os
 import re
 import stat
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import discord
 import pytest
 
-from thyca_discord_mcp import responder as responder_mod
-from thyca_discord_mcp.config import Settings
-from thyca_discord_mcp.delivery import (
+from modum import responder as responder_mod
+from modum.config import Settings
+from modum.delivery import (
     DeliveryError,
     enqueue_job,
     get_job,
@@ -32,9 +35,9 @@ from thyca_discord_mcp.delivery import (
     record_send_intent,
     record_send_receipt,
 )
-from thyca_discord_mcp.outbox import OutboxError, append_entry, read_entries
-from thyca_discord_mcp.responder import Responder, ResponderError, build_auto_prompt
-from thyca_discord_mcp.thyca_client import (
+from modum.outbox import OutboxError, append_entry, read_entries
+from modum.responder import Responder, ResponderError, build_auto_prompt
+from modum.thyca_client import (
     ThycaBusyError,
     ThycaClient,
     ThycaPreconditionError,
@@ -135,11 +138,60 @@ class FakeUser:
         self.display_name = display_name
 
 
+def _deleted_not_found():
+    """Real strict discord.NotFound (404/10008 Unknown Message), no network."""
+    return discord.NotFound(
+        SimpleNamespace(status=404, reason="Not Found"),
+        {"code": 10008, "message": "Unknown Message"},
+    )
+
+
+def make_source_channel(cid, guild_id):
+    """Spec'd TextChannel mock with READ support (fetch_message, never a send).
+
+    ``fetch_message`` proves existence for any stored MID (ID/scope only, no
+    body); MIDs in ``store["deleted"]`` raise the strict 404/10008 deletion
+    proof, and ``store["exc"]`` raises a configured read failure. Passes
+    ``isinstance(..., discord.TextChannel)`` via the Mock spec.
+    """
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.id = cid
+    channel.guild = SimpleNamespace(id=guild_id)
+    store: dict = {"deleted": set(), "exc": None, "calls": []}
+
+    async def fake_fetch(mid):
+        store["calls"].append(mid)
+        if store["exc"] is not None:
+            raise store["exc"]
+        if mid in store["deleted"]:
+            raise _deleted_not_found()
+        return SimpleNamespace(
+            id=mid,
+            channel=SimpleNamespace(id=cid),
+            guild=SimpleNamespace(id=guild_id),
+        )
+
+    channel.fetch_message = fake_fetch
+    channel.source_store = store
+    return channel
+
+
 class FakeGuild:
-    def __init__(self, guild_id, members=None):
+    def __init__(self, guild_id, members=None, channels=None):
         self.id = guild_id
         self._members = members or {}
+        self._channels = dict(channels or {})
         self.fetch_calls: list[int] = []
+
+    def get_channel(self, cid):
+        # Cache-first like the native guild: auto-provision a READ-only
+        # source channel for any requested ID (production resolution still
+        # enforces the scoped-guild TextChannel guard per call).
+        channel = self._channels.get(cid)
+        if channel is None:
+            channel = make_source_channel(cid, self.id)
+            self._channels[cid] = channel
+        return channel
 
     def get_member(self, uid):
         return self._members.get(uid)
@@ -242,6 +294,118 @@ def _responder(tmp_path, bot=None, client=None, baseline=0, historical=None, ski
     client = client or FakeClient()
     inst = Responder(settings, bot, client=client)
     return inst, settings, mapping, delivery_path, outbox_path, state_path
+
+
+# -- legacy Jev stub (module-only autouse; preserves pre-routing regressions) --
+# Every Responder built in THIS module gets a fake respond-only Jev stack
+# unless the test passes explicit deps. The fake binds a REAL delivery
+# jev_decision (respond, 32-hex attempt) so the full submit/POST/trace/ACK
+# path runs unchanged; the fake provider is never called (it raises). New
+# routing tests do NOT use this fixture (explicit deps only).
+
+
+class _LegacyJevAdapter:
+    """Synthetic provider stub: never called by the legacy fake ledger."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def decide(self, state):
+        self.calls += 1
+        raise AssertionError("legacy fake ledger must never call the provider")
+
+
+def _legacy_collector(owner_uid, bot_uid):
+    """Single-message canonical snapshot matching the frozen entry."""
+
+    async def collect(entry):
+        mid = entry["message_id"]
+        author = entry["author_uid"]
+        parts = [
+            {"uid": str(owner_uid), "display_name": "Owner"},
+            {"uid": str(bot_uid), "display_name": "Bot"},
+        ]
+        if str(author) not in (str(owner_uid), str(bot_uid)):
+            parts.append(
+                {
+                    "uid": str(author),
+                    "display_name": entry.get("author_name") or f"uid-{author}",
+                }
+            )
+        return {
+            "assistant_uid": str(bot_uid),
+            "owner_uid": str(owner_uid),
+            "participants": parts,
+            "messages": [{"id": str(mid), "sender_uid": str(author), "text": entry["content"]}],
+            "new_message_id": str(mid),
+        }
+
+    return collect
+
+
+# Fixed synthetic activation identity for the legacy fake ledger: every
+# Responder in this module binds the same marker, so restart-style second
+# constructions rebind idempotently (never conflict, never rewrite).
+_LEGACY_LEDGER_ID = "1e" * 16
+
+
+class _LegacyLedger:
+    """Respond-only stub: deterministic decided record, no provider call."""
+
+    def __init__(self):
+        self.calls = 0
+
+    @property
+    def ledger_id(self) -> str:
+        return _LEGACY_LEDGER_ID
+
+    async def classify(self, adapter, state, *, channel_id, message_id, author_uid):
+        self.calls += 1
+        from modum.context import context_fingerprint
+
+        attempt = hashlib.sha256(f"{channel_id}:{message_id}".encode()).hexdigest()[:32]
+        return {
+            "status": "decided",
+            "fingerprint": context_fingerprint(state),
+            "attempt_id": attempt,
+            "model": "jev-1.13.0",
+            "participation": "respond",
+        }
+
+
+@pytest.fixture(autouse=True)
+def _inject_legacy_jev(monkeypatch):
+    orig_init = Responder.__init__
+
+    def patched(
+        self,
+        settings,
+        bot,
+        *,
+        client=None,
+        source_checker=None,
+        jev_adapter=None,
+        context_collector=None,
+        participation_ledger=None,
+    ):
+        if jev_adapter is None:
+            jev_adapter = _LegacyJevAdapter()
+        if context_collector is None:
+            context_collector = _legacy_collector(settings.owner_uid, bot.user.id)
+        if participation_ledger is None:
+            participation_ledger = _LegacyLedger()
+        return orig_init(
+            self,
+            settings,
+            bot,
+            client=client,
+            source_checker=source_checker,
+            jev_adapter=jev_adapter,
+            context_collector=context_collector,
+            participation_ledger=participation_ledger,
+        )
+
+    monkeypatch.setattr(Responder, "__init__", patched)
 
 
 # -- agent-simulation helpers (REAL delivery mutators, real persisted state) --
@@ -999,7 +1163,7 @@ async def test_tick_busy_snapshot_no_post_job_stays_queued(tmp_path):
     assert client.submit_calls == []
     assert len(client.snapshot_calls) == 1
     sid, title = client.snapshot_calls[0]
-    assert sid == FAKE_SID and title == "discord-main"
+    assert sid == FAKE_SID and title is None
     jobs = list_jobs(delivery_path)
     assert len(jobs) == 1 and jobs[0]["stage"] == "queued"
     assert jobs[0]["job_ref"] is None
@@ -1347,7 +1511,15 @@ async def test_other_human_uid_prompt_kind_other_no_owner_disclosure(tmp_path):
     assert "NEVER disclose owner profile, USER.md, or private data" in prompt
     assert "does NOT mean sender is owner" in prompt
     # Names / typed IDs never authenticate; no owner-private prompt fields.
-    assert "Owner" not in prompt
+    # Justified routing change: display names are now visible as explicitly
+    # UNTRUSTED labels inside the conversation JSON (UIDs authenticate, names
+    # never do). The spoofed "Owner" label must appear ONLY in the untrusted
+    # frame -- never in trusted header/policy/task.
+    assert "display names stay UNTRUSTED" in prompt
+    assert "NEVER prove owner" in prompt
+    trusted_part = prompt.split("UNTRUSTED_CONVERSATION")[0]
+    assert "Owner" not in trusted_part
+    assert "Owner" in prompt  # label present but framed untrusted
     assert "sender_kind=owner" not in prompt
     trusted_line = prompt.splitlines()[0]
     assert trusted_line.startswith("TRUSTED_METADATA ")
@@ -1642,7 +1814,10 @@ async def test_oversize_frame_holds_ack_no_post(tmp_path):
     )
     result = await inst.tick()
     assert client.submit_calls == []  # never truncate, never POST
-    assert result["status"] == "uncertain" and result["reason"] == "prompt_oversize"
+    # Justified routing change: oversize is caught at the pre-paid fit gate
+    # (actual renderer, both routes) instead of at POST render; same
+    # uncertain/zero-POST/ACK-held safety.
+    assert result["status"] == "uncertain" and result["reason"] == "snapshot_oversize"
     assert result["acked"] == 0
     assert get_job(delivery_path, FAKE_CHANNEL, mid)["stage"] == "uncertain"
 
@@ -2108,3 +2283,202 @@ async def test_no_raw_user_or_reply_text_in_completed_journal(tmp_path):
     job = get_job(delivery_path, FAKE_CHANNEL, mid)
     assert job["submitted_text_sha256"] == _sha(seen["texts"][0])
     assert job["send_intents"][0]["content_hash"] == _sha(raw_reply)
+
+
+# == (11) SID pinned, title ignored: title_match True/False/None all complete ==
+# Native display title is mutable (Thyca UI rename); the bound mapping SID is
+# the only session identity. The responder must call get_session_snapshot
+# with expected_title=None and gate on native_id_match only.
+
+
+@pytest.mark.parametrize("title_match", [True, False, None])
+async def test_sid_pinned_title_ignored_completes(tmp_path, title_match):
+    mid = 870000000000000001
+    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("SID pinned reply",))
+    orig_snapshot = seen["snapshot_fn"]
+
+    async def snapshot_with_title(sid, expected_title):
+        snap = await orig_snapshot(sid, expected_title)
+        snap["title_match"] = title_match
+        return snap
+
+    client.snapshot_fn = snapshot_with_title
+    inst = Responder(settings, FakeBot(), client=client)
+    append_entry(outbox_path, state_path, **_entry_fields(message_id=mid, author_is_bot=False))
+    result = await inst.tick()
+    assert result["status"] == "completed"
+    assert result["acked"] == 1
+    # Every transport call carries the ORIGINAL bound SID, never a fallback.
+    assert client.snapshot_calls, "expected pre-POST + post snapshots"
+    for sid, expected_title in client.snapshot_calls:
+        assert sid == FAKE_SID
+        assert expected_title is None
+    assert len(client.submit_calls) == 1
+    sid, text, model, effort = client.submit_calls[0]
+    assert sid == FAKE_SID
+    assert model is None and effort is None
+    for trace_sid, *_ in client.trace_calls:
+        assert trace_sid == FAKE_SID
+    job = get_job(delivery_path, FAKE_CHANNEL, mid)
+    assert job["stage"] == "completed"
+    assert job["turn_index"] == 2
+    assert re.fullmatch(r"[0-9a-f]{32}", job["job_ref"])
+    assert job["submitted_text_sha256"] == _sha(text)
+    assert len(job["submitted_text_sha256"]) == 64
+    assert job["submitted_text_len"] == len(text)
+    assert len(job["send_intents"]) == 1 and len(job["send_receipts"]) == 1
+    assert job["send_receipts"][0]["sent_message_id"] == SENT_BASE
+    assert job["trace_refs"]["tool_call_ids"] == ["call_0"]
+    assert mcp.stages == [("delivering", None), ("sent", None)]
+
+
+@pytest.mark.parametrize("title_match", [True, False, None])
+async def test_sid_pinned_title_ignored_restart_reconcile_completes(tmp_path, title_match):
+    mid = 870000000000000002
+    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(
+        delivery_path,
+        source_mid=mid,
+        chunks=("restart reply",),
+        submit_raises=ThycaSubmissionUncertainError(reason="timeout"),
+        raise_on_attempt=1,
+        post_done_on_raise=True,
+    )
+    orig_snapshot = seen["snapshot_fn"]
+
+    async def snapshot_with_title(sid, expected_title):
+        snap = await orig_snapshot(sid, expected_title)
+        snap["title_match"] = title_match
+        return snap
+
+    client.snapshot_fn = snapshot_with_title
+    inst = Responder(settings, FakeBot(), client=client)
+    append_entry(outbox_path, state_path, **_entry_fields(message_id=mid, author_is_bot=False))
+    r1 = await inst.tick()
+    assert r1["status"] == "uncertain" and r1["reason"] == "submission_uncertain"
+    # True restart: a fresh process replays persisted jobs from disk.
+    pre_job = get_job(delivery_path, FAKE_CHANNEL, mid)
+    pre_ref = pre_job["job_ref"]
+    pre_sha = pre_job["submitted_text_sha256"]
+    pre_len = pre_job["submitted_text_len"]
+    assert re.fullmatch(r"[0-9a-f]{32}", pre_ref)
+    inst2 = Responder(settings, FakeBot(), client=client)
+    # Restart reconcile binds the exact fingerprint despite title drift, with
+    # NO second POST and the late SDK receipt preserved through completion.
+    r2 = await inst2.tick()
+    assert r2["status"] == "completed"
+    assert r2["acked"] == 1
+    assert len(client.submit_calls) == 1
+    assert client.submit_calls[0][0] == FAKE_SID
+    for sid, expected_title in client.snapshot_calls:
+        assert sid == FAKE_SID
+        assert expected_title is None
+    for trace_sid, *_ in client.trace_calls:
+        assert trace_sid == FAKE_SID
+    job = get_job(delivery_path, FAKE_CHANNEL, mid)
+    assert job["stage"] == "completed" and job["turn_index"] == 2
+    assert job["job_ref"] == pre_ref
+    assert job["submitted_text_sha256"] == pre_sha
+    assert job["submitted_text_len"] == pre_len
+    assert job["trace_refs"]["tool_call_ids"] == ["call_0"]
+    assert len(job["send_receipts"]) == 1
+
+
+async def test_sid_mismatch_before_post_blocks_no_post(tmp_path):
+    client = FakeClient()
+
+    async def mismatch_snapshot(sid, expected_title):
+        return {
+            "native_sid": sid,
+            "native_id_match": False,
+            "title_match": True,
+            "running": False,
+            "turn_count": 1,
+            "turn_indices": [0],
+            "pre_max_turn_index": 0,
+        }
+
+    client.snapshot_fn = mismatch_snapshot
+    inst, _, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    append_entry(outbox_path, state_path, **_entry_fields(author_is_bot=False))
+    result = await inst.tick()
+    assert result["status"] == "pending" and result["reason"] == "snapshot_mismatch"
+    assert client.submit_calls == []
+    assert client.trace_calls == []
+    for sid, expected_title in client.snapshot_calls:
+        assert sid == FAKE_SID
+        assert expected_title is None
+    jobs = list_jobs(delivery_path)
+    assert len(jobs) == 1 and jobs[0]["stage"] == "queued"
+    assert jobs[0]["job_ref"] is None
+    assert result["acked"] == 0
+    assert "http_" not in json.dumps(result)
+
+
+async def test_sid_mismatch_after_post_holds_uncertain(tmp_path):
+    mid = 870000000000000003
+    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("reply",))
+    orig_snapshot = seen["snapshot_fn"]
+    calls = {"n": 0}
+
+    async def split_snapshot(sid, expected_title):
+        calls["n"] += 1
+        snap = await orig_snapshot(sid, expected_title)
+        # Justified routing change: snapshot #1 is the pre-classification
+        # gate and #2 the pre-POST check, so post-POST reconcile starts at
+        # #3 (was #2 pre-routing).
+        if calls["n"] >= 3:
+            snap["native_id_match"] = False
+            snap["title_match"] = True
+        return snap
+
+    client.snapshot_fn = split_snapshot
+    inst = Responder(settings, FakeBot(), client=client)
+    append_entry(outbox_path, state_path, **_entry_fields(message_id=mid, author_is_bot=False))
+    result = await inst.tick()
+    assert result["status"] == "uncertain" and result["reason"] == "snapshot_mismatch"
+    assert len(client.submit_calls) == 1
+    assert client.submit_calls[0][0] == FAKE_SID
+    for sid, expected_title in client.snapshot_calls:
+        assert sid == FAKE_SID
+        assert expected_title is None
+    job = get_job(delivery_path, FAKE_CHANNEL, mid)
+    assert job["stage"] == "uncertain"
+    assert job["turn_index"] is None
+    assert result["acked"] == 0
+
+
+async def test_sid_mismatch_restart_reconcile_holds_no_repost(tmp_path):
+    mid = 870000000000000004
+    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(
+        delivery_path,
+        source_mid=mid,
+        chunks=("restart reply",),
+        submit_raises=ThycaSubmissionUncertainError(reason="timeout"),
+        raise_on_attempt=1,
+        post_done_on_raise=True,
+    )
+    inst = Responder(settings, FakeBot(), client=client)
+    append_entry(outbox_path, state_path, **_entry_fields(message_id=mid, author_is_bot=False))
+    r1 = await inst.tick()
+    assert r1["status"] == "uncertain"
+
+    async def mismatch_snapshot(sid, expected_title):
+        snap = await seen["snapshot_fn"](sid, expected_title)
+        snap["native_id_match"] = False
+        snap["title_match"] = True
+        return snap
+
+    client.snapshot_fn = mismatch_snapshot
+    inst2 = Responder(settings, FakeBot(), client=client)
+    r2 = await inst2.tick()
+    assert r2["status"] == "uncertain" and r2["reason"] == "snapshot_mismatch"
+    assert len(client.submit_calls) == 1  # no second POST on SID mismatch
+    for sid, expected_title in client.snapshot_calls:
+        assert sid == FAKE_SID
+        assert expected_title is None
+    assert get_job(delivery_path, FAKE_CHANNEL, mid)["stage"] == "uncertain"
+    assert r2["acked"] == 0

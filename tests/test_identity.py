@@ -1,4 +1,4 @@
-from thyca_discord_mcp.identity import ActorKind, classify_actor
+from modum.identity import ActorKind, classify_actor
 
 BOT_UID = 111
 OWNER_UID = 222

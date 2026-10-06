@@ -22,7 +22,7 @@ last_updated: 2026-10-05
   `75c5ea0` stays the historical v4 checkpoint, not the commit ceiling; V5 source
   was uncommitted at doc time and its commit follows the owner authorization above.
   v4 plan `v4-outbox-digest.md` stays DONE.
-- CURRENT (verified after the 6-item review cleanup; supersedes the 454 baseline
+- CURRENT at `c8b6f94` (historical snapshot; superseded by §6A — verified after the 6-item review cleanup; supersedes the 454 baseline
   below): new `delivery.py` / `thyca_client.py` / `responder.py` + new
   `tests/test_delivery.py` / `tests/test_thyca_client.py` /
   `tests/test_responder.py` / `tests/test_server_responder.py`; modified
@@ -383,6 +383,65 @@ last_updated: 2026-10-05
   — never fake an owner-UID test as that proof. This planning task mutated NO
   state.
 
+## 6A. Accepted identity update (SID-pinned; historical source proof)
+
+- The owner approved ignoring the native display title for identity: all 3 snapshot
+  gates (`_submit_queued`, `_reconcile_after_post`, `_reconcile_job`; 6 clauses) check
+  `native_id_match` only, `expected_title` omitted. `title_match` stays optional
+  diagnostic metadata; internal audit/`session_id` label stays `discord-main`, separate
+  from the renamable native UI title (cosmetic; native SID fixed). Own-SID trace index, fresh nonce, first-user
+  SHA/len proof, and receipts-gated safe ACK are unchanged; true SID mismatch still
+  fails closed. Checked on SID-fix source (historical checkpoint): 464 PASS in 13.16 s (responder 97 = 88 + 9
+  new title-ignored cases); `ruff check src tests` + format (27 files) + diff check
+  clean. Later external restart observed 2026-10-05 18:58+07; no retroactive
+  deploy approval from that event, and open live-fail gates unchanged.
+  No commit after `c8b6f94`. PAUSED: server helper extraction
+  is wired (server 931 + helpers 127 lines); delivery/client helper files remain
+  inert, full refactor incomplete. Peer re-review (`bd47`) is COMPLETE: NO confirmed
+  findings, scoped APPROVE of the SOURCE SID fix ONLY (not deploy/live).
+  T5/T6 stay in-progress.
+
+## 6B. Accepted deleted-source no-reply (source-only; rollout pending)
+
+- Policy: a source confirmed deleted (exact MID) BEFORE any send attempt is a
+  proven-no-send durable `skipped` / `source_deleted` with zero send evidence —
+  no intent, no SDK send, no plain fallback — checked before the LLM POST and
+  again before the correlated MCP send; safe-prefix ACK. Proof is strict: exact
+  `fetch_message` GET bound to the approved guild/channel/MID raising native
+  NotFound 404 + 10008; on GET success the returned MID/channel/guild must
+  match. `SourceUnavailable`/permission/403/other 404s (e.g. 10003)/timeout/5xx
+  is NOT deletion (pre-POST `queued`/`pending`, no POST/nonce; pre-intent MCP
+  bounded error, no SDK). Existing intent/receipt/trace or
+  `uncertain`/`completed` never skips; partial sends hold `uncertain` (receipt
+  kept, further chunks withheld). No MCP send after a mid-generation deletion
+  can hold `uncertain` (no always-unblocks-FIFO claim). After any SDK call ALL
+  errors stay `uncertain`. Durable zero-evidence skip wins over late native
+  POST/result/snapshot/trace outcomes; cancellation propagates. Storage v1 +
+  new skip enum (aliases/unknown fields preserved);
+  `MessageReference(fail_if_not_exists=True)` kept; single GET read, no history
+  scan or content processing, needs ViewChannel + ReadMessageHistory. Symbols:
+  `source_messages.py` (`build_source_checker`/`check_source_message`/
+  `_resolve_text_channel`, alias via `server_helpers`), `Responder` optional
+  `source_checker` (default real SDK), `skip_job` zero-evidence gate. Reply
+  policy only: no AI-history/message-body deletion; owner/clone/shared-memory
+  design tabled.
+- No full-refactor claim: server helper wired, schema/client splits inert and
+  paused; no always-no-reply/exactly-once claim (narrow HTTP-write races hold).
+- Checks, dated 2026-10-05: FINAL 503 PASS in 12.78 s (464 baseline + 39
+  source-deleted: 36 initial + 3 guard), Ruff check clean, 33 formatted, diff
+  check clean. Both hardenings DONE and checked (common fresh post-GET latch +
+  correlated_job guard on both paths; `source_deleted`-only tombstone
+  contradiction rejection, legacy unchanged; INERT schema mirrored, not wired).
+  3 new regressions failed pre-patch, pass fixed. 500 (12.73 s) stays a dated
+  initial-feature historical marker. Review `0ca0d96d-8efe-46c` (APPROVE at the
+  500 checkpoint) stays historical; fresh final review `0887b525-8634-4c6`
+  is complete: no findings, APPROVE of source handling after fixes only.
+  Own checks: 39 feature tests + 3 guard regressions, lint/format/diff check
+  and cold imports; no deploy/live acceptance.
+  §6A 464 and §0/§7/§9 455 stay historical.
+  Source frozen, all authors DONE. Source-only; rollout pending; no restart/commit here. Seq-66 job stays
+  `uncertain`, untouched. T5/T6 in-progress; plan NOT done.
+
 ## 7. Tests (native / offline / security)
 
 - Preserve all v4 tests and keep full `pytest` + `ruff check` +
@@ -435,7 +494,8 @@ last_updated: 2026-10-05
   this partial proof, and do not invent an exclusive-gate claim.
 - Progress on the V5 source at doc time (commit follows owner authorization above):
   T0 capture metadata + T1 delivery core + T2 native client + T3
-  responder/send/ACK/tasks/lifespan are implemented offline (455 current:
+  responder/send/ACK/tasks/lifespan are implemented offline (455 historical c8 snapshot,
+  superseded by §6A:
   delivery 74, native client 57, responder 88, server 65 + server-responder 53
   = 118 combined, tasks 19, rest 99; `ruff check` and format clean for 22
   files; 454 retained only as the pre-cleanup baseline, 446 as the

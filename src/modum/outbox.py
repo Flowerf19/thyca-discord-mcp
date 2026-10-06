@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from thyca_discord_mcp.identity import ActorKind, classify_actor
+from .identity import ActorKind, classify_actor
 
 READ_LIMIT_MIN = 1
 READ_LIMIT_MAX = 500

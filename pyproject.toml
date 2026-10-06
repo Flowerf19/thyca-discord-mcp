@@ -8,6 +8,7 @@ dependencies = [
     "discord.py>=2.7,<3",
     "mcp>=1.0,<2",  # verified against 1.29 FastMCP API; 2.x unchecked
     "pydantic-settings>=2",
+    "typesafe-sdk==0.7.2",  # pinned Jev SDK; this package migrated to modum
 ]
 
 [project.optional-dependencies]
@@ -18,14 +19,14 @@ dev = [
 ]
 
 [project.scripts]
-thyca-discord-mcp = "thyca_discord_mcp.__main__:main"
+thyca-discord-mcp = "modum.__main__:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/thyca_discord_mcp"]
+packages = ["src/modum"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

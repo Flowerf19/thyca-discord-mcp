@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from thyca_discord_mcp import delivery as delivery_mod
-from thyca_discord_mcp.delivery import (
+from modum import delivery as delivery_mod
+from modum.delivery import (
     DeliveryDurabilityUncertain,
     DeliveryError,
     complete_job,
