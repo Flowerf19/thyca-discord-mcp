@@ -20,9 +20,9 @@ from pathlib import Path
 
 import pytest
 
-from modum.conversation import project_conversation_state
-from modum.jev import JEV_MODEL, JevDecision, JevError
-from modum.participation import (
+from conversation import project_conversation_state
+from jev import JEV_MODEL, JevDecision, JevError
+from participation import (
     ParticipationDurabilityUncertain,
     ParticipationError,
     ParticipationLedger,
@@ -169,7 +169,7 @@ def test_import_pure_no_sdk_no_env(monkeypatch, tmp_path):
     monkeypatch.setenv("TYPESAFE_API_KEY", "SENTINEL-should-never-be-read")
     for mod in ("typesafe_sdk", "dotenv"):
         monkeypatch.delitem(sys.modules, mod, raising=False)
-    import modum.participation as part
+    import participation as part
 
     assert part.PARTICIPATION_VERSION == 1
     ledger, path = make_ledger(tmp_path)

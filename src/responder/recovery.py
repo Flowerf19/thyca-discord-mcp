@@ -18,10 +18,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from . import delivery
-from .config import Settings
-from .responder_input import ResponderError, _is_strict_int
-from .thyca_client import ThycaClientError
+import delivery
+from config import Settings
+from thyca import ThycaClientError
+
+from .input import ResponderError, _is_strict_int
 
 # ``observed`` is the durable zero-send terminal for Jev observe routing
 # (positive no-send proof, then safe-prefix ACK). The delivery loader owns

@@ -1,8 +1,9 @@
-"""T4 extraction tests: canonical leaves and pure trace equivalence.
+"""Thyca single-module tests: canonical surface and pure trace equivalence.
 
 Offline only via injected transports and direct pure calls. No real native,
-network, or env. Proves Root re-exports are single-object aliases and the
-pure trace leaf matches the Root API on known fixtures.
+network, or env. The six former ``thyca_*`` modules are merged into one
+``thyca`` module (verbatim bodies); these tests pin its public surface,
+constants, and trace equivalence.
 """
 
 from __future__ import annotations
@@ -12,13 +13,8 @@ import json
 
 import pytest
 
-import modum.thyca_client as root
-import modum.thyca_errors as errors
-import modum.thyca_trace as trace
-import modum.thyca_transport as transport
-import modum.thyca_validate as validate
-from modum.thyca_client import ThycaClient, ThycaProtocolError
-from modum.thyca_trace import build_trace_evidence
+import thyca
+from thyca import ThycaClient, ThycaProtocolError, build_trace_evidence
 
 VALID_SID = "2026-10-05T12-34-56_ab12"
 BASE = "http://127.0.0.1:8765"
@@ -125,24 +121,24 @@ class FakeTransport:
 
 
 def test_canonical_error_identities() -> None:
-    assert root.ThycaClientError is errors.ThycaClientError
-    assert root.ThycaPreconditionError is errors.ThycaPreconditionError
-    assert root.ThycaBusyError is errors.ThycaBusyError
-    assert root.ThycaSubmissionUncertainError is errors.ThycaSubmissionUncertainError
-    assert root.ThycaProtocolError is errors.ThycaProtocolError
-    assert root._TimeoutMarker is errors._TimeoutMarker
-    assert root._NetworkMarker is errors._NetworkMarker
+    assert thyca.ThycaClientError is thyca.ThycaClientError
+    assert thyca.ThycaPreconditionError is thyca.ThycaPreconditionError
+    assert thyca.ThycaBusyError is thyca.ThycaBusyError
+    assert thyca.ThycaSubmissionUncertainError is thyca.ThycaSubmissionUncertainError
+    assert thyca.ThycaProtocolError is thyca.ThycaProtocolError
+    assert thyca._TimeoutMarker is thyca._TimeoutMarker
+    assert thyca._NetworkMarker is thyca._NetworkMarker
 
 
 def test_canonical_transport_identities() -> None:
-    assert root.MAX_RESPONSE_BYTES is transport.MAX_RESPONSE_BYTES
-    assert root.DEFAULT_REQUEST_TIMEOUT_SECONDS is transport.DEFAULT_REQUEST_TIMEOUT_SECONDS
-    assert root.HttpTransport is transport.HttpTransport
-    assert root._declared_body_len is transport._declared_body_len
-    assert root._read_bounded is transport._read_bounded
+    assert thyca.MAX_RESPONSE_BYTES is thyca.MAX_RESPONSE_BYTES
+    assert thyca.DEFAULT_REQUEST_TIMEOUT_SECONDS is thyca.DEFAULT_REQUEST_TIMEOUT_SECONDS
+    assert thyca.HttpTransport is thyca.HttpTransport
+    assert thyca._declared_body_len is thyca._declared_body_len
+    assert thyca._read_bounded is thyca._read_bounded
 
 
-def test_canonical_validate_identities_and_pinned_constants() -> None:
+def test_canonical_validate_helpers_and_pinned_constants() -> None:
     for name in (
         "_normalize_base_url",
         "_validate_sid",
@@ -158,34 +154,18 @@ def test_canonical_validate_identities_and_pinned_constants() -> None:
         "_turn_slice_counts",
         "_sha256_hex",
     ):
-        assert getattr(root, name) is getattr(validate, name), name
+        assert getattr(thyca, name) is not None, name
     # Pinned SID grammar and protocol bounds/tool keys (native-exact).
-    assert validate.SESSION_ID_PATTERN == (r"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}_[0-9a-f]{4}")
-    assert validate.TEXT_MAX == 4000
-    assert validate.SEND_TOOL_NAME == "discord__send_message"
-    assert validate.NO_REPLY_TOOL_NAME == "discord__record_no_reply"
-    assert validate.NO_REPLY_REASONS == frozenset({"no_reply_needed", "missing_context"})
-    assert validate.NO_REPLY_STATUS_DECLARED == "declared"
-
-
-def test_no_cross_owned_defs() -> None:
-    # Single owner: leaves must not define each other's symbols.
-    assert not hasattr(transport, "_validate_sid")
-    assert not hasattr(transport, "_normalize_base_url")
-    assert not hasattr(validate, "_read_bounded")
-    assert not hasattr(validate, "_declared_body_len")
-    assert not hasattr(validate, "sync_http_request")
-    assert not hasattr(validate, "build_trace_evidence")
-    assert not hasattr(transport, "build_trace_evidence")
-    assert not hasattr(trace, "sync_http_request")
-    # Trace is pure: no client/transport imports, no private Root state.
-    assert not hasattr(trace, "ThycaClient")
-    assert "thyca_client" not in dir(trace)
-    assert "thyca_transport" not in dir(trace)
+    assert thyca.SESSION_ID_PATTERN == (r"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}_[0-9a-f]{4}")
+    assert thyca.TEXT_MAX == 4000
+    assert thyca.SEND_TOOL_NAME == "discord__send_message"
+    assert thyca.NO_REPLY_TOOL_NAME == "discord__record_no_reply"
+    assert thyca.NO_REPLY_REASONS == frozenset({"no_reply_needed", "missing_context"})
+    assert thyca.NO_REPLY_STATUS_DECLARED == "declared"
 
 
 def test_transport_leaf_has_explicit_timeout() -> None:
-    sig = inspect.signature(transport.sync_http_request)
+    sig = inspect.signature(thyca.sync_http_request)
     params = list(sig.parameters.values())
     assert [p.name for p in params] == ["method", "url", "body", "request_timeout_seconds"]
     assert params[3].default is inspect.Parameter.empty

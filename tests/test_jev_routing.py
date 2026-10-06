@@ -32,11 +32,11 @@ from unittest.mock import MagicMock
 import discord
 import pytest
 
-from modum import delivery
-from modum.config import Settings
-from modum.context import ContextUnavailable, context_fingerprint
-from modum.conversation import project_conversation_state
-from modum.delivery import (
+import delivery
+from config import Settings
+from context import ContextUnavailable, context_fingerprint
+from conversation import project_conversation_state
+from delivery import (
     enqueue_job,
     get_job,
     initialize_delivery_state,
@@ -45,12 +45,12 @@ from modum.delivery import (
     record_send_intent,
     record_send_receipt,
 )
-from modum.jev import JEV_MODEL, JevDecision, JevError, build_questions
-from modum.outbox import append_entry
-from modum.participation import ParticipationError, ParticipationLedger
-from modum.responder import Responder, ResponderError
-from modum.source_messages import SourceDeleted
-from modum.thyca_client import ThycaBusyError, ThycaProtocolError
+from jev import JEV_MODEL, JevDecision, JevError, build_questions
+from outbox import append_entry
+from participation import ParticipationError, ParticipationLedger
+from responder import Responder, ResponderError
+from source_messages import SourceDeleted
+from thyca import ThycaBusyError, ThycaProtocolError
 
 SID = "2026-01-02T03-04-05_ab12"
 GUILD = 111000000000000001

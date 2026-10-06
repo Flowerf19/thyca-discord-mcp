@@ -2,7 +2,7 @@
 
 Canonical owner of :class:`ResponderError`, the strict metadata helpers,
 ``ID_MAX``, and the pure historical/entry frame predicates. The orchestrator
-(:mod:`modum.responder`) imports and re-exports these names so
+(:mod:`responder`) imports and re-exports these names so
 existing ``responder.ResponderError`` / ``responder._is_strict_*`` imports
 keep working with identical object identity.
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .identity import classify_actor
+from identity import classify_actor
 
 ID_MAX = 128
 

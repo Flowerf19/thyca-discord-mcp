@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from modum.conversation import ConversationError, project_conversation_state
-from modum.thyca_prompt import (
+from conversation import ConversationError, project_conversation_state
+from thyca import (
     ThycaPromptError,
     build_conversation_prompt,
 )
@@ -529,20 +529,42 @@ def test_oversize_error_never_echoes_raw_body():
 
 
 def test_module_imports_stay_pure():
-    path = Path(__file__).resolve().parent.parent / "src" / "modum" / "thyca_prompt.py"
+    path = Path(__file__).resolve().parent.parent / "src" / "thyca.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     allowed = {
+        "asyncio",
+        "hashlib",
+        "http.client",
+        "ipaddress",
         "json",
+        "math",
+        "re",
+        "urllib.error",
+        "urllib.parse",
+        "urllib.request",
         "collections.abc",
         "typing",
         "__future__",
         ".conversation",
-        "modum.conversation",
+        "conversation",
     }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                assert alias.name.split(".")[0] in {"json", "collections", "typing"}, alias.name
+                assert alias.name in {
+                    "asyncio",
+                    "hashlib",
+                    "http.client",
+                    "ipaddress",
+                    "json",
+                    "math",
+                    "re",
+                    "urllib.error",
+                    "urllib.parse",
+                    "urllib.request",
+                    "collections",
+                    "typing",
+                }, alias.name
         elif isinstance(node, ast.ImportFrom):
             assert node.level > 0 or node.module in allowed, node.module
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -551,7 +573,6 @@ def test_module_imports_stay_pure():
             for forbidden in ("typesafe", " os", "os.", "sys", "socket"):
                 assert forbidden not in stripped, stripped
             # Package backstop (the AST allowlist above is authoritative): the
-            # module lives in the same package now, so only the canonical
-            # absolute projection import may name it.
-            if "modum" in stripped:
-                assert stripped.startswith("from modum.conversation import"), stripped
+            # module is flat under src/ now, so only the canonical absolute
+            # projection import may name it.
+            assert "modum" not in stripped, stripped

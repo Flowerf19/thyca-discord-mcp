@@ -161,7 +161,7 @@ failure-injection gaps remain — see the plan.
   internal audit label and `session_id` stay `discord-main`, separate from the native
   UI title. No date/clock auto-reset, no new-SID creation, rollover, or fallback.
 
-### Deleted source (no-reply) — source-only; rollout pending (historical V5 checkpoint; active current is `src/modum/`)
+### Deleted source (no-reply) — source-only; rollout pending (historical V5 checkpoint; active current is `src/` flat with `delivery/`, `participation/`, `responder/`, `server/` packages)
 
 - Gates: existence is proven before the LLM POST (worker `_submit_queued` via
   injected `source_checker`, default real-SDK `build_source_checker`) and again
@@ -206,10 +206,10 @@ failure-injection gaps remain — see the plan.
 
 Current source surface is 15 tools: the 12 v1+v4 names above are preserved
 with the v5 correlation/guards, plus 3 new Modum tools below.
-Both are verified in `src/modum/server.py` (`create_server` scope) with
+Both are verified in `src/server/core.py` (`create_server` scope) with
 `StrictInt` IDs, `responder.correlated_job` gating, and delivery guards; this
-section states actual function contracts, not guesses. Python namespace is
-`modum`; external distribution/CLI stays `thyca-discord-mcp`. Plan
+section states actual function contracts, not guesses. Sources live flat under
+`src/` (no package namespace); external distribution/CLI stays `thyca-discord-mcp`. Plan
 `.agents/plans/modum-jev-integration-refactor.md` is `done` for authorized
 SOURCE work only; the separate V5 live plan remains partial. Whole integration
 SOURCE reviews COMPLETE (two approvals); T4 DONE

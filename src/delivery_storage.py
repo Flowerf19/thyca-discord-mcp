@@ -20,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .delivery_schema import DeliveryDurabilityUncertain, DeliveryError, _validate_state
+from delivery_schema import DeliveryDurabilityUncertain, DeliveryError, _validate_state
 
 
 def _ensure_parent_dir(path: Path) -> None:

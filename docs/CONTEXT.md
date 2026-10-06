@@ -223,13 +223,13 @@ reset or rebinding. See [the example configuration](../.env.example) and
 
 | Responsibility | Source |
 |---|---|
-| Canonical projection and reply status | [`conversation.py`](../src/modum/conversation.py) |
-| Scoped collection, mandatory parent, fit, fingerprint | [`context.py`](../src/modum/context.py) |
-| Jev participation adapter | [`jev.py`](../src/modum/jev.py) |
-| Durable classification/cache/accounting | [`participation.py`](../src/modum/participation.py) |
-| Prepaid/postpaid guards and routing | [`responder.py`](../src/modum/responder.py) |
-| Trusted frame and untrusted JSON rendering | [`thyca_prompt.py`](../src/modum/thyca_prompt.py) |
-| MCP context/declaration tools | [`server.py`](../src/modum/server.py), [tool contracts](TOOLS.md) |
+| Canonical projection and reply status | [`conversation.py`](../src/conversation.py) |
+| Scoped collection, mandatory parent, fit, fingerprint | [`context.py`](../src/context.py) |
+| Jev participation adapter | [`jev.py`](../src/jev.py) |
+| Durable classification/cache/accounting | [`participation/`](../src/participation/ledger.py) |
+| Prepaid/postpaid guards and routing | [`responder/`](../src/responder/core.py) |
+| Trusted frame and untrusted JSON rendering | [`thyca.py`](../src/thyca.py) |
+| MCP context/declaration tools | [`server/`](../src/server/core.py), [tool contracts](TOOLS.md) |
 
 Relevant source tests run offline with fake identities/providers and owned TMP
 state; synthetic local HTTP loopback is allowed:

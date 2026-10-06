@@ -10,7 +10,9 @@ same canonical Discord snapshot when a native turn is needed, uses its existing
 session memory, and owns the reply through MCP. Neither Jev nor the controller
 copies generated replies directly to Discord.
 
-The Python package is `modum`; the distribution and CLI remain
+Sources live flat under `src/` (top-level modules plus `delivery/`,
+`participation/`, `responder/`, `server/` packages; no namespace package);
+the distribution and CLI remain
 `thyca-discord-mcp`. This is a Thyca integration, not a standalone chat agent.
 
 ## At a glance

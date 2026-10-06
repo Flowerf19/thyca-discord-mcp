@@ -23,7 +23,7 @@ from typing import Any
 import discord
 from discord.ext import commands
 
-from .bot import get_scoped_guild
+from bot import get_scoped_guild
 
 # Official Discord "Unknown Message" code: the ONLY code that proves the
 # exact fetched message is gone (verified discord.py 2.7.1 + official docs).

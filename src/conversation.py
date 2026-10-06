@@ -1,7 +1,7 @@
 """Canonical conversation context: validation and projection.
 
 Shared, provider-neutral projection of caller-provided conversation state.
-Both the Jev adapter (``modum.jev``) and future Thyca wiring consume this
+Both the Jev adapter (``jev``) and future Thyca wiring consume this
 snapshot so speaker identity, reply links, and timestamps stay identical.
 
 Accepted scope notes:

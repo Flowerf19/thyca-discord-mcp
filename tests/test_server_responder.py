@@ -27,8 +27,8 @@ import discord
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
-from modum.config import Settings
-from modum.delivery import (
+from config import Settings
+from delivery import (
     DeliveryDurabilityUncertain,
     DeliveryError,
     enqueue_job,
@@ -39,10 +39,10 @@ from modum.delivery import (
     mark_uncertain,
     skip_job,
 )
-from modum.outbox import append_entry, read_entries
-from modum.responder import Responder
-from modum.server import create_server
-from modum.thyca_client import ThycaBusyError
+from outbox import append_entry, read_entries
+from responder import Responder
+from server import create_server
+from thyca import ThycaBusyError
 
 BOT_UID = 111
 OWNER_UID = 222
@@ -547,7 +547,7 @@ class _LegacyLedger:
 
     async def classify(self, adapter, state, *, channel_id, message_id, author_uid):
         self.calls += 1
-        from modum.context import context_fingerprint
+        from context import context_fingerprint
 
         attempt = hashlib.sha256(f"{channel_id}:{message_id}".encode()).hexdigest()[:32]
         return {
@@ -626,7 +626,7 @@ def seed_active_job(settings, *, mid=701, seq=1, author_uid=OWNER_UID, actor_kin
 @asynccontextmanager
 async def parked_server(monkeypatch, settings, bot):
     """Real lifespan with the REAL Responder; auto loops parked before first tick."""
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         for name in ("auto-reply", "auto-reply-recovery"):
@@ -658,7 +658,7 @@ async def test_auto_loops_start_by_default_after_ready(settings, monkeypatch):
     write_mapping(settings)
     init_delivery(settings)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         # No enable flag, no manual priming: the worker is up once ready.
@@ -678,7 +678,7 @@ async def test_auto_loops_start_by_default_after_ready(settings, monkeypatch):
 async def test_missing_mapping_fails_before_login(settings, monkeypatch):
     init_delivery(settings)  # journal fine, mapping absent
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     mcp = create_server(settings)
     with pytest.raises(ValueError, match="mapping is missing"):
         async with mcp.settings.lifespan(mcp):
@@ -698,7 +698,7 @@ async def test_delivery_sid_mismatch_fails_before_capture(settings, monkeypatch)
     write_mapping(settings, sid=FAKE_SID)
     init_delivery(settings, sid="2026-03-04T05-06-07_cd34")  # outside-SID journal
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     mcp = create_server(settings)
     with pytest.raises(ValueError, match="native_session_id mismatch"):
         async with mcp.settings.lifespan(mcp):
@@ -716,7 +716,7 @@ async def test_login_failure_closes_real_responder_no_orphans(settings, monkeypa
         FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}),
         login_exc=discord.LoginFailure("bad token"),
     )
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     mcp = create_server(settings)
     with pytest.raises(discord.LoginFailure, match="bad token"):
         async with mcp.settings.lifespan(mcp):
@@ -769,8 +769,8 @@ async def test_lifespan_cleanup_without_sys_exception_keeps_primary(settings, mo
         FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}),
         login_exc=primary_exc,
     )
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", _FailingCloseRealResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", _FailingCloseRealResponder)
     mcp = create_server(settings)
     with pytest.raises(discord.LoginFailure, match="bad token") as excinfo:
         async with mcp.settings.lifespan(mcp):
@@ -805,8 +805,8 @@ async def test_lifespan_cancel_without_sys_exception_stays_cancelled(settings, m
         await asyncio.sleep(3600)
 
     bot.login = gated_login
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", _FailingCloseRealResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", _FailingCloseRealResponder)
     mcp = create_server(settings)
 
     async def _run():
@@ -841,7 +841,7 @@ def test_server_source_has_no_sys_exception_attribute():
     """
     import ast as _ast
 
-    source = Path(__file__).resolve().parent.parent / "src" / "modum" / "server.py"
+    source = Path(__file__).resolve().parent.parent / "src" / "server" / "core.py"
     tree = _ast.parse(source.read_text(encoding="utf-8"))
     hits = [
         node.lineno
@@ -894,7 +894,7 @@ async def test_failing_auto_loop_stops_itself_without_reset(settings, monkeypatc
     init_delivery(settings)
     seed_active_job(settings)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     mcp = create_server(settings)
     with pytest.raises(DeliveryError, match="corrupt delivery state"):
         async with mcp.settings.lifespan(mcp) as ctx:
@@ -1366,8 +1366,8 @@ async def test_owner_and_other_humans_enqueue_by_metadata_uid(settings, monkeypa
     backend = BusyThycaBackend()  # hold at snapshot: enqueue asserts, no POST either way
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", lambda s, b: Responder(s, b, client=backend))
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", lambda s, b: Responder(s, b, client=backend))
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         for name in ("auto-reply", "auto-reply-recovery"):
@@ -1410,8 +1410,8 @@ async def test_duplicate_mid_aliases_without_second_post(settings, monkeypatch):
     hist, _calls, hstate = make_history()
     channel = make_text_channel(CHANNEL_ID, history=hist)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", lambda s, b: Responder(s, b, client=backend))
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", lambda s, b: Responder(s, b, client=backend))
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         for name in ("auto-reply", "auto-reply-recovery"):
@@ -1437,8 +1437,8 @@ async def test_full_auto_flow_native_loop_drives_post_callback_complete_ack(sett
     backend = FakeThycaBackend(settings.delivery_state_path)
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", lambda s, b: Responder(s, b, client=backend))
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", lambda s, b: Responder(s, b, client=backend))
     mcp = create_server(settings)
     backend.mcp = mcp
     async with mcp.settings.lifespan(mcp) as ctx:
@@ -1478,8 +1478,8 @@ async def test_own_trace_uncorrelated_send_holds_not_complete(settings, monkeypa
     backend.own_trace_uncorrelated_content = "own trace uncorrelated"
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", lambda s, b: Responder(s, b, client=backend))
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", lambda s, b: Responder(s, b, client=backend))
     mcp = create_server(settings)
     backend.mcp = mcp
     async with mcp.settings.lifespan(mcp) as ctx:
@@ -1508,7 +1508,7 @@ def _fsync_fault(monkeypatch, *, fail_on):
     write itself lands durably. Install AFTER seeding so counting starts at
     the call under test (seed writes must not consume the fault budget).
     """
-    import modum.delivery as delivery_mod
+    import delivery as delivery_mod
 
     real = delivery_mod._fsync_parent_dir
     calls = {"n": 0}
@@ -1519,7 +1519,7 @@ def _fsync_fault(monkeypatch, *, fail_on):
             raise DeliveryDurabilityUncertain(state_path)
         return real(parent, state_path)
 
-    monkeypatch.setattr("modum.delivery._fsync_parent_dir", stub)
+    monkeypatch.setattr("delivery._fsync_parent_dir", stub)
     return calls
 
 
@@ -1605,7 +1605,7 @@ def _double_storage_fault(monkeypatch, settings, *, fail_on):
     payload is inspected as owned JSON (never printed raw).
     Returns (fsync_calls, replace_calls) counters for no-further-write proof.
     """
-    import modum.delivery as delivery_mod
+    import delivery as delivery_mod
 
     real_fsync = delivery_mod._fsync_parent_dir
     real_replace = os.replace
@@ -1640,7 +1640,7 @@ def _double_storage_fault(monkeypatch, settings, *, fail_on):
                 raise OSError(errno.ENOSPC, "No space left on device")
         return real_replace(src, dst, *args, **kwargs)
 
-    monkeypatch.setattr("modum.delivery._fsync_parent_dir", fsync_stub)
+    monkeypatch.setattr("delivery._fsync_parent_dir", fsync_stub)
     monkeypatch.setattr(os, "replace", replace_stub)
     return fsync_calls, replace_calls
 
@@ -1768,9 +1768,9 @@ def _poison_tick_harness(monkeypatch, settings, bot):
     def _dead_sink(*args, **kwargs):  # noqa: ARG001 - signature mirrors append_audit
         raise OSError(f"audit sink dead {SINK_CANARY_F2}")
 
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", lambda s, b: Responder(s, b, client=backend))
-    monkeypatch.setattr("modum.server.append_audit", _dead_sink)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", lambda s, b: Responder(s, b, client=backend))
+    monkeypatch.setattr("server.core.append_audit", _dead_sink)
     return backend
 
 
@@ -2076,8 +2076,8 @@ async def test_foreign_manual_send_not_attributed_to_auto_job(settings, monkeypa
     backend.foreign_manual_content = "foreign sid manual"
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", lambda s, b: Responder(s, b, client=backend))
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", lambda s, b: Responder(s, b, client=backend))
     mcp = create_server(settings)
     backend.mcp = mcp
     async with mcp.settings.lifespan(mcp) as ctx:

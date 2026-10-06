@@ -1,7 +1,7 @@
 """Entry point: load settings and run the MCP server over stdio."""
 
-from .config import Settings
-from .server import create_server
+from config import Settings
+from server import create_server
 
 
 def main() -> None:

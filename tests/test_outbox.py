@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from modum.outbox import (
+from outbox import (
     OutboxError,
     ack_entries,
     append_entry,

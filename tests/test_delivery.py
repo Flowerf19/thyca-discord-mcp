@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from modum import delivery as delivery_mod
-from modum.delivery import (
+import delivery as delivery_mod
+from delivery import (
     DeliveryDurabilityUncertain,
     DeliveryError,
     complete_job,
@@ -787,9 +787,7 @@ def test_resolve_uncertain_drop_refuses_send_evidence(tmp_path):
     )
     mark_turn_submitting(path, CHANNEL, 100, job_ref="jobref-001", pre_turn_index=0)
     mark_inflight(path, CHANNEL, 100, turn_index=0)
-    record_send_intent(
-        path, CHANNEL, 100, send_ref="send-001", content_len=5, content_hash=HASH_A
-    )
+    record_send_intent(path, CHANNEL, 100, send_ref="send-001", content_len=5, content_hash=HASH_A)
     mark_uncertain(path, CHANNEL, 100, kind="timeout")
     with pytest.raises(DeliveryError, match="send evidence"):
         resolve_uncertain_drop(path, CHANNEL, 100)

@@ -31,7 +31,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .conversation import project_conversation_state
+from conversation import project_conversation_state
 
 JEV_MODEL = "jev-1.13.0"
 JEV_BASE_URL = "https://api.typesafe.ai"

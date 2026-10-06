@@ -19,18 +19,37 @@ dev = [
 ]
 
 [project.scripts]
-thyca-discord-mcp = "modum.__main__:main"
+thyca-discord-mcp = "main:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/modum"]
+packages = ["src/delivery", "src/participation", "src/responder", "src/server"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/audit.py" = "audit.py"
+"src/bot.py" = "bot.py"
+"src/config.py" = "config.py"
+"src/context.py" = "context.py"
+"src/conversation.py" = "conversation.py"
+"src/delivery_schema.py" = "delivery_schema.py"
+"src/delivery_storage.py" = "delivery_storage.py"
+"src/identity.py" = "identity.py"
+"src/jev.py" = "jev.py"
+"src/main.py" = "main.py"
+"src/outbox.py" = "outbox.py"
+"src/server_helpers.py" = "server_helpers.py"
+"src/server_ticks.py" = "server_ticks.py"
+"src/source_messages.py" = "source_messages.py"
+"src/tasks.py" = "tasks.py"
+"src/thyca.py" = "thyca.py"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.ruff]
 target-version = "py310"

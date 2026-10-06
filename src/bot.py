@@ -7,7 +7,7 @@ import sys
 import discord
 from discord.ext import commands
 
-from .config import Settings
+from config import Settings
 
 
 def build_intents(settings: Settings) -> discord.Intents:

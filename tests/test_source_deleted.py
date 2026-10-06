@@ -20,8 +20,8 @@ import discord
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
-from modum.config import Settings
-from modum.delivery import (
+from config import Settings
+from delivery import (
     DeliveryError,
     enqueue_job,
     get_job,
@@ -36,10 +36,10 @@ from modum.delivery import (
     requeue_definitive_busy,
     skip_job,
 )
-from modum.outbox import append_entry, read_entries
-from modum.responder import Responder
-from modum.server import create_server
-from modum.source_messages import (
+from outbox import append_entry, read_entries
+from responder import Responder
+from server import create_server
+from source_messages import (
     SourceDeleted,
     SourceUnavailable,
     build_source_checker,
@@ -302,9 +302,9 @@ def _append(settings, mid, seq_note="", author_uid=OWNER_UID, kind="owner", name
 
 @asynccontextmanager
 async def _parked(monkeypatch, settings, bot, backend=None):
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     if backend is not None:
-        monkeypatch.setattr("modum.server.Responder", lambda s, b: Responder(s, b, client=backend))
+        monkeypatch.setattr("server.core.Responder", lambda s, b: Responder(s, b, client=backend))
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         for name in ("auto-reply", "auto-reply-recovery"):
@@ -475,7 +475,7 @@ class _LegacyLedger:
 
     async def classify(self, adapter, state, *, channel_id, message_id, author_uid):
         self.calls += 1
-        from modum.context import context_fingerprint
+        from context import context_fingerprint
 
         attempt = hashlib.sha256(f"{channel_id}:{message_id}".encode()).hexdigest()[:32]
         return {
@@ -998,7 +998,7 @@ async def test_mcp_gate_stale_stage_rejects_skip(settings, monkeypatch):
 
 
 async def test_mcp_gate_send_blocked_latch_withholds_skip(settings, monkeypatch):
-    import modum.server as server_mod
+    import server.core as server_mod
 
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
@@ -1080,8 +1080,8 @@ async def test_full_flow_deletion_during_submit_skips_via_gate(settings, monkeyp
         return {"cancelled": False, "completed": True, "native_id_match": True}
 
     backend.submit_fn = submit_delete_then_gate
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", lambda s, b: Responder(s, b, client=backend))
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", lambda s, b: Responder(s, b, client=backend))
     mcp = create_server(settings)
     backend.mcp = mcp
     async with mcp.settings.lifespan(mcp) as ctx:
@@ -1108,7 +1108,7 @@ async def test_source_present_guard_fences_latched_race_no_second_intent(setting
     A must reject before a second intent/SDK: exactly 1 attempt, 1 intent,
     evidence preserved, no completion. Real FastMCP + real delivery + real
     Responder correlation; no live I/O."""
-    import modum.server as server_mod
+    import server.core as server_mod
 
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))

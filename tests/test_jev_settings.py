@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from modum.config import PROJECT_ROOT, Settings
+from config import PROJECT_ROOT, Settings
 
 _JEV_ENV_VARS = (
     "TYPESAFE_API_KEY",

@@ -1,4 +1,4 @@
-"""Offline tests for the minimal Jev adapter (modum.jev).
+"""Offline tests for the minimal Jev adapter (jev).
 
 Fake/offline only: synthetic states, the 30 benchmark fixture states (state
 fields only, never gold in requests), and an injected fake typesafe_sdk
@@ -19,8 +19,8 @@ from pathlib import Path
 
 import pytest
 
-from modum.conversation import ConversationError, project_conversation_state
-from modum.jev import (
+from conversation import ConversationError, project_conversation_state
+from jev import (
     JEV_BASE_URL,
     JEV_MODEL,
     JEV_TIMEOUT,
@@ -494,7 +494,7 @@ def test_sdk_close_failure_unknown_controls(monkeypatch, kind):
 
 
 def test_sdk_error_classification_bounded():
-    from modum.jev import _classify_sdk_error
+    from jev import _classify_sdk_error
 
     class TypeSafeAPITimeoutError(Exception):
         pass
@@ -1250,11 +1250,9 @@ def test_offline_default_reads_no_key_and_imports_no_sdk(monkeypatch):
     monkeypatch.setenv("TYPESAFE_API_KEY", "SENTINEL-KEY-should-never-be-read")
     for mod in ("typesafe_sdk", "dotenv"):
         monkeypatch.delitem(sys.modules, mod, raising=False)
-    import modum
-    import modum.conversation
-    import modum.jev
+    import conversation  # noqa: F401
+    import jev  # noqa: F401
 
-    assert modum.__version__
     adapter = JevAdapter(provider=lambda s, q: make_result())
     assert adapter is not None
     assert "typesafe_sdk" not in sys.modules

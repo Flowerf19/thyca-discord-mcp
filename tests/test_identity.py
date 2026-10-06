@@ -1,4 +1,4 @@
-from modum.identity import ActorKind, classify_actor
+from identity import ActorKind, classify_actor
 
 BOT_UID = 111
 OWNER_UID = 222

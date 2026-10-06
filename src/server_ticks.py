@@ -1,13 +1,13 @@
 """Background tick factories for the MCP server composition root.
 
 Authoritative owner of the three background ticks registered by
-:func:`modum.server.create_server`: heartbeat liveness,
+:func:`server.create_server`: heartbeat liveness,
 capture-only poll, and the v5 auto-reply worker step. Moved verbatim from
 server.py (T4 responsibility cut): the composition root keeps the
 TaskRegistry, state dict, bot getter, tools, lifespan, SDK send, proof, and
 latch logic, and constructs these factories with explicit settings, bot
 getters, and a fresh-resolving audit callback so the root
-``modum.server.append_audit`` patch target keeps working.
+``server.append_audit`` patch target keeps working.
 
 Dependency policy: settings, bot getters, and the audit sink are explicit
 constructor arguments (no server imports, no build_bot/Responder capture, no
@@ -33,12 +33,12 @@ from typing import Any, Protocol
 
 import discord
 
-from .bot import get_scoped_guild
-from .config import Settings
-from .identity import classify_actor
-from .outbox import append_entry, get_poll_cursor, set_poll_cursor
-from .server_helpers import _check_outbox_consistent, _coarse_error_kind, _resolve_text_channel
-from .tasks import TickFn
+from bot import get_scoped_guild
+from config import Settings
+from identity import classify_actor
+from outbox import append_entry, get_poll_cursor, set_poll_cursor
+from server_helpers import _check_outbox_consistent, _coarse_error_kind, _resolve_text_channel
+from tasks import TickFn
 
 __all__ = [
     "AppendAuditFn",
@@ -51,7 +51,7 @@ __all__ = [
 ]
 
 # Signature mirrors audit.append_audit; the root passes a fresh-resolving
-# callable so late patches of modum.server.append_audit apply.
+# callable so late patches of server.append_audit apply.
 AppendAuditFn = Callable[..., dict[str, Any]]
 # Poll getter: raises when the bot is not ready (mirrors server._bot).
 GetBotFn = Callable[[], discord.Client]

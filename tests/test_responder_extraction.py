@@ -17,19 +17,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from modum import delivery
-from modum import responder as responder_mod
-from modum import responder_input as input_mod
-from modum import responder_recovery as recovery_mod
-from modum.config import Settings
-from modum.delivery import (
+import delivery
+import responder as responder_mod
+from config import Settings
+from delivery import (
     enqueue_job,
     initialize_delivery_state,
     mark_inflight,
     mark_turn_submitting,
 )
-from modum.responder import Responder
-from modum.responder_recovery import ResponderRecovery
+from responder import Responder, ResponderRecovery
+from responder import input as input_mod
+from responder import recovery as recovery_mod
 
 FAKE_SID = "2026-01-02T03-04-05_ab12"
 GUILD = 100000000000000001
@@ -355,7 +354,7 @@ async def test_recovery_direct_source_deleted_wins(tmp_path):
         source_deleted_status=lambda cid, mid_: {"status": "skipped", "reason": "source_deleted"},
     )
     # Safe-terminal path reports the durable skip without trace calls.
-    from modum.delivery import skip_job
+    from delivery import skip_job
 
     skip_job(settings.delivery_state_path, CHANNEL, mid, reason="source_deleted")
     out = await rec.reconcile_job({"channel_id": CHANNEL, "message_id": mid})
@@ -370,7 +369,7 @@ async def test_bound_reconcile_late_source_deleted_status(
 ):
     import asyncio
 
-    from modum.thyca_client import ThycaProtocolError
+    from thyca import ThycaProtocolError
 
     settings = _settings(tmp_path, typesafe_api_key=None)
     _write_mapping(settings)
@@ -557,7 +556,7 @@ async def test_recovery_callbacks_use_fresh_root_lookup(tmp_path, monkeypatch):
 
 
 def test_constructor_bind_last_after_ledger_and_recovery_no_io(tmp_path, monkeypatch):
-    from modum.participation import ParticipationLedger
+    from participation import ParticipationLedger
 
     settings = _settings(tmp_path)
     _write_mapping(settings)
@@ -579,8 +578,8 @@ def test_constructor_bind_last_after_ledger_and_recovery_no_io(tmp_path, monkeyp
         assert sorted(os.listdir(tmp_path)) == before_files
         assert settings.delivery_state_path.read_bytes() == before_delivery
 
-    monkeypatch.setattr("modum.responder.delivery.bind_jev_ledger", _spy_bind)
-    monkeypatch.setattr("modum.responder.ResponderRecovery.__init__", _spy_recovery_init)
+    monkeypatch.setattr("responder.delivery.bind_jev_ledger", _spy_bind)
+    monkeypatch.setattr("responder.ResponderRecovery.__init__", _spy_recovery_init)
     bot = _FakeBot()
     client = _FakeClient()
 

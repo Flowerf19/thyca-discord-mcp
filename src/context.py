@@ -1,6 +1,6 @@
 """Scoped conversation-context collector for one approved channel (unwired slice).
 
-Builds one canonical snapshot (``modum.conversation``-compatible) for the
+Builds one canonical snapshot (``conversation``-compatible) for the
 exact current source message plus recent same-channel context. A future
 parent wiring will call the collector, then feed the SAME snapshot to Jev
 and the Thyca renderer; this module performs no routing, budgeting,
@@ -9,8 +9,8 @@ inference, sends, or paid calls.
 Scope contract (checked on every call, no retries, no guessing):
 - Approved guild/channel only: ``guild_id``/``channel_id`` are strict
   positive ints. Resolution reuses the existing scoped helpers
-  (``modum.bot.get_scoped_guild`` +
-  ``modum.source_messages._resolve_text_channel``): cache-first
+  (``bot.get_scoped_guild`` +
+  ``source_messages._resolve_text_channel``): cache-first
   guild/channel lookup with one ``bot.fetch_channel`` fallback, then strict
   ``isinstance(discord.TextChannel)`` plus guild-scope ID checks. Voice and
   stage channels, threads, and DMs are refused independent of class names
@@ -23,7 +23,7 @@ Scope contract (checked on every call, no retries, no guessing):
   entry MID: a strict NATIVE ``discord.NotFound`` with status 404 + code
   10008 (``isinstance`` plus strict-int status/code; same-named spoof
   classes are rejected) raises the authoritative
-  ``modum.source_messages.SourceDeleted`` (re-exported here,
+  ``source_messages.SourceDeleted`` (re-exported here,
   same object -- the router and the existing checker catch that class).
   Every other fetch failure -- Forbidden, 5xx, timeouts, unknown-channel
   codes, scope mismatch, malformed reads -- raises
@@ -74,7 +74,7 @@ Selection policy (explicit, not truncating supplied state):
 - Shared Jev/Thyca fit BEFORE any paid call: the full candidate snapshot
   is checked against the ACTUAL final routed prompts for BOTH
   ``respond`` and ``need_context``
-  (:func:`modum.thyca_prompt.build_conversation_prompt` with paired
+  (:func:`thyca_prompt.build_conversation_prompt` with paired
   ``participation``/``context_sha256``) with a fixed 32-char fake nonce
   (``"f"*32``) and a fixed 64-char fake hash (``"f"*64``) -- neither
   stored. No guessed reserve: both routed prompts must render ``<=4000``
@@ -86,13 +86,13 @@ Selection policy (explicit, not truncating supplied state):
   Unknown/binding renderer failures fail immediately (no drop).
 
 Fingerprint: :func:`context_fingerprint` projects any raw/snapshot state
-through :func:`modum.conversation.project_conversation_state` and returns
+through :func:`conversation.project_conversation_state` and returns
 the SHA-256 hex of the canonical ``sort_keys`` JSON. It never mutates its
 input and carries no raw bodies in errors.
 
 Importing this module performs no I/O: no env reads, no network, no Discord
 calls. It imports ``discord`` and the authoritative source helpers
-(``modum.source_messages``/``bot`` are cycle-free here and read
+(``source_messages``/``bot`` are cycle-free here and read
 nothing on import). All SDK reads happen inside the returned async
 collector, exactly once per dependency (no retries).
 """
@@ -107,10 +107,10 @@ from typing import Any
 
 import discord
 
-from .bot import get_scoped_guild
-from .conversation import ConversationError, project_conversation_state
-from .source_messages import SourceDeleted, _resolve_text_channel
-from .thyca_prompt import ThycaPromptError, build_conversation_prompt
+from bot import get_scoped_guild
+from conversation import ConversationError, project_conversation_state
+from source_messages import SourceDeleted, _resolve_text_channel
+from thyca import ThycaPromptError, build_conversation_prompt
 
 MAX_MESSAGES_LIMIT = 20
 FIT_NONCE = "f" * 32
@@ -135,7 +135,7 @@ class ContextUnavailable(ValueError):
 
 
 # ``SourceDeleted`` is intentionally NOT redeclared here: the name above is the
-# authoritative ``modum.source_messages.SourceDeleted`` object,
+# authoritative ``source_messages.SourceDeleted`` object,
 # re-exported so the router and the existing checker catch the same class.
 
 
@@ -168,7 +168,7 @@ def context_fingerprint(state: Mapping[str, Any]) -> str:
     """Return the SHA-256 hex of the canonical projected JSON for ``state``.
 
     Accepts raw caller state or an already-projected snapshot; the state is
-    validated through :func:`modum.conversation.project_conversation_state`
+    validated through :func:`conversation.project_conversation_state`
     (unknown/gold keys dropped, :class:`ConversationError` on violations).
     The input is never mutated; the hash covers the detached snapshot only.
     """
@@ -417,7 +417,7 @@ def build_context_collector(
     ``content``) and returns the detached canonical snapshot
     (``assistant_uid``/``owner_uid``/``participants``/``messages``/
     ``new_message_id``) selected per the module policy. It raises the
-    authoritative ``modum.source_messages.SourceDeleted`` (same
+    authoritative ``source_messages.SourceDeleted`` (same
     object, re-exported) only for a strictly deleted source and
     :class:`ContextUnavailable` for every other bounded failure; both
     carry fixed strings (never raw bodies). Cancellation propagates

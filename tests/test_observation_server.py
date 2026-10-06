@@ -29,9 +29,9 @@ import discord
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
-from modum import delivery
-from modum.config import Settings
-from modum.delivery import (
+import delivery
+from config import Settings
+from delivery import (
     enqueue_job,
     get_job,
     initialize_delivery_state,
@@ -39,9 +39,9 @@ from modum.delivery import (
     mark_uncertain,
     record_send_intent,
 )
-from modum.outbox import append_entry
-from modum.responder import Responder
-from modum.server import create_server
+from outbox import append_entry
+from responder import Responder
+from server import create_server
 
 BOT_UID = 111
 OWNER_UID = 222
@@ -372,9 +372,9 @@ def settings(tmp_path):
 @asynccontextmanager
 async def _running(monkeypatch, settings, bot):
     """Real lifespan with a fake bot and stub-Jev REAL Responder; loops parked."""
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     monkeypatch.setattr(
-        "modum.server.Responder",
+        "server.core.Responder",
         lambda s, b: Responder(
             s,
             b,
@@ -965,9 +965,7 @@ async def test_resolve_uncertain_drop_happy_path(settings, monkeypatch):
     _seed_uncertain(settings)
     bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
-        payload = await _call_json(
-            mcp, "resolve_uncertain_drop", {"source_message_id": SOURCE_MID}
-        )
+        payload = await _call_json(mcp, "resolve_uncertain_drop", {"source_message_id": SOURCE_MID})
         job = get_job(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID)
         assert job["stage"] == "skipped"
         assert job["skip_reason"] == "operator_approved_drop"

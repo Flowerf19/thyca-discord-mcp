@@ -18,15 +18,16 @@ or production reads.
 """
 
 import ast
+import importlib
 import inspect
 from pathlib import Path
 
 import pytest
 
-from modum import delivery as delivery_mod
-from modum import delivery_schema as schema_mod
-from modum import delivery_storage as storage_mod
-from modum.delivery import (
+import delivery as delivery_mod
+import delivery_schema as schema_mod
+import delivery_storage as storage_mod
+from delivery import (
     DeliveryDurabilityUncertain,
     DeliveryError,
     enqueue_job,
@@ -97,7 +98,7 @@ def test_canonical_const_validator_aliases_same_objects():
         assert hasattr(schema_mod, name), f"schema missing {name}"
         assert getattr(delivery_mod, name) is getattr(schema_mod, name), name
         # Single owner: canonical __module__ is schema (import may alter it, fine).
-        assert getattr(schema_mod, name).__module__ == "modum.delivery_schema"
+        assert getattr(schema_mod, name).__module__ == "delivery_schema"
 
 
 def test_storage_aliases_and_root_ownership():
@@ -105,37 +106,41 @@ def test_storage_aliases_and_root_ownership():
     assert delivery_mod._ensure_parent_dir is storage_mod._ensure_parent_dir
     assert delivery_mod._fsync_parent_dir is storage_mod._fsync_parent_dir
     assert delivery_mod._load_state is storage_mod._load_state
-    # Root-owned: defined in delivery, not aliases.
-    assert delivery_mod._now_iso.__module__ == "modum.delivery"
-    assert delivery_mod._save_state.__module__ == "modum.delivery"
+    # Package-owned: canonically defined in delivery.store, re-exported at root.
+    _store_mod = importlib.import_module("delivery.store")
+    assert delivery_mod._now_iso is _store_mod._now_iso
+    assert delivery_mod._save_state is _store_mod._save_state
     assert delivery_mod._save_state is not storage_mod._save_state
-    assert delivery_mod._new_job.__module__ == "modum.delivery"
+    assert delivery_mod._new_job is _store_mod._new_job
     assert not hasattr(schema_mod, "_now_iso")
     assert not hasattr(storage_mod, "_now_iso")
     assert not hasattr(schema_mod, "_save_state")
-    # No thin all-public facade: root still defines all public mutations.
-    for name in [
-        "initialize_delivery_state",
-        "load_delivery_state",
-        "enqueue_job",
-        "get_job",
-        "list_jobs",
-        "mark_turn_submitting",
-        "mark_inflight",
-        "requeue_definitive_busy",
-        "record_send_intent",
-        "record_send_receipt",
-        "complete_job",
-        "skip_job",
-        "mark_uncertain",
-        "bind_jev_ledger",
-        "bind_jev_decision",
-        "observe_job",
-        "record_no_reply",
-        "complete_observation",
-        "processed_seq_prefix",
-    ]:
-        assert getattr(delivery_mod, name).__module__ == "modum.delivery", name
+    # No thin all-public facade: root re-exports the canonical submodule objects.
+    _canonical_submodule = {
+        "initialize_delivery_state": "delivery.store",
+        "load_delivery_state": "delivery.store",
+        "bind_jev_ledger": "delivery.store",
+        "enqueue_job": "delivery.transitions",
+        "mark_turn_submitting": "delivery.transitions",
+        "mark_inflight": "delivery.transitions",
+        "requeue_definitive_busy": "delivery.transitions",
+        "record_send_intent": "delivery.transitions",
+        "record_send_receipt": "delivery.transitions",
+        "complete_job": "delivery.transitions",
+        "skip_job": "delivery.transitions",
+        "mark_uncertain": "delivery.transitions",
+        "bind_jev_decision": "delivery.transitions",
+        "observe_job": "delivery.transitions",
+        "record_no_reply": "delivery.transitions",
+        "complete_observation": "delivery.transitions",
+        "get_job": "delivery.queries",
+        "list_jobs": "delivery.queries",
+        "processed_seq_prefix": "delivery.queries",
+    }
+    for name, submodule in _canonical_submodule.items():
+        assert getattr(delivery_mod, name) is getattr(importlib.import_module(submodule), name), (
+            name
+        )
 
 
 def test_storage_write_requires_explicit_typed_fsync_callback():
@@ -151,11 +156,11 @@ def test_storage_write_requires_explicit_typed_fsync_callback():
     sig = inspect.signature(delivery_mod._save_state)
     assert list(sig.parameters) == ["path", "state"]
     src = inspect.getsource(delivery_mod._save_state)
-    assert "fsync_parent_dir=_fsync_parent_dir" in src
+    assert "fsync_parent_dir=_delivery_root._fsync_parent_dir" in src
     assert "_storage_save_state" in src
     init_src = inspect.getsource(delivery_mod.initialize_delivery_state)
     assert "_storage_create_state_exclusive" in init_src
-    assert "fsync_parent_dir=_fsync_parent_dir" in init_src
+    assert "fsync_parent_dir=_delivery_root._fsync_parent_dir" in init_src
 
 
 def test_timestamp_root_patch_propagated(tmp_path, monkeypatch):

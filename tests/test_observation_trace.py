@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from modum.thyca_client import ThycaClient, ThycaProtocolError
+from thyca import ThycaClient, ThycaProtocolError
 
 VALID_SID = "2026-10-05T12-34-56_ab12"
 OTHER_SID = "2026-10-04T01-02-03_cd34"

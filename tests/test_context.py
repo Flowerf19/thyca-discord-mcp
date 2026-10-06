@@ -1,4 +1,4 @@
-"""Offline tests for the scoped context collector (modum.context).
+"""Offline tests for the scoped context collector (context).
 
 Fake/offline only: fictitious integer IDs, synthetic SDK objects, synthetic
 text. No network, no env, no real Discord/Thyca, no paid calls, no
@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 import discord
 import pytest
 
-from modum.context import (
+from context import (
     FIT_HASH,
     FIT_NONCE,
     ContextUnavailable,
@@ -27,9 +27,9 @@ from modum.context import (
     build_context_collector,
     context_fingerprint,
 )
-from modum.conversation import ConversationError, project_conversation_state
-from modum.source_messages import SourceDeleted as AuthoritativeSourceDeleted
-from modum.thyca_prompt import PROMPT_MAX, build_conversation_prompt
+from conversation import ConversationError, project_conversation_state
+from source_messages import SourceDeleted as AuthoritativeSourceDeleted
+from thyca import PROMPT_MAX, build_conversation_prompt
 
 GUILD = 11
 CHANNEL = 22
@@ -1103,7 +1103,7 @@ def test_source_deleted_is_authoritative_identity():
 
 async def test_collector_current_404_caught_by_existing_catcher():
     # The raised instance must satisfy an existing
-    # ``except modum.source_messages.SourceDeleted`` clause.
+    # ``except source_messages.SourceDeleted`` clause.
     ch = FakeChannel(CHANNEL, GUILD)
     ch.deleted.add(701)
     guild = FakeGuild(GUILD, {CHANNEL: ch})

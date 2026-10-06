@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from modum.conversation import (
+from conversation import (
     ConversationError,
     get_new_message,
     new_message_reply_status,
@@ -430,8 +430,7 @@ def test_projection_needs_no_env_key_or_sdk(monkeypatch):
 
 def test_package_import_reads_no_env(monkeypatch):
     monkeypatch.setenv("TYPESAFE_API_KEY", "SENTINEL-should-never-be-read")
-    import modum  # noqa: F401
-    import modum.conversation  # noqa: F401
+    import conversation  # noqa: F401
 
     blob = json.dumps(project_conversation_state(make_state()))
     assert "SENTINEL" not in blob

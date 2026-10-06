@@ -2,7 +2,7 @@
 
 Covers the extracted background ticks (heartbeat, poll, auto-reply) at the
 factory level with fake Discord objects and tmp-only settings, plus the root
-late-patch proof: patching ``modum.server.append_audit`` AFTER
+late-patch proof: patching ``server.append_audit`` AFTER
 ``create_server`` still reroutes tick audits (the root passes a
 fresh-resolving callable, never a stale binding or module namespace).
 
@@ -19,11 +19,11 @@ from unittest.mock import MagicMock
 import discord
 import pytest
 
-from modum.config import Settings
-from modum.delivery import DeliveryError
-from modum.outbox import get_poll_cursor, read_entries
-from modum.server import create_server
-from modum.server_ticks import (
+from config import Settings
+from delivery import DeliveryError
+from outbox import get_poll_cursor, read_entries
+from server import create_server
+from server_ticks import (
     make_auto_reply_tick,
     make_heartbeat_tick,
     make_poll_tick,
@@ -216,8 +216,8 @@ def read_audit(settings):
 
 @asynccontextmanager
 async def running_server(monkeypatch, settings, bot):
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FakeResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         for name in ("auto-reply", "auto-reply-recovery"):
@@ -302,7 +302,7 @@ async def test_poll_first_tick_captures_newest20_reversed(settings):
 
 
 async def test_poll_later_tick_pages_after_cursor(settings):
-    from modum.outbox import set_poll_cursor as _set
+    from outbox import set_poll_cursor as _set
 
     _set(settings.outbox_state_path, CHANNEL_ID, 200)
     msgs = [FakeMessage(201, FakeUser(OWNER_UID, "Owner"), "next")]
@@ -464,7 +464,7 @@ async def test_root_late_audit_patch_reroutes_all_ticks(settings, monkeypatch):
             return {"tool": kwargs.get("tool")}
 
         # Late patch: after create_server + lifespan + tick construction.
-        monkeypatch.setattr("modum.server.append_audit", _late_sink)
+        monkeypatch.setattr("server.core.append_audit", _late_sink)
 
         # Heartbeat via the registered native loop coro.
         await ctx["tasks"]._loops["heartbeat"].coro()

@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from modum.delivery import (
+from delivery import (
     DeliveryError,
     bind_jev_decision,
     bind_jev_ledger,

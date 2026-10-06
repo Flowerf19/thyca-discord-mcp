@@ -21,9 +21,9 @@ from unittest.mock import MagicMock
 import discord
 import pytest
 
-from modum import responder as responder_mod
-from modum.config import Settings
-from modum.delivery import (
+import responder as responder_mod
+from config import Settings
+from delivery import (
     DeliveryError,
     enqueue_job,
     get_job,
@@ -35,9 +35,9 @@ from modum.delivery import (
     record_send_intent,
     record_send_receipt,
 )
-from modum.outbox import OutboxError, append_entry, read_entries
-from modum.responder import Responder, ResponderError, build_auto_prompt
-from modum.thyca_client import (
+from outbox import OutboxError, append_entry, read_entries
+from responder import Responder, ResponderError, build_auto_prompt
+from thyca import (
     ThycaBusyError,
     ThycaClient,
     ThycaPreconditionError,
@@ -361,7 +361,7 @@ class _LegacyLedger:
 
     async def classify(self, adapter, state, *, channel_id, message_id, author_uid):
         self.calls += 1
-        from modum.context import context_fingerprint
+        from context import context_fingerprint
 
         attempt = hashlib.sha256(f"{channel_id}:{message_id}".encode()).hexdigest()[:32]
         return {

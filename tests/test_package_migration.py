@@ -1,8 +1,8 @@
-"""Packaging checks for the completed single-package migration (offline).
+"""Packaging checks for the flat-src layout (offline).
 
 Portable: repo-relative paths only, no baselines, no env reads, no network,
-no keys, no production paths. Verifies the retired package namespace is
-gone, every expected ``modum`` module imports, the console entry target
+no keys, no production paths. Verifies the retired namespaces are gone,
+every expected top-level module/package imports, the console entry target
 resolves (never invoked), and the distribution name stays unchanged.
 """
 
@@ -12,107 +12,114 @@ import importlib
 import importlib.util
 from pathlib import Path
 
-import modum
-
 ROOT = Path(__file__).resolve().parent.parent
-SRC = ROOT / "src" / "modum"
+SRC = ROOT / "src"
 
-# Built at runtime so this file itself never contains the retired namespace.
+# Built at runtime so this file itself never contains the retired namespaces.
 _RETIRED = "thyca" + "_discord_" + "mcp"
+_RETIRED_PKG = "mod" + "um"
 
 EXPECTED_FILES = (
-    "__init__.py",
-    "__main__.py",
     "audit.py",
     "bot.py",
     "config.py",
     "context.py",
     "conversation.py",
-    "delivery.py",
     "delivery_schema.py",
     "delivery_storage.py",
     "identity.py",
     "jev.py",
+    "main.py",
     "outbox.py",
-    "participation.py",
-    "responder.py",
-    "responder_input.py",
-    "responder_recovery.py",
-    "server.py",
     "server_helpers.py",
     "server_ticks.py",
     "source_messages.py",
     "tasks.py",
-    "thyca_client.py",
-    "thyca_errors.py",
-    "thyca_prompt.py",
-    "thyca_trace.py",
-    "thyca_transport.py",
-    "thyca_validate.py",
+    "thyca.py",
 )
 
+EXPECTED_PACKAGES = {
+    "delivery": ("__init__.py", "queries.py", "store.py", "transitions.py"),
+    "participation": ("__init__.py", "errors.py", "ledger.py", "store.py", "validate.py"),
+    "responder": ("__init__.py", "core.py", "input.py", "recovery.py", "submit.py"),
+    "server": ("__init__.py", "core.py"),
+}
+
 EXPECTED_IMPORTS = (
-    "__main__",
     "audit",
     "bot",
     "config",
     "context",
     "conversation",
     "delivery",
+    "delivery.queries",
+    "delivery.store",
+    "delivery.transitions",
     "delivery_schema",
     "delivery_storage",
     "identity",
     "jev",
+    "main",
     "outbox",
     "participation",
+    "participation.errors",
+    "participation.ledger",
+    "participation.store",
+    "participation.validate",
     "responder",
-    "responder_input",
-    "responder_recovery",
+    "responder.core",
+    "responder.input",
+    "responder.recovery",
+    "responder.submit",
     "server",
+    "server.core",
     "server_helpers",
     "server_ticks",
     "source_messages",
     "tasks",
-    "thyca_client",
-    "thyca_errors",
-    "thyca_prompt",
-    "thyca_trace",
-    "thyca_transport",
-    "thyca_validate",
+    "thyca",
 )
 
 
 def test_retired_namespace_not_importable():
     assert importlib.util.find_spec(_RETIRED) is None
+    assert importlib.util.find_spec(_RETIRED_PKG) is None
 
 
 def test_retired_package_dir_gone():
     assert not (ROOT / "src" / _RETIRED).exists()
-    assert sorted(p.name for p in ROOT.glob("src/*") if p.is_dir()) == ["modum"]
+    assert not (ROOT / "src" / _RETIRED_PKG).exists()
+    assert sorted(p.name for p in ROOT.glob("src/*") if p.is_dir() and p.name != "__pycache__") == [
+        "delivery",
+        "participation",
+        "responder",
+        "server",
+    ]
 
 
-def test_package_root_minimal():
-    assert modum.__version__ == "0.1.0"
-    assert modum.__all__ == ["__version__"]
-    for heavy in ("Settings", "Responder", "create_server", "ThycaClient"):
-        assert not hasattr(modum, heavy), heavy
+def test_no_package_root_leftover():
+    # Flat layout: no top-level package module, version lives in pyproject.
+    assert (SRC / "__init__.py").exists() is False
+    assert (SRC / _RETIRED_PKG).exists() is False
 
 
 def test_package_file_surface_exact():
     assert sorted(p.name for p in SRC.glob("*.py")) == sorted(EXPECTED_FILES)
+    for dirname, files in EXPECTED_PACKAGES.items():
+        assert sorted(p.name for p in (SRC / dirname).glob("*.py")) == sorted(files)
 
 
 def test_all_modules_import():
     for name in EXPECTED_IMPORTS:
-        assert importlib.import_module(f"modum.{name}") is not None
+        assert importlib.import_module(f"{name}") is not None
 
 
 def test_console_entry_target_resolves_without_invoking():
-    from modum.__main__ import main
+    from main import main
 
     assert callable(main)
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'thyca-discord-mcp = "modum.__main__:main"' in pyproject
+    assert 'thyca-discord-mcp = "main:main"' in pyproject
     assert 'name = "thyca-discord-mcp"' in pyproject
 
 
@@ -126,14 +133,14 @@ def test_no_retired_namespace_in_shipped_sources():
 
 
 def test_moved_namespaces_resolve_under_new_package():
-    from modum.bot import build_bot
-    from modum.config import Settings
-    from modum.responder import Responder
-    from modum.server import create_server
-    from modum.thyca_client import ThycaClient
+    from bot import build_bot
+    from config import Settings
+    from responder import Responder
+    from server import create_server
+    from thyca import ThycaClient
 
-    assert build_bot.__module__ == "modum.bot"
-    assert Settings.__module__ == "modum.config"
-    assert Responder.__module__ == "modum.responder"
-    assert create_server.__module__ == "modum.server"
-    assert ThycaClient.__module__ == "modum.thyca_client"
+    assert build_bot.__module__ == "bot"
+    assert Settings.__module__ == "config"
+    assert Responder.__module__ == "responder.core"
+    assert create_server.__module__ == "server.core"
+    assert ThycaClient.__module__ == "thyca"

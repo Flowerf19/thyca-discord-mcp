@@ -3,7 +3,7 @@
 Moved verbatim from server.py: outbox consistency guard, coarse audit error
 kind, send metadata args, unvalidated correlation args, and exact jump-URL
 segment match. The scoped text-channel resolver lives in
-:mod:`modum.source_messages` (shared without a
+:mod:`source_messages` (shared without a
 responder->server_helpers->responder import cycle) and is re-exported here
 so existing ``server_helpers._resolve_text_channel`` imports keep working.
 No other logic lives here.
@@ -16,11 +16,11 @@ from typing import Any
 
 import discord
 
-from .config import Settings
-from .delivery import DeliveryError
-from .outbox import OutboxError, read_entries
-from .responder import ResponderError
-from .source_messages import _resolve_text_channel
+from config import Settings
+from delivery import DeliveryError
+from outbox import OutboxError, read_entries
+from responder import ResponderError
+from source_messages import _resolve_text_channel
 
 __all__ = [
     "_check_outbox_consistent",

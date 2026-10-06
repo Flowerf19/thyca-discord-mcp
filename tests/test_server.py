@@ -6,7 +6,7 @@ network, no real .env/outbox/audit files (all paths are tmp fixtures).
 
 v5 isolation: this module covers the base 14-tool MCP protocol only. The
 ``running_server`` helper (and every direct-lifespan test) patches
-``modum.server.Responder`` with ``FakeResponder`` and parks the
+``server.Responder`` with ``FakeResponder`` and parks the
 always-on auto loops before their first tick, so no worker logic runs here.
 ``FakeResponder.guard_ack`` is a deliberate no-op: these tests isolate the
 underlying ack monotonic API only — the mandatory production guard is proven
@@ -26,15 +26,15 @@ import discord
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
-from modum.config import Settings
-from modum.outbox import (
+from config import Settings
+from outbox import (
     OutboxError,
     append_entry,
     get_poll_cursor,
     read_entries,
     set_poll_cursor,
 )
-from modum.server import create_server
+from server import create_server
 
 BOT_UID = 111
 OWNER_UID = 222
@@ -360,8 +360,8 @@ async def running_server(monkeypatch, settings, bot):
     their first tick can never run. v4 protocol assertions stay race-free;
     default-on auto behavior is proven in tests/test_server_responder.py.
     """
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FakeResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         for name in ("auto-reply", "auto-reply-recovery"):
@@ -769,8 +769,8 @@ async def test_send_message_scoped_helper_regression(settings, monkeypatch):
 
 async def test_lifespan_startup_order_and_listener(settings, monkeypatch):
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FakeResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         # Listener registered after build, before login/connect; login before connect.
@@ -798,8 +798,8 @@ async def test_lifespan_early_gateway_failure(settings, monkeypatch):
         await asyncio.sleep(3600)
 
     bot.wait_until_ready = hang_ready
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FakeResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="gateway failed before ready"):
         async with mcp.settings.lifespan(mcp):
@@ -827,8 +827,8 @@ async def test_lifespan_login_failure_closes_bot_and_listener(settings, monkeypa
         FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}),
         login_exc=discord.LoginFailure("bad token"),
     )
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FakeResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(discord.LoginFailure, match="bad token"):
         async with mcp.settings.lifespan(mcp):
@@ -852,8 +852,8 @@ async def test_lifespan_ready_failure_cleans_gateway(settings, monkeypatch):
         await orig_connect()
 
     bot.connect = spy_connect
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FakeResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="ready boom"):
         async with mcp.settings.lifespan(mcp):
@@ -891,8 +891,8 @@ async def test_lifespan_cancel_during_readiness_wait_cleans_all(settings, monkey
 
     bot.wait_until_ready = hang_ready
     bot.connect = spy_connect
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FakeResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
 
     async def _run():
@@ -922,8 +922,8 @@ async def test_lifespan_cancel_during_login_cleans_all(settings, monkeypatch):
         await login_release.wait()
 
     bot.login = gated_login
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FakeResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
 
     async def _run():
@@ -955,8 +955,8 @@ async def test_lifespan_close_error_still_settles_tasks(settings, monkeypatch):
         await orig_connect()
 
     bot.connect = spy_connect
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FakeResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="close boom"):
         async with mcp.settings.lifespan(mcp) as ctx:
@@ -983,8 +983,8 @@ async def test_lifespan_startup_refuses_state_behind_log(settings, monkeypatch):
     state_before = settings.outbox_state_path.read_bytes()
     log_before = settings.outbox_path.read_bytes()
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FakeResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(OutboxError, match="behind the log"):
         async with mcp.settings.lifespan(mcp):
@@ -1006,8 +1006,8 @@ async def test_lifespan_startup_refuses_malformed_log(settings, monkeypatch):
     state_before = settings.outbox_state_path.read_bytes()
     log_before = settings.outbox_path.read_bytes()
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FakeResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(OutboxError, match="corrupt outbox log"):
         async with mcp.settings.lifespan(mcp):
@@ -1258,8 +1258,8 @@ async def test_stop_task_refuses_protected_loops(settings, monkeypatch):
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     # Unparked lifespan: the protected loops must be running to prove the
     # refusal is about protection, not idleness.
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FakeResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         assert ctx["tasks"].status("auto-reply").running is True
@@ -1354,8 +1354,8 @@ async def test_lifespan_cancel_during_login_with_cleanup_failure_stays_cancelled
         await asyncio.sleep(3600)
 
     bot.login = gated_login
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FailingCloseResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FailingCloseResponder)
     mcp = create_server(settings)
 
     async def _run():
@@ -1384,8 +1384,8 @@ async def test_lifespan_startup_failure_with_cleanup_failures_keeps_primary(sett
         login_exc=discord.LoginFailure("bad token"),
         close_exc=RuntimeError("bot close boom"),
     )
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", FailingCloseResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", FailingCloseResponder)
     mcp = create_server(settings)
     with pytest.raises(discord.LoginFailure, match="bad token") as excinfo:
         async with mcp.settings.lifespan(mcp):
@@ -1405,8 +1405,8 @@ async def test_lifespan_startup_failure_with_cleanup_failures_keeps_primary(sett
 async def test_lifespan_listener_removal_failure_still_tears_down(settings, monkeypatch):
     channel = make_text_channel(CHANNEL_ID)
     bot = FailingRemoveListenerBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    monkeypatch.setattr("modum.server.build_bot", lambda s: bot)
-    monkeypatch.setattr("modum.server.Responder", RefusingGuardResponder)
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    monkeypatch.setattr("server.core.Responder", RefusingGuardResponder)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="remove boom"):
         async with mcp.settings.lifespan(mcp):

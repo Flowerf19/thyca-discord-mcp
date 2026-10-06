@@ -33,10 +33,10 @@ import discord
 from mcp.server.fastmcp import FastMCP
 from pydantic import StrictInt
 
-from .audit import append_audit
-from .bot import build_bot, get_scoped_guild, resolve_display_name
-from .config import Settings
-from .delivery import (
+from audit import append_audit
+from bot import build_bot, get_scoped_guild, resolve_display_name
+from config import Settings
+from delivery import (
     DeliveryDurabilityUncertain,
     get_job,
     mark_uncertain,
@@ -45,22 +45,22 @@ from .delivery import (
     skip_job,
 )
 
-# Aliased: the MCP tool below is named ``resolve_uncertain_drop``, so the
-# delivery function needs a distinct name (same pattern as record_no_reply).
-from .delivery import resolve_uncertain_drop as _delivery_resolve_uncertain_drop
-
 # Aliased: the MCP tool below defines a local ``record_no_reply`` inside the
 # ``create_server`` scope, so the delivery function needs a distinct name.
-from .delivery import record_no_reply as _delivery_record_no_reply
-from .identity import classify_actor
-from .outbox import (
+from delivery import record_no_reply as _delivery_record_no_reply
+
+# Aliased: the MCP tool below is named ``resolve_uncertain_drop``, so the
+# delivery function needs a distinct name (same pattern as record_no_reply).
+from delivery import resolve_uncertain_drop as _delivery_resolve_uncertain_drop
+from identity import classify_actor
+from outbox import (
     ack_entries,
     append_entry,
     build_message_entry,
     read_entries,
 )
-from .responder import Responder
-from .server_helpers import (
+from responder import Responder
+from server_helpers import (
     _check_outbox_consistent,
     _coarse_error_kind,
     _jump_url_ids_match,
@@ -68,9 +68,9 @@ from .server_helpers import (
     _send_meta_args,
     _unvalidated_correlation_args,
 )
-from .server_ticks import make_auto_reply_tick, make_heartbeat_tick, make_poll_tick
-from .source_messages import SourceDeleted, SourceUnavailable, check_source_message
-from .tasks import AUTO_RECOVERY_TASK_NAME, AUTO_REPLY_TASK_NAME, TaskRegistry, TickFn
+from server_ticks import make_auto_reply_tick, make_heartbeat_tick, make_poll_tick
+from source_messages import SourceDeleted, SourceUnavailable, check_source_message
+from tasks import AUTO_RECOVERY_TASK_NAME, AUTO_REPLY_TASK_NAME, TaskRegistry, TickFn
 
 MIN_POLL_SECONDS = 30.0
 
@@ -117,7 +117,7 @@ def create_server(settings: Settings) -> FastMCP:
 
     def _audit_sink(*args: Any, **kwargs: Any) -> dict[str, Any]:
         # Fresh lookup of server.append_audit per call: late patches of
-        # modum.server.append_audit (after create_server) apply.
+        # server.append_audit (after create_server) apply.
         return append_audit(*args, **kwargs)
 
     def _get_bot_or_none() -> discord.Client | None:
@@ -940,9 +940,7 @@ def create_server(settings: Settings) -> FastMCP:
         cid = channel_id if channel_id is not None else settings.default_channel_id
         args: dict[str, Any] = {
             "channel_id": cid,
-            "source_message_id": source_message_id
-            if isinstance(source_message_id, int)
-            else None,
+            "source_message_id": source_message_id if isinstance(source_message_id, int) else None,
         }
 
         def _bounded_drop(kind: str, public: str) -> NoReturn:
@@ -961,9 +959,7 @@ def create_server(settings: Settings) -> FastMCP:
             or isinstance(source_message_id, bool)
             or source_message_id <= 0
         ):
-            _bounded_drop(
-                "validation_error", "resolve_uncertain_drop: invalid source_message_id"
-            )
+            _bounded_drop("validation_error", "resolve_uncertain_drop: invalid source_message_id")
         try:
             dropped = _delivery_resolve_uncertain_drop(
                 settings.delivery_state_path, cid, source_message_id

@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from modum.tasks import (
+from tasks import (
     AUTO_RECOVERY_TASK_NAME,
     AUTO_REPLY_TASK_NAME,
     TaskRegistry,

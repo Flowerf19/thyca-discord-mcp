@@ -16,7 +16,7 @@ from unittest import mock
 
 import pytest
 
-from modum.thyca_client import (
+from thyca import (
     MAX_RESPONSE_BYTES,
     ThycaBusyError,
     ThycaClient,
