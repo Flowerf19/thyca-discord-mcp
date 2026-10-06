@@ -871,6 +871,86 @@ def skip_job(
     return copy.deepcopy(job)
 
 
+def resolve_uncertain_drop(
+    path: str | Path,
+    channel_id: int,
+    message_id: int,
+) -> dict[str, Any]:
+    """Operator-drop a stuck ``uncertain`` job with zero send evidence.
+
+    Moves ``uncertain`` -> ``skipped`` with reason ``operator_approved_drop``
+    and appends the matching ``authorized_skips`` record (same tuple the
+    schema validates: seq/author/actor/reason). This is the ONLY write path
+    for an uncertain job that is not ``complete_job``: it exists because a
+    responded turn can end with zero verifiable sends (nothing to receipt,
+    nothing to declare), leaving reconcile with no forward transition and
+    the FIFO head-blocked behind it.
+
+    Preconditions (fresh load, fail closed, never silently repaired): the
+    job exists and is ``uncertain``; send intents, receipts, trace refs,
+    observation, and no-reply declaration are ALL empty (any evidence
+    refuses -- a partly delivered job must never drop as no-send). Only
+    stage/skip_reason/error/updated_at change plus one authorized-skips
+    append; job_ref, fingerprints, aliases, Jev proof, and unknown fields
+    are preserved. Repeat on an already-dropped job returns the stored
+    copy only when the authorized record still matches exactly.
+    """
+    file = Path(path)
+    if not _is_strict_int(channel_id) or channel_id <= 0:
+        raise DeliveryError(f"invalid channel_id for delivery state {file}")
+    if not _is_strict_int(message_id) or message_id <= 0:
+        raise DeliveryError(f"invalid message_id for delivery state {file}")
+    state = _load_state(file)
+    key = _require_job(state, file, channel_id, message_id)
+    job = state["jobs"][key]
+    if job["stage"] == "skipped" and job["skip_reason"] == "operator_approved_drop":
+        skips = state.get("authorized_skips") or []
+        if any(
+            isinstance(item, dict)
+            and item.get("channel_id") == channel_id
+            and item.get("message_id") == message_id
+            and item.get("seq") == job["seq"]
+            and item.get("author_uid") == job["author_uid"]
+            and item.get("actor_kind") == job["actor_kind"]
+            and item.get("reason") == "operator_approved_drop"
+            for item in skips
+        ):
+            return copy.deepcopy(job)
+        raise DeliveryError(
+            f"delivery state {file}: job {key} drop record mismatch"
+        )
+    if job["stage"] != "uncertain":
+        raise DeliveryError(
+            f"delivery state {file}: job {key} stage {job['stage']} cannot operator-drop"
+        )
+    if (
+        job["send_intents"]
+        or job["send_receipts"]
+        or job["trace_refs"] is not None
+        or job["observation"] is not None
+        or job["no_reply_declaration"] is not None
+    ):
+        raise DeliveryError(f"delivery state {file}: job {key} has send evidence; cannot drop")
+    job["stage"] = "skipped"
+    job["skip_reason"] = "operator_approved_drop"
+    job["error"] = None
+    job["updated_at"] = _now_iso()
+    record = {
+        "channel_id": channel_id,
+        "message_id": message_id,
+        "seq": job["seq"],
+        "author_uid": job["author_uid"],
+        "actor_kind": job["actor_kind"],
+        "reason": "operator_approved_drop",
+    }
+    skips = state.get("authorized_skips")
+    if not isinstance(skips, list):
+        raise DeliveryError(f"delivery state {file}: authorized_skips must be a list")
+    skips.append(record)
+    _save_state(file, state)
+    return copy.deepcopy(job)
+
+
 def mark_uncertain(
     path: str | Path,
     channel_id: int,

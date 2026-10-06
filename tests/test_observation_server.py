@@ -467,14 +467,15 @@ def _seed_need_context(settings, mid=SOURCE_MID, seq=1, job_ref="job-need-1"):
 # --- tool surface -----------------------------------------------------------------
 
 
-async def test_tool_count_14_old_12_unchanged(settings):
+async def test_tool_count_15_old_12_unchanged(settings):
     mcp = create_server(settings)
     tools = await mcp.list_tools()
     names = sorted(t.name for t in tools)
-    assert len(names) == 14
+    assert len(names) == 15
     for old in OLD_TOOLS:
         assert old in names
     assert "read_context" in names and "record_no_reply" in names
+    assert "resolve_uncertain_drop" in names
     descs = {t.name: t.description or "" for t in tools}
     # Old tool contracts intact (identity policy + correlation wording).
     assert str(OWNER_UID) in descs["send_message"]
@@ -483,6 +484,8 @@ async def test_tool_count_14_old_12_unchanged(settings):
     # New tools carry their contracts.
     assert "no_reply_needed" in descs["record_no_reply"]
     assert "NEVER terminal" in descs["record_no_reply"]
+    assert "zero send evidence" in descs["resolve_uncertain_drop"]
+    assert "operator_approved_drop" in descs["resolve_uncertain_drop"]
     assert "1..20" in descs["read_context"]
     assert "never auto-forwarded" in descs["read_context"]
 
@@ -940,3 +943,75 @@ async def test_read_context_post_await_race_rejected(settings, monkeypatch):
                 "read_context",
                 {"source_message_id": SOURCE_MID, "job_ref": ref, "limit": 5},
             )
+
+
+# --- resolve_uncertain_drop -------------------------------------------------------
+
+
+def _seed_uncertain(settings, mid=SOURCE_MID, seq=1):
+    """Queued job driven to uncertain with zero send evidence."""
+    enqueue_job(
+        settings.delivery_state_path,
+        channel_id=CHANNEL_ID,
+        message_id=mid,
+        author_uid=OWNER_UID,
+        actor_kind="owner",
+        seq=seq,
+    )
+    mark_uncertain(settings.delivery_state_path, CHANNEL_ID, mid, kind="trace_unverified")
+
+
+async def test_resolve_uncertain_drop_happy_path(settings, monkeypatch):
+    _seed_uncertain(settings)
+    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
+    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        payload = await _call_json(
+            mcp, "resolve_uncertain_drop", {"source_message_id": SOURCE_MID}
+        )
+        job = get_job(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID)
+        assert job["stage"] == "skipped"
+        assert job["skip_reason"] == "operator_approved_drop"
+        assert job["error"] is None
+    assert payload == {
+        "status": "skipped",
+        "reason": "operator_approved_drop",
+        "channel_id": CHANNEL_ID,
+        "source_message_id": SOURCE_MID,
+        "seq": 1,
+    }
+    audited = _audit_records(settings, "resolve_uncertain_drop")
+    assert audited and all(r["ok"] is True for r in audited)
+
+
+async def test_resolve_uncertain_drop_rejects(settings, monkeypatch):
+    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
+    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        with pytest.raises(ToolError):  # unknown job
+            await _call_json(mcp, "resolve_uncertain_drop", {"source_message_id": 1})
+        with pytest.raises(ToolError):  # out of scope
+            await _call_json(
+                mcp,
+                "resolve_uncertain_drop",
+                {"source_message_id": SOURCE_MID, "channel_id": CHANNEL_ID + 1},
+            )
+        with pytest.raises(ToolError):  # bad id
+            await _call_json(mcp, "resolve_uncertain_drop", {"source_message_id": -5})
+    audited = _audit_records(settings, "resolve_uncertain_drop")
+    assert audited and all(r["ok"] is False for r in audited)
+
+
+async def test_resolve_uncertain_drop_rejects_non_uncertain(settings, monkeypatch):
+    enqueue_job(
+        settings.delivery_state_path,
+        channel_id=CHANNEL_ID,
+        message_id=SOURCE_MID,
+        author_uid=OWNER_UID,
+        actor_kind="owner",
+        seq=1,
+    )
+    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
+    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        with pytest.raises(ToolError):  # queued, never uncertain
+            await _call_json(mcp, "resolve_uncertain_drop", {"source_message_id": SOURCE_MID})
+        job = get_job(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID)
+        assert job["stage"] == "queued"

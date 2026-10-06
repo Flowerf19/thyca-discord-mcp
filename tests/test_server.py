@@ -52,6 +52,7 @@ EXPECTED_TOOLS = [
     "read_outbox",
     "record_no_reply",
     "remove_poll_task",
+    "resolve_uncertain_drop",
     "send_message",
     "start_task",
     "stop_task",
@@ -59,7 +60,8 @@ EXPECTED_TOOLS = [
 ]
 
 # Pre-routing tools: every one of the old 12 must remain with compatible
-# behavior; the 2 additions (read_context, record_no_reply) are covered in
+# behavior; the 3 additions (read_context, record_no_reply,
+# resolve_uncertain_drop) are covered in
 # tests/test_observation_server.py.
 EXPECTED_LEGACY_TOOLS = [
     "ack_outbox",
@@ -437,7 +439,7 @@ async def test_new_tool_descriptions_carry_essentials(settings):
 async def test_identity_policy_visible_in_tool_descriptions(settings):
     mcp = create_server(settings)
     descs = {t.name: t.description or "" for t in await mcp.list_tools()}
-    assert sorted(descs) == EXPECTED_TOOLS  # 14 tools: old 12 intact + 2 routing additions
+    assert sorted(descs) == EXPECTED_TOOLS  # 15 tools: old 12 intact + 3 additions
     for name in ("whoami", "read_outbox", "send_message"):
         desc = descs[name]
         assert str(settings.owner_uid) in desc  # parameterized owner UID (222 in tests)

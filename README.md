@@ -417,8 +417,8 @@ acceptance remains incomplete.
   fallback, unavailable holds; seq-66 stays `uncertain` (1 intent, 0 receipts)
   untouched; original live-fault gates not completed. Correlation nonce is NOT
   caller ACL in the shared MCP pool; no exactly-once, account-cap, or
-  live-quality claim. Current surface is 14 tools (12 preserved +
-  `read_context` + `record_no_reply`); contracts in [docs/TOOLS.md](docs/TOOLS.md).
+  live-quality claim. Current surface is 15 tools (12 preserved +
+  `read_context` + `record_no_reply` + `resolve_uncertain_drop`); contracts in [docs/TOOLS.md](docs/TOOLS.md).
 - **RunGate (do not start current source):** current source is a different
   Python namespace (`modum`) though the external CLI name is unchanged; native
   processes run old cached modules with no hot reload; deployment is separate
@@ -474,7 +474,7 @@ FastMCP drives the asyncio loop; the lifespan hook `await`s `bot.login()`, then 
 `bot.connect()` in the background and races it against `wait_until_ready()`, so tools
 `await` discord.py directly with no thread bridge.
 
-## Tools (current source: 14 total; V4 historical snapshot was 12)
+## Tools (current source: 15 total; V4 historical snapshot was 12)
 
 | Tool | What it does |
 |---|---|
@@ -490,11 +490,12 @@ FastMCP drives the asyncio loop; the lifespan hook `await`s `bot.login()`, then 
 | `ack_outbox` | mark entries up to a seq as read (rejects beyond latest) |
 | `read_context` | read approved-channel context for a correlated turn (≤20, before source) |
 | `record_no_reply` | declare no reply for a correlated `need_context` turn (nonterminal) |
+| `resolve_uncertain_drop` | operator-drop a stuck uncertain job with zero send evidence (terminal) |
 
 v2 (messages/channels) and v3 (members/roles) in [docs/TOOLS.md](docs/TOOLS.md) stay
 proposed; v4 (outbox + poll tasks) is implemented. The V4 historical snapshot
-above was 12 tools; the current source is 14 tools (12 preserved + `read_context`
-and `record_no_reply` for Modum `need_context`, source-complete, not deployed). No
+above was 12 tools; the current source is 15 tools (12 preserved + `read_context`,
+`record_no_reply` and `resolve_uncertain_drop` for Modum, source-complete, not deployed). No
 v2/v3 mutation/admin/destructive behavior is implemented or tested (existing
 read-only channel/member listings were exercised in the native 12-tool E2E).
 V5 (in-progress plan, V5 source, backend deployed and operating) adds no tool names beyond its 12 — `send_message`

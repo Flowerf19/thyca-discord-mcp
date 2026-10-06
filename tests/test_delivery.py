@@ -25,6 +25,7 @@ from modum.delivery import (
     record_send_intent,
     record_send_receipt,
     requeue_definitive_busy,
+    resolve_uncertain_drop,
     skip_job,
 )
 
@@ -728,6 +729,85 @@ def test_skip_and_uncertain_guards(tmp_path):
         mark_uncertain(path, CHANNEL, 101, kind="boom")
     with pytest.raises(DeliveryError, match="invalid http_status"):
         mark_uncertain(path, 999, 999, kind="timeout", http_status=99)
+
+
+def test_resolve_uncertain_drop_happy_path_and_idempotent(tmp_path):
+    path = _init(tmp_path)
+    enqueue_job(
+        path, channel_id=CHANNEL, message_id=100, author_uid=AUTHOR, actor_kind="owner", seq=1
+    )
+    mark_turn_submitting(path, CHANNEL, 100, job_ref="jobref-001", pre_turn_index=0)
+    dropped_mark = mark_uncertain(path, CHANNEL, 100, kind="trace_unverified")
+    assert dropped_mark["stage"] == "uncertain"
+    job = resolve_uncertain_drop(path, CHANNEL, 100)
+    assert job["stage"] == "skipped"
+    assert job["skip_reason"] == "operator_approved_drop"
+    assert job["error"] is None
+    assert job["job_ref"] == "jobref-001"  # proof preserved
+    assert job["send_intents"] == [] and job["send_receipts"] == []
+    # Authorized-skips record matches the job tuple exactly.
+    state = load_delivery_state(path)
+    assert state["authorized_skips"] == [
+        {
+            "channel_id": CHANNEL,
+            "message_id": 100,
+            "seq": 1,
+            "author_uid": AUTHOR,
+            "actor_kind": "owner",
+            "reason": "operator_approved_drop",
+        }
+    ]
+    same = resolve_uncertain_drop(path, CHANNEL, 100)
+    assert same == job
+
+
+def test_resolve_uncertain_drop_refusals(tmp_path):
+    path = _init(tmp_path)
+    enqueue_job(
+        path, channel_id=CHANNEL, message_id=100, author_uid=AUTHOR, actor_kind="owner", seq=1
+    )
+    with pytest.raises(DeliveryError, match="cannot operator-drop"):
+        resolve_uncertain_drop(path, CHANNEL, 100)
+    with pytest.raises(DeliveryError, match="invalid channel_id"):
+        resolve_uncertain_drop(path, 0, 100)
+    with pytest.raises(DeliveryError, match="invalid message_id"):
+        resolve_uncertain_drop(path, CHANNEL, -5)
+    with pytest.raises(DeliveryError, match="unknown job"):
+        resolve_uncertain_drop(path, CHANNEL, 999)
+    dropped = skip_job(path, CHANNEL, 100, reason="out_of_scope")
+    assert dropped["stage"] == "skipped"
+    with pytest.raises(DeliveryError, match="cannot operator-drop"):
+        resolve_uncertain_drop(path, CHANNEL, 100)
+
+
+def test_resolve_uncertain_drop_refuses_send_evidence(tmp_path):
+    path = _init(tmp_path)
+    enqueue_job(
+        path, channel_id=CHANNEL, message_id=100, author_uid=AUTHOR, actor_kind="owner", seq=1
+    )
+    mark_turn_submitting(path, CHANNEL, 100, job_ref="jobref-001", pre_turn_index=0)
+    mark_inflight(path, CHANNEL, 100, turn_index=0)
+    record_send_intent(
+        path, CHANNEL, 100, send_ref="send-001", content_len=5, content_hash=HASH_A
+    )
+    mark_uncertain(path, CHANNEL, 100, kind="timeout")
+    with pytest.raises(DeliveryError, match="send evidence"):
+        resolve_uncertain_drop(path, CHANNEL, 100)
+    assert get_job(path, CHANNEL, 100)["stage"] == "uncertain"
+
+
+def test_resolve_uncertain_drop_mismatch_never_silent_repair(tmp_path):
+    path = _init(tmp_path)
+    enqueue_job(
+        path, channel_id=CHANNEL, message_id=100, author_uid=AUTHOR, actor_kind="owner", seq=1
+    )
+    mark_uncertain(path, CHANNEL, 100, kind="timeout")
+    resolve_uncertain_drop(path, CHANNEL, 100)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["authorized_skips"].pop()
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(DeliveryError, match="drop record mismatch"):
+        resolve_uncertain_drop(path, CHANNEL, 100)
 
 
 def test_terminal_cannot_rewind_but_alias_backfill_persists(tmp_path):

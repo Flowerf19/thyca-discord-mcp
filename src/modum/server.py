@@ -45,6 +45,10 @@ from .delivery import (
     skip_job,
 )
 
+# Aliased: the MCP tool below is named ``resolve_uncertain_drop``, so the
+# delivery function needs a distinct name (same pattern as record_no_reply).
+from .delivery import resolve_uncertain_drop as _delivery_resolve_uncertain_drop
+
 # Aliased: the MCP tool below defines a local ``record_no_reply`` inside the
 # ``create_server`` scope, so the delivery function needs a distinct name.
 from .delivery import record_no_reply as _delivery_record_no_reply
@@ -905,6 +909,80 @@ def create_server(settings: Settings) -> FastMCP:
                 "source_message_id": source_message_id,
                 "job_ref": job_ref,
                 "reason": reason,
+            },
+        )
+
+    @mcp.tool(
+        description=(
+            "Operator-drop a stuck uncertain job with zero send evidence; "
+            "defaults to the configured channel. Call with the exact "
+            "source_message_id of an uncertain job whose native turn is final "
+            "and produced nothing verifiable (no intents, receipts, trace, "
+            "observation, or declaration). The job moves to skipped with "
+            "reason operator_approved_drop plus a matching authorized-skips "
+            "record, unblocking the FIFO head; proof fields (job_ref, "
+            "fingerprints, Jev decision) are preserved. Refuses anything with "
+            "send evidence and any non-uncertain stage. "
+            f"{identity_policy}"
+        )
+    )
+    async def resolve_uncertain_drop(
+        source_message_id: StrictInt,
+        channel_id: int | None = None,
+    ) -> str:
+        """Drop a stuck uncertain job. (Agent-facing text is above.)
+
+        Targeted by channel + source message only (no job_ref: the caller
+        names the stuck job, delivery enforces uncertain-stage plus
+        zero-evidence preconditions). Shared MCP correlation selects the job
+        but never authenticates the caller.
+        """
+        cid = channel_id if channel_id is not None else settings.default_channel_id
+        args: dict[str, Any] = {
+            "channel_id": cid,
+            "source_message_id": source_message_id
+            if isinstance(source_message_id, int)
+            else None,
+        }
+
+        def _bounded_drop(kind: str, public: str) -> NoReturn:
+            audit(
+                "resolve_uncertain_drop",
+                {**args, "error_kind": kind},
+                ok=False,
+                error=f"resolve_uncertain_drop failed kind={kind}",
+            )
+            raise ValueError(public) from None
+
+        if cid != settings.default_channel_id:
+            _bounded_drop("validation_error", "resolve_uncertain_drop: channel out of scope")
+        if (
+            not isinstance(source_message_id, int)
+            or isinstance(source_message_id, bool)
+            or source_message_id <= 0
+        ):
+            _bounded_drop(
+                "validation_error", "resolve_uncertain_drop: invalid source_message_id"
+            )
+        try:
+            dropped = _delivery_resolve_uncertain_drop(
+                settings.delivery_state_path, cid, source_message_id
+            )
+        except asyncio.CancelledError:
+            raise
+        except DeliveryDurabilityUncertain:
+            _bounded_drop("delivery_error", "resolve_uncertain_drop: delivery uncertain")
+        except Exception as exc:
+            _bounded_drop(_coarse_error_kind(exc), "resolve_uncertain_drop: drop rejected")
+        return _ok(
+            "resolve_uncertain_drop",
+            args,
+            {
+                "status": dropped["stage"],
+                "reason": dropped["skip_reason"],
+                "channel_id": cid,
+                "source_message_id": source_message_id,
+                "seq": dropped["seq"],
             },
         )
 

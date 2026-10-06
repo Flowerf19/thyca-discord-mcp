@@ -1,4 +1,4 @@
-# MCP tools — v1 + v4 implemented (12 preserved); v5 in-progress; Modum adds 2 (14 total, source-only); v2/v3 proposed
+# MCP tools — v1 + v4 implemented (12 preserved); v5 in-progress; Modum adds 3 (15 total, source-only); v2/v3 proposed
 
 Scope guard (all tools): operate only on the configured `GUILD_ID`.
 Every call is audited to `audit.jsonl`. Destructive tools run without confirm
@@ -202,10 +202,10 @@ failure-injection gaps remain — see the plan.
   imports; no deploy/live acceptance implied.
   Source-only; rollout pending. T5/T6 gaps open (see plan).
 
-## Modum — source complete (never deployed): `read_context` + `record_no_reply` (14 total)
+## Modum — source complete (never deployed): `read_context` + `record_no_reply` + `resolve_uncertain_drop` (15 total)
 
-Current source surface is 14 tools: the 12 v1+v4 names above are preserved
-with the v5 correlation/guards, plus 2 new Modum `need_context` tools below.
+Current source surface is 15 tools: the 12 v1+v4 names above are preserved
+with the v5 correlation/guards, plus 3 new Modum tools below.
 Both are verified in `src/modum/server.py` (`create_server` scope) with
 `StrictInt` IDs, `responder.correlated_job` gating, and delivery guards; this
 section states actual function contracts, not guesses. Python namespace is
@@ -297,6 +297,26 @@ replace the frozen Jev snapshot or automatically trigger another classification.
   old jobs missing optional new fields stay preserved with no legacy-null
   contradiction. Correlation nonce is NOT caller ACL; no exactly-once claim.
 
+### `resolve_uncertain_drop` — operator drop for a stuck uncertain job
+
+- Signature (actual): `resolve_uncertain_drop(source_message_id: StrictInt,
+  channel_id: int | None = None)`. Default channel when omitted. No `job_ref`:
+  the caller names the stuck job; delivery enforces the preconditions.
+- Gates: channel must equal default; source strict positive int; job exists and
+  is `uncertain`; send intents, receipts, trace refs, observation, and no-reply
+  declaration are ALL empty (any evidence refuses -- a partly delivered job
+  must never drop as no-send). Exists because a responded turn can end with
+  zero verifiable sends, leaving reconcile with no forward transition and the
+  FIFO head-blocked behind it.
+- Effect: `uncertain` -> `skipped` with reason `operator_approved_drop` plus a
+  matching `authorized_skips` record (seq/author/actor/reason tuple the schema
+  validates); `job_ref`, fingerprints, aliases, and Jev proof preserved,
+  `error` cleared. Repeat on an already-dropped job returns the stored copy
+  only while the authorized record still matches exactly (never silent repair).
+- Returns: `{status: skipped, reason: operator_approved_drop, channel_id,
+  source_message_id, seq}`.
+- Audit: failures audit `error_kind` with no raw-body echo; success audits ok.
+
 ## v2 — proposed: messages & channels
 
 | Tool | Args | Discord perm | Note |
@@ -346,8 +366,8 @@ replace the frozen Jev snapshot or automatically trigger another classification.
   destructive operations remain proposed and untested; existing read-only
   channel/member listings were exercised in the native 12-tool E2E. V5
   correlation/guards add no tool names beyond its 12; the plan stays
-  in-progress with T6 evidence PARTIAL (see above). Current source is 14 tools
-  (12 preserved + Modum `read_context` + `record_no_reply`, source-only
+  in-progress with T6 evidence PARTIAL (see above). Current source is 15 tools
+  (12 preserved + Modum `read_context` + `record_no_reply` + `resolve_uncertain_drop`, source-only
   complete, integration SOURCE reviews complete, T4 DONE checked/reviewed;
   T5 COMPLETE, T6 audit complete without additional source deletion;
   T7 final reviews complete, Minor fixed and independently approved).
