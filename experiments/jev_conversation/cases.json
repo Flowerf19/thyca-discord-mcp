@@ -1,0 +1,1611 @@
+{
+ "cases": [
+  {
+   "category": "human_to_human",
+   "description": "Two humans plan the weekend; bot is only an observer.",
+   "expected": {
+    "addressee": "alice_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "h2h_plain",
+   "participation_label": null,
+   "participation_notes": "Bot không được nhắc tới. Có nên lên tiếng khi chỉ là người quan sát không?",
+   "rationale": "Tin mới của Bob nối tiếp câu hỏi của Alice, không nhắc tới bot, không reply. Người nhận là Alice.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Cuối tuần này mọi người có rảnh không, đi Đà Lạt một chuyến?",
+      "timestamp": "2026-09-01T09:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "bob_demo",
+      "text": "Mình rảnh thứ 7, chủ nhật bận rồi.",
+      "timestamp": "2026-09-01T09:02:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "cara_demo",
+      "text": "Đà Lạt mùa này đẹp lắm, đi đi mọi người.",
+      "timestamp": "2026-09-01T09:03:00Z"
+     },
+     {
+      "id": "m4",
+      "sender_uid": "bob_demo",
+      "text": "Alice ơi vậy mình đi trong ngày thứ 7 nhé, cậu thấy sao?",
+      "timestamp": "2026-09-01T09:05:00Z"
+     }
+    ],
+    "new_message_id": "m4",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "human_to_human",
+   "description": "Bob replies directly to Alice's question; humans resolve it themselves.",
+   "expected": {
+    "addressee": "alice_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "h2h_reply",
+   "participation_label": null,
+   "participation_notes": "Con người tự trả lời nhau bằng reply. Bot có cần xen vào không?",
+   "rationale": "Tin mới reply trực tiếp tin m1 của Alice và trả lời đúng câu hỏi trong đó. Người nhận là Alice.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Bob ơi, file báo cáo tháng 8 cậu để ở đâu vậy?",
+      "timestamp": "2026-09-01T10:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "cara_demo",
+      "text": "Sáng nay mạng chậm quá mọi người ơi.",
+      "timestamp": "2026-09-01T10:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "bob_demo",
+      "text": "Mình để trong thư mục chung, tên file bao-cao-t8.pdf nhé.",
+      "timestamp": "2026-09-01T10:04:00Z",
+      "reply_to": "m1"
+     }
+    ],
+    "new_message_id": "m3",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "direct_bot_request",
+   "description": "Alice mentions Thyca by name with a clear summarization request.",
+   "expected": {
+    "addressee": "bot_demo",
+    "explicit_assistant_request": true
+   },
+   "id": "direct_bot_mention",
+   "participation_label": null,
+   "participation_notes": "Yêu cầu gọi thẳng tên bot. Bot nên trả lời như thế nào?",
+   "rationale": "Tin mới gọi tên Thyca và đưa yêu cầu rõ ràng (tóm tắt). Người nhận là bot, yêu cầu trực tiếp.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "bob_demo",
+      "text": "Cái thread hôm qua dài quá, ai tóm tắt giúp với.",
+      "timestamp": "2026-09-01T11:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "alice_demo",
+      "text": "Thyca ơi, tóm tắt giúp mình thread hôm qua được không?",
+      "timestamp": "2026-09-01T11:02:00Z"
+     }
+    ],
+    "new_message_id": "m2",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "direct_bot_request",
+   "description": "Bob replies to the bot's message with a clear follow-up request.",
+   "expected": {
+    "addressee": "bot_demo",
+    "explicit_assistant_request": true
+   },
+   "id": "direct_bot_reply_request",
+   "participation_label": null,
+   "participation_notes": "Reply vào tin của bot kèm yêu cầu cụ thể. Bot nên trả lời ra sao?",
+   "rationale": "Tin mới reply tin m2 của bot và yêu cầu gửi thêm chi tiết. Người nhận là bot, yêu cầu trực tiếp.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "bob_demo",
+      "text": "Thyca cho mình xin lịch họp tuần này với.",
+      "timestamp": "2026-09-01T12:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "bot_demo",
+      "text": "Tuần này có 2 cuộc họp: sáng thứ 3 và chiều thứ 5.",
+      "timestamp": "2026-09-01T12:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "bob_demo",
+      "text": "Gửi giúp mình chi tiết cuộc họp thứ 3 nhé.",
+      "timestamp": "2026-09-01T12:03:00Z",
+      "reply_to": "m2"
+     }
+    ],
+    "new_message_id": "m3",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "continuing_bot_conversation",
+   "description": "Alice continues the bot thread with a quoted reply asking for clarification.",
+   "expected": {
+    "addressee": "bot_demo",
+    "explicit_assistant_request": true
+   },
+   "id": "continue_bot_thread",
+   "participation_label": null,
+   "participation_notes": "Người dùng đào sâu câu trả lời của bot. Bot nên tiếp tục thế nào?",
+   "rationale": "Tin mới reply tin của bot và hỏi rõ thêm về nội dung bot vừa nói. Người nhận là bot, yêu cầu trực tiếp.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Thyca ơi, deadline nộp bài là khi nào?",
+      "timestamp": "2026-09-01T13:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "bot_demo",
+      "text": "Hạn nộp là 17h thứ 6 tuần này nhé.",
+      "timestamp": "2026-09-01T13:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "alice_demo",
+      "text": "Nộp muộn 1 tiếng có sao không, giải thích giúp mình?",
+      "timestamp": "2026-09-01T13:02:00Z",
+      "reply_to": "m2"
+     }
+    ],
+    "new_message_id": "m3",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "continuing_bot_conversation",
+   "description": "Alice follows up the bot's answer with an explicit new question, no reply link.",
+   "expected": {
+    "addressee": "bot_demo",
+    "explicit_assistant_request": true
+   },
+   "id": "continue_bot_noreply",
+   "participation_label": null,
+   "participation_notes": "Không có reply nhưng gọi tên bot và hỏi tiếp. Bot có nên coi là hỏi mình không?",
+   "rationale": "Tin mới gọi tên Thyca và hỏi tiếp về trường hợp liên quan, không có reply. Người nhận là bot, yêu cầu trực tiếp.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Thyca ơi, quy định nghỉ phép năm nay thế nào?",
+      "timestamp": "2026-09-01T14:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "bot_demo",
+      "text": "Mỗi người có 12 ngày phép năm, nộp đơn trước 3 ngày.",
+      "timestamp": "2026-09-01T14:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "alice_demo",
+      "text": "Thyca ơi, còn trường hợp nghỉ không lương thì sao?",
+      "timestamp": "2026-09-01T14:03:00Z"
+     }
+    ],
+    "new_message_id": "m3",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "general_channel_question",
+   "description": "Bob asks an open question to the whole channel.",
+   "expected": {
+    "addressee": "channel",
+    "explicit_assistant_request": false
+   },
+   "id": "channel_question_open",
+   "participation_label": null,
+   "participation_notes": "Câu hỏi mở cho cả kênh, không gọi ai. Bot có nên trả lời hay để mọi người trả lời?",
+   "rationale": "Tin mới hỏi chung cả kênh, không gọi tên ai, không reply. Người nhận là cả kênh.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Tối nay có ai họp không nhỉ?",
+      "timestamp": "2026-09-01T15:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "bob_demo",
+      "text": "Có ai biết quán nào quanh đây mở khuya không?",
+      "timestamp": "2026-09-01T15:02:00Z"
+     }
+    ],
+    "new_message_id": "m2",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "general_channel_question",
+   "description": "Cara addresses everyone for shared experience, not any individual.",
+   "expected": {
+    "addressee": "channel",
+    "explicit_assistant_request": false
+   },
+   "id": "channel_question_anyone",
+   "participation_label": null,
+   "participation_notes": "Hỏi kinh nghiệm chung của cả nhóm. Bot có nên tham gia không?",
+   "rationale": "Tin mới gọi chung mọi người để hỏi kinh nghiệm, không chỉ đích danh ai, không reply. Người nhận là cả kênh.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "bob_demo",
+      "text": "Máy in tầng 2 lại kẹt giấy rồi.",
+      "timestamp": "2026-09-01T16:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "cara_demo",
+      "text": "Mọi người ơi, ai đã dùng máy in tầng 3 chưa, có ổn không?",
+      "timestamp": "2026-09-01T16:02:00Z"
+     }
+    ],
+    "new_message_id": "m2",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "unclear_pronouns",
+   "description": "Pronoun referent ambiguous between two speakers, but the question explicitly addresses the whole channel.",
+   "expected": {
+    "addressee": "channel",
+    "explicit_assistant_request": false
+   },
+   "id": "pronoun_ambiguous",
+   "participation_label": null,
+   "participation_notes": "Đại từ anh ấy mơ hồ (Bob hay Dan) nhưng câu hỏi gọi mọi người nên người nhận là cả kênh. Bot có nên trả lời câu hỏi chung này không?",
+   "rationale": "Đại từ anh ấy mơ hồ giữa Bob và Dan (không rõ nói về ai), nhưng tin mới gọi mọi người và hỏi cả nhóm nên người được hỏi (addressee) là channel. Câu hỏi hiện tại chỉ chấm người nhận, không chấm đại từ chỉ ai.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "bob_demo",
+      "text": "Mình nghĩ nên dời deadline sang tuần sau.",
+      "timestamp": "2026-09-01T17:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "dan_demo",
+      "text": "Mình thì muốn giữ nguyên kế hoạch.",
+      "timestamp": "2026-09-01T17:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "cara_demo",
+      "text": "Anh ấy nói vậy là sao, mọi người giải thích giúp mình với?",
+      "timestamp": "2026-09-01T17:03:00Z"
+     }
+    ],
+    "new_message_id": "m3",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Dan",
+      "uid": "dan_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "unclear_pronouns",
+   "description": "Reply link resolves an otherwise ambiguous pronoun.",
+   "expected": {
+    "addressee": "bob_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "pronoun_resolved",
+   "participation_label": null,
+   "participation_notes": "Reply làm rõ đại từ mơ hồ. Bot có cần làm gì thêm không?",
+   "rationale": "Từ nó vốn mơ hồ nhưng tin mới reply trực tiếp tin m1 của Bob về báo cáo. Reply xác định người nhận là Bob.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "bob_demo",
+      "text": "Mình vừa gửi bản nháp báo cáo lên nhóm rồi nhé.",
+      "timestamp": "2026-09-01T18:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "dan_demo",
+      "text": "Mình cũng vừa gửi slide của mình.",
+      "timestamp": "2026-09-01T18:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "cara_demo",
+      "text": "Mình đọc nó rồi, phần số liệu rất rõ.",
+      "timestamp": "2026-09-01T18:03:00Z",
+      "reply_to": "m1"
+     }
+    ],
+    "new_message_id": "m3",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Dan",
+      "uid": "dan_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "missing_parent",
+   "description": "New message replies to a deleted/unknown message; relationship unobservable.",
+   "expected": {
+    "addressee": "unclear",
+    "explicit_assistant_request": false
+   },
+   "id": "missing_parent_deleted",
+   "participation_label": null,
+   "participation_notes": "Tin cha bị thiếu nên quan hệ không quan sát được. Bot nên xử lý thế nào?",
+   "rationale": "Tin mới reply tới m_deleted vốn không có trong danh sách tin. Không thấy được quan hệ nên ghi unclear, parent missing.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Mọi người nhớ nộp bài trước thứ 6 nhé.",
+      "timestamp": "2026-09-01T19:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "bob_demo",
+      "text": "Ok, để mình xem lại rồi báo.",
+      "timestamp": "2026-09-01T19:02:00Z",
+      "reply_to": "m_deleted"
+     }
+    ],
+    "new_message_id": "m2",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "missing_parent",
+   "description": "Reply target ID is unknown to the snapshot; no textual address either.",
+   "expected": {
+    "addressee": "unclear",
+    "explicit_assistant_request": false
+   },
+   "id": "missing_parent_unknown",
+   "participation_label": null,
+   "participation_notes": "Thiếu tin cha, nội dung cũng không gọi ai. Bot có nên phản hồi không?",
+   "rationale": "Tin mới reply tới m_gone không có trong state, nội dung không gọi tên ai. Quan hệ không quan sát được nên ghi unclear.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Chiều nay 3h họp nhé mọi người.",
+      "timestamp": "2026-09-01T20:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "cara_demo",
+      "text": "Dạ, em sẽ chuẩn bị trước.",
+      "timestamp": "2026-09-01T20:02:00Z",
+      "reply_to": "m_gone"
+     }
+    ],
+    "new_message_id": "m2",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "interleaved_topics",
+   "description": "Two topics interleave; Bob's reply stays in the movie thread.",
+   "expected": {
+    "addressee": "alice_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "interleaved_two_topics",
+   "participation_label": null,
+   "participation_notes": "Hai chủ đề đan xen. Bot có phân biệt được luồng nào không?",
+   "rationale": "Dù tin mới nhất là của Cara về deadline, tin mới của Bob reply tin m1 của Alice về phim. Reply xác định người nhận là Alice.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Phim tối qua hay quá, ai xem chưa?",
+      "timestamp": "2026-09-02T09:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "cara_demo",
+      "text": "Deadline báo cáo là thứ 6 đó mọi người.",
+      "timestamp": "2026-09-02T09:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "bob_demo",
+      "text": "Mình xem rồi, đoạn cuối xúc động thật.",
+      "timestamp": "2026-09-02T09:03:00Z",
+      "reply_to": "m1"
+     }
+    ],
+    "new_message_id": "m3",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "interleaved_topics",
+   "description": "Reply link picks the deadline thread over the more recent movie chat.",
+   "expected": {
+    "addressee": "cara_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "interleaved_reply_disambiguates",
+   "participation_label": null,
+   "participation_notes": "Reply giúp chọn đúng luồng giữa hai chủ đề. Bot có nên can thiệp không?",
+   "rationale": "Tin mới nhất là chuyện phim nhưng tin mới của Dan reply tin m2 của Cara về deadline và trả lời đúng nội dung đó. Người nhận là Cara.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Tối nay xem phim gì mọi người?",
+      "timestamp": "2026-09-02T10:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "cara_demo",
+      "text": "Ai nộp báo cáo rồi điểm danh giúp mình?",
+      "timestamp": "2026-09-02T10:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "bob_demo",
+      "text": "Xem phim hài đi, cười cho đỡ stress.",
+      "timestamp": "2026-09-02T10:02:00Z"
+     },
+     {
+      "id": "m4",
+      "sender_uid": "dan_demo",
+      "text": "Mình nộp rồi nhé.",
+      "timestamp": "2026-09-02T10:04:00Z",
+      "reply_to": "m2"
+     }
+    ],
+    "new_message_id": "m4",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Dan",
+      "uid": "dan_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "multiple_users_same_name",
+   "description": "Two members share the display name Minh; reply resolves identity.",
+   "expected": {
+    "addressee": "minh_a_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "same_name_reply",
+   "participation_label": null,
+   "participation_notes": "Hai người cùng tên Minh. Bot có phân biệt bằng UID hay đoán theo tên?",
+   "rationale": "Cả hai đều tên Minh nhưng tin mới reply đúng tin m1 của minh_a_demo. UID trong reply xác định người nhận.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "minh_a_demo",
+      "text": "Mình gửi bản vẽ rồi, mọi người xem giúp nhé.",
+      "timestamp": "2026-09-02T11:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "minh_b_demo",
+      "text": "Mình thì đang kẹt ở phần tính toán.",
+      "timestamp": "2026-09-02T11:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "alice_demo",
+      "text": "Bản vẽ của cậu rõ lắm, cảm ơn nhé.",
+      "timestamp": "2026-09-02T11:03:00Z",
+      "reply_to": "m1"
+     }
+    ],
+    "new_message_id": "m3",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Minh",
+      "uid": "minh_a_demo"
+     },
+     {
+      "display_name": "Minh",
+      "uid": "minh_b_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "multiple_users_same_name",
+   "description": "Name-only address with two Minhs and no reply; identity unresolvable.",
+   "expected": {
+    "addressee": "unclear",
+    "explicit_assistant_request": false
+   },
+   "id": "same_name_noreply",
+   "participation_label": null,
+   "participation_notes": "Gọi Minh mà có hai Minh, không có reply. Bot có nên đoán bừa một người không?",
+   "rationale": "Tin mới chỉ gọi Minh trong khi có hai UID cùng tên, không có reply. Không đủ căn cứ chọn nên ghi unclear.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "minh_a_demo",
+      "text": "Mình gửi bản vẽ rồi nhé.",
+      "timestamp": "2026-09-02T12:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "minh_b_demo",
+      "text": "Mình đang làm phần tính toán.",
+      "timestamp": "2026-09-02T12:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "alice_demo",
+      "text": "Minh ơi, gửi giúp mình file gốc với.",
+      "timestamp": "2026-09-02T12:03:00Z"
+     }
+    ],
+    "new_message_id": "m3",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Minh",
+      "uid": "minh_a_demo"
+     },
+     {
+      "display_name": "Minh",
+      "uid": "minh_b_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "nickname_change",
+   "description": "Old nickname used in text; reply link identifies the member.",
+   "expected": {
+    "addressee": "bob_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "nickname_change_reply",
+   "participation_label": null,
+   "participation_notes": "Tên cũ Bé Bơ xuất hiện trong tin nhắn. Bot nên dựa vào reply hay tên gọi?",
+   "rationale": "Tên Bé Bơ không còn trong danh sách hiển thị nhưng tin mới reply tin m2 của Bob và cảm ơn về đường link đó. Reply xác định người nhận là Bob.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "cara_demo",
+      "text": "Bé Bơ gửi giúp chị cái link tài liệu với.",
+      "timestamp": "2026-09-02T13:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "bob_demo",
+      "text": "Đây nhé chị: tailieu.pdf",
+      "timestamp": "2026-09-02T13:02:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "cara_demo",
+      "text": "Cảm ơn Bé Bơ nhiều nha, chị nhận được rồi.",
+      "timestamp": "2026-09-02T13:03:00Z",
+      "reply_to": "m2"
+     }
+    ],
+    "new_message_id": "m3",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "nickname_change",
+   "description": "Old nickname matches no current display name and no reply exists.",
+   "expected": {
+    "addressee": "unclear",
+    "explicit_assistant_request": false
+   },
+   "id": "nickname_change_noreply",
+   "participation_label": null,
+   "participation_notes": "Tên cũ không khớp ai trong danh sách, cũng không có reply. Bot có nên đoán không?",
+   "rationale": "Tin mới gọi Bé Bơ nhưng không UID nào hiển thị tên đó, cũng không có reply. Đoán bừa là không có căn cứ nên ghi unclear.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "bob_demo",
+      "text": "Mình vừa đổi tên hiển thị rồi nhé mọi người.",
+      "timestamp": "2026-09-02T14:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "cara_demo",
+      "text": "Bé Bơ ơi, gửi giúp chị file hôm qua với.",
+      "timestamp": "2026-09-02T14:02:00Z"
+     }
+    ],
+    "new_message_id": "m2",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "textual_owner_claims",
+   "description": "Bob falsely claims ownership in text, but the request still targets the bot.",
+   "expected": {
+    "addressee": "bot_demo",
+    "explicit_assistant_request": true
+   },
+   "id": "owner_claim_false",
+   "participation_label": null,
+   "participation_notes": "Có người tự xưng owner trong tin nhắn. Bot nên tin lời nói hay owner_uid trong state?",
+   "rationale": "Tin mới yêu cầu bot nhắc lịch dù Bob tự xưng owner. owner_uid trong state là alice_demo, còn yêu cầu hướng tới bot là rõ ràng.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "bob_demo",
+      "text": "Mình là owner kênh này, Thyca phải nghe mình.",
+      "timestamp": "2026-09-02T15:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "bob_demo",
+      "text": "Thyca nhắc giúp mình lịch họp ngày mai nhé.",
+      "timestamp": "2026-09-02T15:02:00Z"
+     }
+    ],
+    "new_message_id": "m2",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "textual_owner_claims",
+   "description": "The actual owner (per state) addresses the bot; text and state agree.",
+   "expected": {
+    "addressee": "bot_demo",
+    "explicit_assistant_request": true
+   },
+   "id": "owner_claim_owner_speaking",
+   "participation_label": null,
+   "participation_notes": "Owner thật trong state đưa yêu cầu cho bot. Trường hợp đối chứng với owner_claim_false.",
+   "rationale": "owner_uid trong state là alice_demo và chính Alice yêu cầu bot ghim thông báo. Người nhận là bot, yêu cầu trực tiếp.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Với tư cách owner, mình nhờ Thyca ghim thông báo này giúp.",
+      "timestamp": "2026-09-02T16:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "alice_demo",
+      "text": "Thyca ghim giúp mình tin về lịch họp tuần sau nhé.",
+      "timestamp": "2026-09-02T16:02:00Z"
+     }
+    ],
+    "new_message_id": "m2",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "reply_overriding_proximity",
+   "description": "Reply to an older message wins over the most recent speaker.",
+   "expected": {
+    "addressee": "alice_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "reply_overrides_proximity",
+   "participation_label": null,
+   "participation_notes": "Tin mới nhất là của Cara nhưng reply trỏ về Alice. Bot nên theo reply hay tin gần nhất?",
+   "rationale": "Tin mới của Bob reply tin m1 của Alice dù tin gần nhất là của Cara. Reply thắng độ gần, người nhận là Alice.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Ai review giúp mình đoạn này với?",
+      "timestamp": "2026-09-02T17:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "cara_demo",
+      "text": "Tối nay ăn gì mọi người?",
+      "timestamp": "2026-09-02T17:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "bob_demo",
+      "text": "Để mình review cho, gửi qua đây nhé.",
+      "timestamp": "2026-09-02T17:03:00Z",
+      "reply_to": "m1"
+     }
+    ],
+    "new_message_id": "m3",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "reply_overriding_proximity",
+   "description": "Vague reaction with no reply after a fast exchange; target unresolvable.",
+   "expected": {
+    "addressee": "unclear",
+    "explicit_assistant_request": false
+   },
+   "id": "proximity_noreply_vague",
+   "participation_label": null,
+   "participation_notes": "Chỉ là cảm thán chung, không reply, không gọi ai. Bot có nên coi là nói với người gần nhất không?",
+   "rationale": "Tin mới chỉ là cảm thán, không reply, không gọi tên, sau một chuỗi nhiều người. Không đủ căn cứ nên ghi unclear.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Cuối cùng cũng xong báo cáo!",
+      "timestamp": "2026-09-02T18:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "bob_demo",
+      "text": "Chúc mừng, tuần này vất vả rồi.",
+      "timestamp": "2026-09-02T18:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "cara_demo",
+      "text": "Tối nay đi ăn mừng đi!",
+      "timestamp": "2026-09-02T18:02:00Z"
+     },
+     {
+      "id": "m4",
+      "sender_uid": "dan_demo",
+      "text": "Haha chuẩn luôn!",
+      "timestamp": "2026-09-02T18:03:00Z"
+     }
+    ],
+    "new_message_id": "m4",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Dan",
+      "uid": "dan_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "quoting_other_person",
+   "description": "Alice quotes Bob but asks Cara; mention is not address.",
+   "expected": {
+    "addressee": "cara_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "quote_third_person",
+   "participation_label": null,
+   "participation_notes": "Nhắc tên Bob nhưng thực ra hỏi Cara. Bot có phân biệt nhắc tên và gọi người nhận không?",
+   "rationale": "Tin mới trích lời Bob nhưng câu hỏi gọi tên Cara. Người được nhắc khác người được hỏi, người nhận là Cara.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "bob_demo",
+      "text": "Mai mình nộp phần của mình.",
+      "timestamp": "2026-09-03T09:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "alice_demo",
+      "text": "Cara ơi, Bob nói mai nộp là nộp cái gì vậy?",
+      "timestamp": "2026-09-03T09:02:00Z"
+     }
+    ],
+    "new_message_id": "m2",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "quoting_other_person",
+   "description": "Bob quotes the bot's statement to ask the group; not a bot request.",
+   "expected": {
+    "addressee": "channel",
+    "explicit_assistant_request": false
+   },
+   "id": "quote_bot_statement",
+   "participation_label": null,
+   "participation_notes": "Nhắc tới Thyca nhưng hỏi cả nhóm, không phải gọi bot. Bot có nên nhảy vào không?",
+   "rationale": "Tin mới trích lời bot nhưng câu hỏi hướng tới mọi người, không gọi bot trả lời. Người nhận là cả kênh, không phải yêu cầu.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "bot_demo",
+      "text": "Theo quy định thì nghỉ phép cần báo trước 3 ngày.",
+      "timestamp": "2026-09-03T10:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "bob_demo",
+      "text": "Thyca nói phải báo trước 3 ngày, mọi người thấy có hợp lý không?",
+      "timestamp": "2026-09-03T10:02:00Z"
+     }
+    ],
+    "new_message_id": "m2",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "question_about_bot",
+   "description": "Cara talks about the bot in third person to the group.",
+   "expected": {
+    "addressee": "channel",
+    "explicit_assistant_request": false
+   },
+   "id": "about_bot_third_person",
+   "participation_label": null,
+   "participation_notes": "Nói về bot ở ngôi thứ ba, không gọi bot. Bot có nên tự ái mà lên tiếng không?",
+   "rationale": "Tin mới nhận xét về bot ở ngôi thứ ba và hỏi cả nhóm, không gọi bot. Người nhận là cả kênh.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "bob_demo",
+      "text": "Hôm nay bot trả lời nhanh ghê.",
+      "timestamp": "2026-09-03T11:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "cara_demo",
+      "text": "Con bot này dạo này trả lời chậm quá, mọi người có thấy vậy không?",
+      "timestamp": "2026-09-03T11:02:00Z"
+     }
+    ],
+    "new_message_id": "m2",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "bot_just_answered",
+   "description": "Bot answered Alice; Bob explains the answer to Alice, replying to the bot message.",
+   "expected": {
+    "addressee": "alice_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "bot_just_answered_human_follows",
+   "participation_label": null,
+   "participation_notes": "Reply trỏ tin của bot nhưng nội dung gọi tên Alice. Bot nên theo nội dung hay reply?",
+   "rationale": "Tin mới reply tin của bot nhưng câu chữ gọi tên Alice và diễn giải cho Alice. Địa chỉ trong nội dung thắng mục tiêu reply, người nhận là Alice.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Thyca ơi, hạn đăng ký là khi nào?",
+      "timestamp": "2026-09-03T12:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "bot_demo",
+      "text": "Hạn đăng ký là thứ 4 tuần sau nhé.",
+      "timestamp": "2026-09-03T12:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "bob_demo",
+      "text": "Alice ơi, ý Thyca là thứ 4 tuần sau đó, cậu nhớ đăng ký sớm nhé.",
+      "timestamp": "2026-09-03T12:03:00Z",
+      "reply_to": "m2"
+     }
+    ],
+    "new_message_id": "m3",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "thanks",
+   "description": "Alice thanks the bot; gratitude is not a new request.",
+   "expected": {
+    "addressee": "bot_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "thanks_to_bot",
+   "participation_label": null,
+   "participation_notes": "Cảm ơn bot nhưng không yêu cầu gì thêm. Bot có nên đáp lại hay im lặng?",
+   "rationale": "Tin mới cảm ơn Thyca sau câu trả lời của bot, không đưa yêu cầu mới. Người nhận là bot nhưng không phải yêu cầu.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Thyca ơi, gửi mình link tài liệu với.",
+      "timestamp": "2026-09-03T13:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "bot_demo",
+      "text": "Đây nhé: tailieu.pdf",
+      "timestamp": "2026-09-03T13:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "alice_demo",
+      "text": "Cảm ơn Thyca nhiều nha!",
+      "timestamp": "2026-09-03T13:02:00Z"
+     }
+    ],
+    "new_message_id": "m3",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "thanks",
+   "description": "Alice thanks Bob; the bot is not involved.",
+   "expected": {
+    "addressee": "bob_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "thanks_human_to_human",
+   "participation_label": null,
+   "participation_notes": "Cảm ơn giữa hai con người. Bot có nên xen vào không?",
+   "rationale": "Tin mới cảm ơn Bob về file, gọi tên Bob, không nhắc bot. Người nhận là Bob.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "bob_demo",
+      "text": "Mình gửi file rồi nhé Alice.",
+      "timestamp": "2026-09-03T14:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "alice_demo",
+      "text": "Cảm ơn Bob nhiều, file đúng cái mình cần!",
+      "timestamp": "2026-09-03T14:02:00Z"
+     }
+    ],
+    "new_message_id": "m2",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "group_selection",
+   "description": "Four members discuss; Dan answers Alice's question with a reply.",
+   "expected": {
+    "addressee": "alice_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "group_multi_followup",
+   "participation_label": null,
+   "participation_notes": "Nhiều người cùng thảo luận, reply xác định ai hỏi ai. Bot có nên tham gia không?",
+   "rationale": "Tin mới của Dan reply tin m1 của Alice và trả lời đúng câu hỏi trong đó. Người nhận là Alice.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "alice_demo",
+      "text": "Ai biết chỗ thuê loa cho sự kiện không?",
+      "timestamp": "2026-09-03T15:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "bob_demo",
+      "text": "Mình không rõ, chưa thuê bao giờ.",
+      "timestamp": "2026-09-03T15:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "cara_demo",
+      "text": "Để mình hỏi bạn mình xem sao.",
+      "timestamp": "2026-09-03T15:02:00Z"
+     },
+     {
+      "id": "m4",
+      "sender_uid": "dan_demo",
+      "text": "Mình biết một chỗ, để mình gửi số cho.",
+      "timestamp": "2026-09-03T15:04:00Z",
+      "reply_to": "m1"
+     }
+    ],
+    "new_message_id": "m4",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Dan",
+      "uid": "dan_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  },
+  {
+   "category": "group_selection",
+   "description": "After group chatter, Alice singles out Bob by name.",
+   "expected": {
+    "addressee": "bob_demo",
+    "explicit_assistant_request": false
+   },
+   "id": "group_addressed_individual",
+   "participation_label": null,
+   "participation_notes": "Giữa thảo luận nhóm, một người được gọi tên riêng. Bot có nên nhường lời không?",
+   "rationale": "Tin mới gọi tên Bob và hỏi ý kiến riêng cậu ấy, không reply, không nhắc bot. Người nhận là Bob.",
+   "state": {
+    "assistant_uid": "bot_demo",
+    "messages": [
+     {
+      "id": "m1",
+      "sender_uid": "bob_demo",
+      "text": "Mình thấy phương án A đơn giản hơn.",
+      "timestamp": "2026-09-03T16:00:00Z"
+     },
+     {
+      "id": "m2",
+      "sender_uid": "cara_demo",
+      "text": "Mình thì thích phương án B, nhìn xịn hơn.",
+      "timestamp": "2026-09-03T16:01:00Z"
+     },
+     {
+      "id": "m3",
+      "sender_uid": "dan_demo",
+      "text": "Hai phương án đều tốn kha khá nhỉ.",
+      "timestamp": "2026-09-03T16:02:00Z"
+     },
+     {
+      "id": "m4",
+      "sender_uid": "alice_demo",
+      "text": "Bob ơi, còn cậu thì sao, cậu chọn phương án nào?",
+      "timestamp": "2026-09-03T16:04:00Z"
+     }
+    ],
+    "new_message_id": "m4",
+    "owner_uid": "alice_demo",
+    "participants": [
+     {
+      "display_name": "Alice",
+      "uid": "alice_demo"
+     },
+     {
+      "display_name": "Bob",
+      "uid": "bob_demo"
+     },
+     {
+      "display_name": "Cara",
+      "uid": "cara_demo"
+     },
+     {
+      "display_name": "Dan",
+      "uid": "dan_demo"
+     },
+     {
+      "display_name": "Thyca",
+      "uid": "bot_demo"
+     }
+    ]
+   }
+  }
+ ],
+ "description": "Synthetic benchmark fixture for the Jev reflex-vs-context experiment: natural Vietnamese micro-dialogues where the model, as a participant observer, must judge who a new message addresses. All people, IDs, and timestamps are fake.",
+ "schema_version": 1
+}
