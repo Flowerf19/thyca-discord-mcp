@@ -12,6 +12,8 @@ from pathlib import Path
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from sessions import parse_tz_name
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -38,6 +40,28 @@ class Settings(BaseSettings):
     session_id: str = Field(
         default="discord-main",
         description="Fixed memory session for Discord activity.",
+    )
+    daily_session_rotation: bool = Field(
+        default=True,
+        description="Rotate to a fresh native Thyca session once per logical "
+        "day (one session per day). Rotation is drain-gated: the worker "
+        "keeps serving the previous session until every delivery job is "
+        "safe-terminal, then adopts the new day session. Old sessions are "
+        "never deleted. Set false to pin the single mapped session forever.",
+    )
+    session_day_timezone: str = Field(
+        default="Asia/Ho_Chi_Minh",
+        description="IANA timezone for the rotation logical day. Must parse "
+        "via zoneinfo; validated eagerly at Settings construction.",
+    )
+    session_day_rollover_hour: int = Field(
+        default=4,
+        ge=0,
+        le=23,
+        description="Logical-day rollover hour (0..23) in session_day_timezone: "
+        "the day flips at this wall hour, not at midnight, so a late-night "
+        "conversation stays in one session. Env strings with clean ints "
+        "coerce; bools/floats are rejected.",
     )
     audit_path: Path = Field(default=PROJECT_ROOT / "audit.jsonl")
     outbox_path: Path = Field(
@@ -136,6 +160,22 @@ class Settings(BaseSettings):
         """Reject bools/floats before lax int coercion (env strings coerce)."""
         if isinstance(value, bool) or isinstance(value, float):
             raise ValueError("must be an int 1..20, not a bool or float")
+        return value
+
+    @field_validator("session_day_rollover_hour", mode="before")
+    @classmethod
+    def _reject_bool_float_rollover(cls, value: object) -> object:
+        """Reject bools/floats before lax int coercion (env strings coerce)."""
+        if isinstance(value, bool) or isinstance(value, float):
+            raise ValueError("must be an int 0..23, not a bool or float")
+        return value
+
+    @field_validator("session_day_timezone", mode="after")
+    @classmethod
+    def _validate_session_day_timezone(cls, value: str) -> str:
+        """Reject unknown timezones eagerly (rotation must never fail mid-tick)."""
+        if parse_tz_name(value) is None:
+            raise ValueError("must be a valid IANA timezone")
         return value
 
     @model_validator(mode="after")

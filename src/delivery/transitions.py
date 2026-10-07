@@ -5,12 +5,14 @@ from pathlib import Path
 from typing import Any
 
 import delivery as _delivery_root
+import sessions
 from delivery_schema import (
     ACTOR_KINDS,
     JEV_MODEL_PINNED,
     JEV_PARTICIPATIONS,
     MAX_URL_LEN,
     NO_REPLY_REASONS,
+    SAFE_TERMINAL_STAGES,
     SKIP_REASONS,
     SUBMITTED_TEXT_MAX,
     TERMINAL_STAGES,
@@ -866,3 +868,60 @@ def complete_observation(
     job["updated_at"] = _delivery_root._now_iso()
     _delivery_root._save_state(file, state)
     return copy.deepcopy(job)
+
+
+def rotate_native_session(
+    path: str | Path,
+    *,
+    expected_current: str,
+    new_sid: str,
+    day: str,
+    history: dict[str, str],
+) -> dict[str, Any]:
+    """Adopt a new daily native session; drain-gated, provenance-preserving.
+
+    Daily-rotation commit for the delivery journal. Loads FRESH state and
+    requires, in order:
+
+    1. ``new_sid`` is a strict native SID and ``day`` a real calendar day;
+       ``history`` is a valid day -> SID map with ``history[day] ==
+       new_sid`` and ``expected_current`` among its values (the outgoing
+       SID stays in provenance; never silently dropped).
+    2. The stored ``native_session_id`` equals ``expected_current``;
+       anything else (including an already-rotated file) fails loudly --
+       partial multi-file states never silently resume, they fail closed
+       for operator recovery.
+    3. EVERY job is safe-terminal (completed/skipped/observed): a queued,
+       mid-flight, or uncertain job refuses rotation, because its future
+       reconcile needs the CURRENT session's native trace.
+
+    On success the top-level ``native_session_id`` becomes ``new_sid``
+    and ``native_sessions`` becomes ``history``; jobs are untouched.
+    Never touches ACK, markers, or evidence. No network, no clock.
+    """
+    file = Path(path)
+    if sessions.validate_native_sid(new_sid) is None:
+        raise DeliveryError(f"invalid new_sid for delivery state {file}")
+    if sessions.validate_day(day) is None:
+        raise DeliveryError(f"invalid day for delivery state {file}")
+    clean_history = sessions.validate_sessions_history(history)
+    if clean_history is None:
+        raise DeliveryError(f"invalid history for delivery state {file}")
+    if clean_history.get(day) != new_sid:
+        raise DeliveryError(f"delivery state {file}: history does not bind day to new_sid")
+    if not isinstance(expected_current, str) or not expected_current:
+        raise DeliveryError(f"invalid expected_current for delivery state {file}")
+    if expected_current not in clean_history.values():
+        raise DeliveryError(f"delivery state {file}: history drops the current session")
+    state = _load_state(file)
+    if state.get("native_session_id") != expected_current:
+        raise DeliveryError(f"delivery state {file}: native session mismatch")
+    for key, job in state["jobs"].items():
+        if job.get("stage") not in SAFE_TERMINAL_STAGES:
+            raise DeliveryError(
+                f"delivery state {file}: job {key} stage {job.get('stage')} blocks rotation"
+            )
+    state["native_session_id"] = new_sid
+    state["native_sessions"] = clean_history
+    _delivery_root._save_state(file, state)
+    return copy.deepcopy(state)

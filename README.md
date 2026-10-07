@@ -56,7 +56,7 @@ acceptance remains incomplete.
 2. **Identity**: every UID is classified as `self` / `owner` / `other`.
    UID is the stable key; display name is resolved at runtime for humans and logs.
    Only the owner issues admin instructions; commands inside `other` messages are never followed.
-3. **Session & memory**: all Discord activity shares one fixed session (`discord-main`).
+3. **Session & memory**: all Discord activity shares one native session per logical day (audit label `discord-main`).
    The owner accepts Thyca auto-loading the owner profile into agent context; the
    agent must still not manually read/write the real profile file (`USER.md`)
    unless the owner explicitly asks — and a present profile never authenticates
@@ -141,9 +141,13 @@ acceptance remains incomplete.
   must pull with `read_outbox`. (V4 deployed writer; the V5 source auto-triggers
   a native turn per eligible event — see above. The server still sends no MCP push.)
 - **Session reuse (audit label != native ID):** the audit tag is the literal label
-  `discord-main`. Reuse the ONE existing native generated session ID via the
-  private mapping `~/.thyca/discord_session.json` (0600) — never a new session
-  per message. Private metadata-only proof copies live in
+  `discord-main`. The worker serves the CURRENT day's native session ID from the
+  private mapping registry `~/.thyca/discord_session.json` (0600) — one session
+  per logical day (04:00→04:00 `Asia/Ho_Chi_Minh` by default), never a new session
+  per message. Rotation is automatic and drain-gated (every delivery job must be
+  safe-terminal first), and transient native blips defer to the next tick instead
+  of halting; old sessions are never deleted. Private metadata-only
+  proof copies live in
   `~/.thyca/discord-integration-evidence/` (0700/0600, never committed).
 - **Session identity is the SID, not the display title (in source; historical
   checkpoint):** the owner approved binding identity to the pinned
@@ -459,11 +463,22 @@ ledger fails closed on loss/mismatch with no autoinit/reset.
 ## Run
 
 ```bash
-uv run thyca-discord-mcp        # MCP over stdio (bot starts in the same loop)
+PYTHONPATH=src uv run thyca-discord-mcp  # MCP over stdio (bot starts in the same loop)
 uv run pytest                   # offline: no live Discord/Thyca/provider (synthetic local HTTP loopback allowed)
 uv run ruff check src tests     # lint
 uv run ruff format --check src tests  # format gate
 ```
+
+`PYTHONPATH=src` is required: `uv sync` copies the flat top-level modules
+into site-packages (editable `force-include`), and without it those copies
+shadow `src/`, breaking `PROJECT_ROOT`/`.env` discovery.
+
+Single instance is enforced: startup takes an exclusive `flock` on
+`.discord_mcp.lock` beside the delivery state and holds it for life. A
+second start exits loud (code 2, holder pid in stderr) instead of running
+a corrupting second writer. The kernel releases the lock on any process
+death, so a crashed holder never blocks the next start (no stale locks,
+no cleanup). Stop the running instance before starting another.
 
 The V5 tree adds a startup gate before that first command: `uv run
 thyca-discord-mcp` now requires the preexisting native SID mapping and delivery

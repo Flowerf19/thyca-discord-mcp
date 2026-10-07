@@ -1282,6 +1282,45 @@ class ThycaClient:
             "proof": "session_detail_turn_slices",
         }
 
+    async def create_session(self) -> dict:
+        """Create a fresh native session; return creation metadata only.
+
+        Uses ``POST /api/sessions`` with an empty JSON body (the native
+        route requires a JSON object). The new session MUST be blank
+        (zero messages) and idle -- anything else is a protocol
+        violation and fails closed. Returns ``native_sid``,
+        ``message_count`` (always 0), and a fixed ``proof`` marker;
+        titles and raw messages are dropped locally.
+
+        Transport timeouts/disconnects raise
+        :class:`ThycaSubmissionUncertainError` (the session may or may
+        not exist -- the caller must never assume either outcome and
+        must retry by creating again, never by adopting blindly).
+        HTTP statuses map exactly like the turn POST.
+        """
+        body_bytes = b"{}"
+        status, raw = await self._request("POST", f"{self._base_url}/api/sessions", body_bytes)
+        _map_http_status(status)
+        payload = _parse_json_dict(raw)
+        sid_ret = payload.get("id")
+        title_ret = payload.get("title")
+        running_ret = payload.get("running")
+        messages_ret = payload.get("messages")
+        if not isinstance(sid_ret, str) or not _SID_RE.fullmatch(sid_ret):
+            raise ThycaProtocolError(reason="malformed")
+        if not isinstance(title_ret, str):
+            raise ThycaProtocolError(reason="malformed")
+        if running_ret is not False:
+            raise ThycaProtocolError(reason="malformed")
+        messages = _validate_message_roles(messages_ret)
+        if len(messages) != 0:
+            raise ThycaProtocolError(reason="malformed")
+        return {
+            "native_sid": sid_ret,
+            "message_count": 0,
+            "proof": "session_create_blank",
+        }
+
     async def submit_turn(
         self,
         native_sid: str,

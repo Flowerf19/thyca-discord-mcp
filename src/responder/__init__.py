@@ -4,7 +4,8 @@ Canonical re-exports of the previous :mod:`responder` surface.
 Internal layout: :mod:`responder.core` (orchestrator),
 :mod:`responder.submit` (pre-POST submit mixin),
 :mod:`responder.input` (pure input validation),
-:mod:`responder.recovery` (native POST recovery + trace proof).
+:mod:`responder.recovery` (native POST recovery + trace proof),
+:mod:`responder.rotation` (mapping registry + daily session rotation).
 """
 
 import delivery  # noqa: F401 - module re-export so the established

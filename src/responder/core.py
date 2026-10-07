@@ -1,13 +1,18 @@
 """V5 responder: FIFO worker for agent-owned MCP auto-reply.
 
-Flow: outbox (capture-only) -> FIFO worker -> existing native Thyca SID
+Flow: outbox (capture-only) -> FIFO worker -> daily native Thyca SID
 (agent calls MCP ``send_message``) -> receipt + native Trace correlation
 -> controller ACK (safe processed prefix).
 
-This module never sends Discord replies itself (no bridge-owned SDK send),
-never creates native sessions, and never runs a scheduler. Scheduling is
-owned by the server via native ``discord.ext.tasks.Loop``; this worker only
-exposes ``tick``/``close`` coroutines plus sync guards.
+This module never sends Discord replies itself (no bridge-owned SDK send)
+and never runs a scheduler. Scheduling is owned by the server via native
+``discord.ext.tasks.Loop``; this worker only exposes ``tick``/``close``
+coroutines plus sync guards. Native sessions ARE created here, but only
+by the daily rotation gate (:mod:`responder.rotation`): one session per
+logical day, drain-gated (every delivery job safe-terminal first), lazy
+(a quiet day creates no empty session), and transient-deferring (a native
+blip retries next tick instead of halting). Old sessions are never
+deleted.
 
 Durability: all delivery mutations reload fresh from disk via
 :mod:`delivery` (never save a stale snapshot across an
@@ -22,11 +27,10 @@ Network happens only inside ``tick`` via the injected
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
-import stat
-from pathlib import Path
+import sys
+from collections.abc import Callable
 from typing import Any
 
 import delivery
@@ -36,6 +40,7 @@ from identity import classify_actor
 from jev import JevAdapter
 from outbox import ack_entries, read_entries
 from participation import ParticipationLedger
+from sessions import default_session_day_provider, validate_day
 from source_messages import build_source_checker
 from thyca import ThycaClient
 
@@ -49,6 +54,13 @@ from .input import (
     validate_entry,
 )
 from .recovery import _SAFE_TERMINAL, ResponderRecovery
+from .rotation import (  # noqa: F401 - _load_mapping kept as canonical re-export
+    RotationDeferred,
+    _load_mapping,
+    adopt_session_day,
+    load_session_registry,
+    rotate_to_today,
+)
 from .submit import (  # noqa: F401 - intentional canonical re-exports
     _VALID_PARTICIPATIONS,
     ResponderSubmitMixin,
@@ -76,58 +88,9 @@ _ROUTED_POST_PARTICIPATIONS = frozenset({"respond", "need_context"})
 # (imported above for internal use).
 
 
-def _load_mapping(path: Path, expected_session_id: str) -> dict[str, str]:
-    """Load the existing native SID mapping (0600, 5 strict keys, SID match).
-
-    Never opens the native session file/profile; only checks the ``path``
-    basename stem equals ``native_id``. Unknown keys are ignored. All errors
-    are coarse with field names only (no value dumps).
-    """
-    file = Path(path)
-    if file.is_symlink():
-        raise ResponderError("mapping must not be a symlink")
-    if not file.exists():
-        raise ResponderError("mapping is missing; initialize explicitly")
-    if not file.is_file():
-        raise ResponderError("mapping is not a regular file")
-    try:
-        mode = stat.S_IMODE(file.stat().st_mode)
-    except OSError:
-        raise ResponderError("mapping stat failed") from None
-    if mode != 0o600:
-        raise ResponderError("mapping permissions must be 0600")
-    try:
-        raw = json.loads(file.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise ResponderError("mapping has invalid JSON") from None
-    except OSError:
-        raise ResponderError("mapping read failed") from None
-    if not isinstance(raw, dict):
-        raise ResponderError("mapping top level must be an object")
-    for key in ("native_id", "title", "audit_label", "created_at", "path"):
-        if key not in raw:
-            raise ResponderError(f"mapping missing key {key!r}")
-        value = raw[key]
-        if not isinstance(value, str) or not value or len(value) > 1000:
-            raise ResponderError(f"mapping has invalid {key!r}")
-    native_id = raw["native_id"]
-    if not _SID_RE.fullmatch(native_id):
-        raise ResponderError("mapping has invalid native_id")
-    if raw["title"] != expected_session_id or raw["audit_label"] != expected_session_id:
-        raise ResponderError("mapping title mismatch")
-    try:
-        stem = Path(raw["path"]).stem
-    except Exception:
-        raise ResponderError("mapping has invalid path") from None
-    if stem != native_id:
-        raise ResponderError("mapping path mismatch")
-    return {
-        "native_id": native_id,
-        "title": raw["title"],
-        "audit_label": raw["audit_label"],
-        "created_at": raw["created_at"],
-        "path": raw["path"],
-    }
+# _load_mapping canonical in responder_rotation (imported above for
+# internal use + package re-export).
+# _SID_RE below mirrors the same verified native SID grammar.
 
 
 def build_auto_prompt(
@@ -219,11 +182,27 @@ class Responder(ResponderSubmitMixin):
         jev_adapter: Any | None = None,
         context_collector: Any | None = None,
         participation_ledger: Any | None = None,
+        session_day_provider: Callable[[], str] | None = None,
     ) -> None:
         self._settings = settings
         self._bot = bot
         self._busy = False
         self._closed = False
+        if session_day_provider is None:
+            # Production default: real-clock logical day from the configured
+            # timezone + rollover hour. Validated eagerly (Settings already
+            # constrains both); tests inject a fake day.
+            try:
+                self._session_day_provider: Callable[[], str] = default_session_day_provider(
+                    settings.session_day_timezone,
+                    settings.session_day_rollover_hour,
+                )
+            except ValueError:
+                raise ResponderError("invalid session day clock config") from None
+        else:
+            if not callable(session_day_provider):
+                raise ResponderError("session_day_provider must be callable")
+            self._session_day_provider = session_day_provider
         if source_checker is None:
             # Production default: the REAL bot-backed existence proof (live
             # SDK reads), never a permissive no-op. Tests inject a fake.
@@ -232,9 +211,19 @@ class Responder(ResponderSubmitMixin):
             if not callable(source_checker):
                 raise ResponderError("source_checker must be callable")
             self._source_checker = source_checker
-        mapping = _load_mapping(settings.thyca_session_mapping_path, settings.session_id)
-        self._mapping = mapping
+        mapping = load_session_registry(settings.thyca_session_mapping_path, settings.session_id)
+        self._mapping = {
+            key: mapping[key] for key in ("native_id", "title", "audit_label", "created_at", "path")
+        }
         self._native_sid = mapping["native_id"]
+        # Daily rotation state: the sealed logical day this SID serves
+        # (None for legacy dateless mappings until the first tick adopts)
+        # plus the detached day -> SID history at load.
+        self._active_date = mapping["active_date"]
+        self._registry_sessions = dict(mapping["sessions"])
+        # Deferral note day: a transient rotation failure warns once per
+        # logical day (never 1 Hz spam); a new day re-arms automatically.
+        self._rotation_deferred_day: str | None = None
         try:
             state = delivery.load_delivery_state(settings.delivery_state_path)
         except delivery.DeliveryError:
@@ -290,10 +279,15 @@ class Responder(ResponderSubmitMixin):
                 settings.jev_state_path,
                 native_sid=self._native_sid,
             )
+            # Owned ledger: rotation converges its file and swaps in a fresh
+            # instance bound to the new SID. An injected ledger (tests) owns
+            # its lifecycle: rotation skips the ledger file AND the swap.
+            self._participation_owned = True
         else:
             if not callable(getattr(participation_ledger, "classify", None)):
                 raise ResponderError("participation_ledger must provide async classify")
             self._participation_ledger = participation_ledger
+            self._participation_owned = False
         # Native recovery wiring (no I/O): explicit client/sid/settings plus
         # Root policy callbacks with FRESH method lookup so late test patches
         # of _mark_uncertain/_source_deleted_status still dispatch.
@@ -526,7 +520,127 @@ class Responder(ResponderSubmitMixin):
             ack_entries(self._settings.outbox_state_path, safe)
         return safe
 
+    async def _maybe_rotate_session(self) -> None:
+        """Adopt or rotate the daily native session (drain-gated, lazy).
+
+        No-op when rotation is disabled or the sealed day is current.
+        A legacy dateless mapping is ADOPTED (sealed to today, no native
+        calls). A stale sealed day rotates only when EVERY delivery job
+        is safe-terminal (queued/mid-flight/uncertain jobs keep serving
+        the old session; the gate retries next tick) AND unread outbox
+        work exists (a quiet day creates no empty native session).
+        Transient native failures (timeout/disconnect/busy/5xx) during
+        rotation DEFER (one stderr note per day; the old session keeps
+        serving and the next tick retries). Definitive failures
+        (malformed shapes, 400s, verify mismatch, store refusals) raise.
+
+        On rotation the delivery journal, the owned participation ledger,
+        and the mapping registry converge (in that order), then the
+        in-memory SID, recovery binding, and owned ledger instance swap
+        with no ``await`` between the swaps. Any definitive failure
+        raises :class:`ResponderError` (the auto-reply loop fails
+        closed); SIDs never reach logs (day + created/reused only).
+        """
+        if not self._settings.daily_session_rotation:
+            return
+        try:
+            today = self._session_day_provider()
+        except Exception:
+            raise ResponderError("session day provider failed") from None
+        if validate_day(today) is None:
+            raise ResponderError("session day provider returned invalid day")
+        if today == self._active_date:
+            return
+        registry = load_session_registry(
+            self._settings.thyca_session_mapping_path, self._settings.session_id
+        )
+        if registry["native_id"] != self._native_sid:
+            raise ResponderError("daily rotation mapping changed")
+        if self._active_date is None:
+            outcome = adopt_session_day(
+                mapping_path=self._settings.thyca_session_mapping_path,
+                expected_session_id=self._settings.session_id,
+                today=today,
+                registry=registry,
+            )
+            self._active_date = outcome["day"]
+            if outcome["adopted"]:
+                self._registry_sessions = {outcome["day"]: outcome["native_sid"]}
+                print(
+                    f"thyca-discord-mcp: adopted daily session for {today}",
+                    file=sys.stderr,
+                )
+            else:
+                # Already sealed by a concurrent writer: sync the FULL
+                # recorded map, never a subset (dropping days would orphan
+                # ledger history and trip the guard below next rollover).
+                self._registry_sessions = dict(registry["sessions"])
+            return
+        if (
+            registry["active_date"] != self._active_date
+            or registry["sessions"] != self._registry_sessions
+        ):
+            raise ResponderError("daily rotation mapping changed")
+        try:
+            dstate = delivery.load_delivery_state(self._settings.delivery_state_path)
+        except delivery.DeliveryDurabilityUncertain:
+            raise ResponderError("delivery durability uncertain") from None
+        if dstate.get("native_session_id") != self._native_sid:
+            raise ResponderError("delivery native_session_id mismatch")
+        for job in dstate["jobs"].values():
+            if job.get("stage") not in _SAFE_TERMINAL:
+                return
+        peek = read_entries(
+            self._settings.outbox_path,
+            self._settings.outbox_state_path,
+            limit=1,
+            unread_only=True,
+        )
+        if not peek["entries"]:
+            return
+        try:
+            outcome = await rotate_to_today(
+                client=self._client,
+                mapping_path=self._settings.thyca_session_mapping_path,
+                delivery_path=self._settings.delivery_state_path,
+                ledger_path=self._settings.jev_state_path if self._participation_owned else None,
+                expected_session_id=self._settings.session_id,
+                today=today,
+                registry=registry,
+            )
+        except RotationDeferred as exc:
+            # Transient native failure: keep serving the previous day and
+            # retry next tick. One stderr note per logical day (no spam);
+            # a successful rotation needs no reset (the gate goes quiet).
+            if self._rotation_deferred_day != today:
+                print(
+                    f"thyca-discord-mcp: rotation deferred for {today} ({exc.kind})",
+                    file=sys.stderr,
+                )
+                self._rotation_deferred_day = today
+            return
+        self._native_sid = outcome["native_sid"]
+        self._active_date = outcome["day"]
+        self._registry_sessions = dict(outcome["history"])
+        sealed = outcome["registry"]
+        self._mapping = {
+            key: sealed[key] for key in ("native_id", "title", "audit_label", "created_at", "path")
+        }
+        self._recovery.rotate_native_sid(outcome["native_sid"])
+        if self._participation_owned:
+            assert self._settings.jev_state_path is not None
+            self._participation_ledger = ParticipationLedger(
+                self._settings.jev_state_path,
+                native_sid=outcome["native_sid"],
+            )
+        how = "reused" if outcome["reused"] else "created"
+        print(
+            f"thyca-discord-mcp: rotated daily session for {today} ({how})",
+            file=sys.stderr,
+        )
+
     async def _tick_once(self) -> dict[str, Any]:
+        await self._maybe_rotate_session()
         data = read_entries(
             self._settings.outbox_path,
             self._settings.outbox_state_path,

@@ -136,6 +136,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+import sessions
 from conversation import ConversationError, project_conversation_state
 from jev import (
     JEV_MODEL,
@@ -209,6 +210,7 @@ class ParticipationLedger:
             "version": PARTICIPATION_VERSION,
             "ledger_id": uuid.uuid4().hex,
             "native_session_id": native_sid,
+            "native_sessions": {},
             "attempts": {},
         }
         _validate_ledger(json.loads(json.dumps(fresh)), file, native_sid)
@@ -479,3 +481,56 @@ class ParticipationLedger:
         record["participation"] = None
         record["answers"] = None
         _save_ledger(self._path, fresh)
+
+
+def rotate_native_session(
+    path: str | Path,
+    *,
+    expected_current: str,
+    new_sid: str,
+    day: str,
+    history: dict[str, str],
+) -> dict[str, Any]:
+    """Adopt a new daily native session; provenance-preserving.
+
+    Daily-rotation commit for the participation ledger. Loads FRESH
+    state and requires, in order:
+
+    1. ``new_sid`` is a strict native SID and ``day`` a real calendar
+       day; ``history`` is a valid day -> SID map with ``history[day]
+       == new_sid`` and ``expected_current`` among its values (the
+       outgoing SID stays in provenance; never silently dropped).
+    2. The stored top-level ``native_session_id`` equals
+       ``expected_current``; anything else (including an already-rotated
+       file) fails loudly -- partial multi-file states never silently
+       resume, they fail closed for operator recovery.
+
+    On success the top-level ``native_session_id`` becomes ``new_sid``
+    and ``native_sessions`` becomes ``history``; every attempt record
+    keeps the SID of its classification day (still valid: records may
+    carry any SID in {current} + history). ``ledger_id``, attempts, and
+    unknown keys are untouched. The caller owns drain-gating (the
+    delivery journal refuses rotation while jobs are unresolved). No
+    network, no clock.
+    """
+    file = Path(path)
+    if sessions.validate_native_sid(new_sid) is None:
+        raise ParticipationError(f"invalid new_sid for participation ledger {file}")
+    if sessions.validate_day(day) is None:
+        raise ParticipationError(f"invalid day for participation ledger {file}")
+    clean_history = sessions.validate_sessions_history(history)
+    if clean_history is None:
+        raise ParticipationError(f"invalid history for participation ledger {file}")
+    if clean_history.get(day) != new_sid:
+        raise ParticipationError(f"participation ledger {file}: history does not bind day")
+    if not isinstance(expected_current, str) or not expected_current:
+        raise ParticipationError(f"invalid expected_current for participation ledger {file}")
+    if expected_current not in clean_history.values():
+        raise ParticipationError(f"participation ledger {file}: history drops the current session")
+    # Fresh load under the outgoing SID: a wrong-SID file (including
+    # an already-rotated one) fails here, never silently resumed.
+    state = _load_ledger(file, expected_current)
+    state["native_session_id"] = new_sid
+    state["native_sessions"] = clean_history
+    _save_ledger(file, state)
+    return copy.deepcopy(state)

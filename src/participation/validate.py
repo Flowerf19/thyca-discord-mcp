@@ -22,6 +22,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import sessions
 from jev import (
     JEV_MODEL,
     PARTICIPATION_OPTIONS,
@@ -278,7 +279,23 @@ def _validate_stored_answers(raw: Any, path: Path, key: str) -> dict[str, Any]:
     return clean
 
 
-def _validate_record(raw: Any, key: str, path: Path, expected_sid: str) -> dict[str, Any]:
+def _validate_record(
+    raw: Any,
+    key: str,
+    path: Path,
+    expected_sid: str,
+    *,
+    allowed_sids: frozenset[str] | None = None,
+) -> dict[str, Any]:
+    """Validate one attempt record; its SID must be the current or historical.
+
+    ``allowed_sids`` is the rotation-aware SID set (current top-level SID
+    plus every ``native_sessions`` history value); records keep the SID of
+    the day they were classified on, so post-rotation files legitimately
+    span SIDs. ``None`` means ``{expected_sid}`` (pre-rotation behavior).
+    Cache correctness never depends on the SID: hits still require the
+    exact channel/mid/author/fingerprint match.
+    """
     if not isinstance(raw, dict):
         raise ParticipationError(
             f"corrupt participation ledger {path}: job {key} must be an object"
@@ -310,7 +327,8 @@ def _validate_record(raw: Any, key: str, path: Path, expected_sid: str) -> dict[
         raise ParticipationError(
             f"corrupt participation ledger {path}: job {key} has invalid session"
         )
-    if sid != expected_sid:
+    allowed = allowed_sids if allowed_sids is not None else frozenset({expected_sid})
+    if sid not in allowed:
         raise ParticipationError(f"participation ledger {path}: job {key} session mismatch")
     record["native_session_id"] = sid
     for name in ("channel_id", "message_id", "author_uid"):
@@ -528,6 +546,23 @@ def _validate_ledger(raw: Any, path: Path, expected_sid: str) -> dict[str, Any]:
     if sid != expected_sid:
         raise ParticipationError(f"participation ledger {path}: session mismatch")
     state["native_session_id"] = sid
+    # Optional top-level daily-session history (day -> native SID
+    # provenance). Missing key means a pre-rotation ledger: treat as
+    # empty for compatibility. When present, every key must be a real
+    # calendar day and every value a strict native SID. Records may
+    # carry any SID in {current} + history values (their classification
+    # day's session); anything else is a session mismatch.
+    if "native_sessions" not in raw:
+        history: dict[str, str] = {}
+    else:
+        validated = sessions.validate_sessions_history(raw.get("native_sessions"))
+        if validated is None:
+            raise ParticipationError(
+                f"corrupt participation ledger {path}: invalid native_sessions"
+            )
+        history = validated
+    state["native_sessions"] = history
+    allowed_sids = frozenset({sid, *history.values()})
     attempts_raw = raw["attempts"]
     if not isinstance(attempts_raw, dict):
         raise ParticipationError(
@@ -538,6 +573,6 @@ def _validate_ledger(raw: Any, path: Path, expected_sid: str) -> dict[str, Any]:
         if _parse_job_key(key) is None:
             raise ParticipationError(f"corrupt participation ledger {path}: bad job key")
     for key, value in attempts_raw.items():
-        attempts[key] = _validate_record(value, key, path, expected_sid)
+        attempts[key] = _validate_record(value, key, path, expected_sid, allowed_sids=allowed_sids)
     state["attempts"] = attempts
     return state

@@ -18,6 +18,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import sessions
+
 DELIVERY_VERSION = 1
 
 STAGES = frozenset(
@@ -914,4 +916,17 @@ def _validate_state(raw: Any, path: Path) -> dict[str, Any]:
         state["jev_ledger_id"] = ledger
     else:
         raise DeliveryError(f"corrupt delivery state {path}: invalid jev_ledger_id")
+    # Optional top-level daily-session history (day -> native SID
+    # provenance). Missing key means a pre-rotation state file: treat as
+    # empty for compatibility. When present, every key must be a real
+    # calendar day and every value a strict native SID. Provenance only;
+    # no cross-check against native_session_id or jobs at load (the
+    # rotate transition maintains the invariant).
+    if "native_sessions" not in raw:
+        state["native_sessions"] = {}
+    else:
+        history = sessions.validate_sessions_history(raw.get("native_sessions"))
+        if history is None:
+            raise DeliveryError(f"corrupt delivery state {path}: invalid native_sessions")
+        state["native_sessions"] = history
     return state

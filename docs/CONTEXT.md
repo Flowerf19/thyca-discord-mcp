@@ -13,7 +13,9 @@ paid call, state reset, or ACK of an unresolved job.
 | Native session history and memory | The existing Thyca session's history and native memory handling | Thyca only; this history is not exported to Jev |
 
 The Discord snapshot is not a replacement for native memory. All Discord activity
-continues to use the pinned native SID, not a new session per message or person.
+uses one native session per logical day (04:00→04:00 `Asia/Ho_Chi_Minh` by
+default), not a new session per message or person. Rotation is automatic,
+drain-gated, and transient-deferring; old sessions are never deleted.
 The mutable session title is cosmetic; `discord-main` remains the audit label.
 Thyca controls its own history/context selection. The Discord message-count limit
 does not limit the native agent's entire context or guarantee that all native
@@ -159,7 +161,7 @@ blind retry. No job, ledger, or native history is deleted to resolve a mismatch.
 
 | Route | Behavior |
 |---|---|
-| `respond` | Render the frozen snapshot into the pinned native session; the agent generates a threaded, correlated reply through its own MCP `send_message`. |
+| `respond` | Render the frozen snapshot into the current daily native session; the agent generates a threaded, correlated reply through its own MCP `send_message`. |
 | `observe` | Record a positive durable Jev no-send outcome, without a native POST. It becomes eligible for safe-prefix ACK only through the delivery guards. |
 | `need_context` | Stored-decision compat only (no longer emitted): render the same frozen snapshot; the agent may read more scoped context, ask for clarification, or explicitly declare that no reply is needed. |
 
@@ -208,6 +210,9 @@ not retroactively converted into a no-reply proof.
 | `CONVERSATION_MAX_MESSAGES` | `20`, strict integer `1..20` | Maximum total selected messages; mandatory parent and fit rules still apply. |
 | `TYPESAFE_API_KEY` | Required for the real adapter; lazy secret | SDK authentication, never included as a context field or logged. |
 | `JEV_STATE_PATH` | `jev_state.json` beside the delivery state | Private metadata-only classification ledger. |
+| `DAILY_SESSION_ROTATION` | `true`; `false` pins the single mapped session | One native session per logical day; drain-gated, transient-deferring, lazy on quiet days, old sessions kept. |
+| `SESSION_DAY_TIMEZONE` | `Asia/Ho_Chi_Minh`, valid IANA zone | Timezone of the rotation logical day; bad zones fail at startup. |
+| `SESSION_DAY_ROLLOVER_HOUR` | `4`, strict int `0..23` | Wall hour the logical day flips; 04:00 keeps late-night context in one session. |
 
 Per-call Jev spend has no daily stop (removed by user order); per-day cost is
 reported in the ledger summary for observability only.
@@ -228,6 +233,7 @@ reset or rebinding. See [the example configuration](../.env.example) and
 | Jev participation adapter | [`jev.py`](../src/jev.py) |
 | Durable classification/cache/accounting | [`participation/`](../src/participation/ledger.py) |
 | Prepaid/postpaid guards and routing | [`responder/`](../src/responder/core.py) |
+| Daily session rotation (registry, drain gate, lazy create) | [`sessions.py`](../src/sessions.py), [`responder/rotation.py`](../src/responder/rotation.py) |
 | Trusted frame and untrusted JSON rendering | [`thyca.py`](../src/thyca.py) |
 | MCP context/declaration tools | [`server/`](../src/server/core.py), [tool contracts](TOOLS.md) |
 
@@ -238,7 +244,7 @@ state; synthetic local HTTP loopback is allowed:
 uv run --offline pytest -q tests/test_conversation.py tests/test_context.py \
   tests/test_thyca_prompt.py tests/test_jev_routing.py \
   tests/test_observation_delivery.py tests/test_observation_trace.py \
-  tests/test_observation_server.py
+  tests/test_observation_server.py tests/test_daily_session.py
 ```
 
 These checks cover selection, reply relations, fit, identity binding, changed
@@ -246,3 +252,34 @@ context/cache holds, routing, and positive no-reply proof. They do not establish
 live-channel quality, current production activation, provider billing caps, or
 atomic Discord/journal transactions. Existing uncertain jobs stay unresolved
 unless separately reconciled with evidence and explicit authorization.
+
+## Daily rotation recovery
+
+Rotation failures are loud and manual-safe (no silent resume, no auto-reset).
+With the MCP server STOPPED (single-writer rule), compare the three SID
+bindings: the mapping `~/.thyca/discord_session.json` (`native_id` +
+`active_date` + `sessions`), `delivery_state.json` (`native_session_id` +
+`native_sessions`), and `jev_state.json` (same two keys).
+
+- Deferred rotation (stderr `rotation deferred for <day> (<kind>)`): a
+  transient native blip; the worker keeps serving the previous day and
+  retries every tick. No action; a later `rotated daily session` line
+  confirms recovery.
+- Pruned today-session (every submit 404s to `uncertain`): a foreign native
+  `create` removed the still-blank day session before its first turn. Drop
+  each stuck job with the operator `resolve_uncertain_drop` tool; the next
+  04:00 boundary then rotates fresh automatically. For immediate recovery
+  instead of waiting: `POST /api/sessions` with an empty `{}` body to mint
+  a replacement, then with the server stopped set the SAME new SID in all
+  three files (`native_id` + `sessions[<today>]` + updated `path` stem in
+  the mapping; `native_session_id` + `native_sessions` in delivery and
+  ledger, keeping every older day entry). Restart only with explicit
+  approval.
+- Half-commit (startup `native_session_id mismatch` naming both SIDs after
+  a crash between the sync store writes): the mapping registry is the
+  commit record. If the mapping already seals today, copy its `native_id`
+  + `sessions` map into the lagging delivery/ledger file(s); if the
+  mapping still seals yesterday while delivery/ledger already carry
+  today's SID (present in their `native_sessions`), activate the mapping
+  to match (`native_id`, `active_date`, `sessions`, `path` stem, fresh
+  `created_at`). Never delete old day entries or old native sessions.

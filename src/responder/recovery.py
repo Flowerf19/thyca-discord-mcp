@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import Any
 
 import delivery
+import sessions
 from config import Settings
 from thyca import ThycaClientError
 
@@ -51,6 +52,17 @@ class ResponderRecovery:
             raise ResponderError("source_deleted_status must be callable")
         self._mark_uncertain = mark_uncertain
         self._source_deleted_status = source_deleted_status
+
+    def rotate_native_sid(self, native_sid: str) -> None:
+        """Swap the bound native SID after a daily rotation (no I/O).
+
+        Recovery holds no per-SID cached state (every call passes the
+        SID fresh), so the swap is a plain rebind. The SID must be a
+        strict native SID; anything else fails closed.
+        """
+        if sessions.validate_native_sid(native_sid) is None:
+            raise ResponderError("rotation has invalid session")
+        self._native_sid = native_sid
 
     async def reconcile_after_post(
         self,

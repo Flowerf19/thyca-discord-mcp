@@ -19,3 +19,5 @@ jev_state.json
 jev_state.json.tmp
 jev_state.json.tmp.*
 .jev_state.json.*.tmp
+.discord_mcp.lock
+service.live.log

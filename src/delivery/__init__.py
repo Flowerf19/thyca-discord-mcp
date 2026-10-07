@@ -67,5 +67,6 @@ from .transitions import (  # noqa: F401 - canonical re-exports
     record_send_receipt,
     requeue_definitive_busy,
     resolve_uncertain_drop,
+    rotate_native_session,
     skip_job,
 )
