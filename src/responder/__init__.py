@@ -1,5 +1,11 @@
 """Responder package: FIFO worker + ACK controller (no sends, no scheduler).
 
+[DEPRECATED worker path] Retained for the legacy correlated tools only.
+The MCP lifespan no longer starts the auto-reply / recovery loops, and the
+neutral tools (``tools/transport.py`` -> ``services/``) never import this
+package. ``ack_outbox`` is now a pure sequence cursor and does not consult
+:class:`Responder`.
+
 Canonical re-exports of the previous :mod:`responder` surface.
 Internal layout: :mod:`responder.core` (orchestrator),
 :mod:`responder.submit` (pre-POST submit mixin),

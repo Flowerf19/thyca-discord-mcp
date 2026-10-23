@@ -8,14 +8,18 @@ v4 adds a capture-only outbox: a realtime on_message listener plus periodic
 poll tasks append Discord messages to outbox.jsonl; the agent pulls them with
 read_outbox/ack_outbox and summarizes itself (this server has no LLM, no push).
 
-v5 adds an always-on auto-reply worker (see responder.py): the lifespan builds
-a Responder over the existing native mapping + delivery journal, then starts
-two protected native loops (auto-reply tick + recovery poll) once Discord is
-ready. The agent owns the reply send via MCP send_message with exact
-source_message_id/job_ref correlation; the worker never sends itself, and the
-controller owns ACK (safe processed prefix only). Correlation never
-authenticates the MCP caller: the shared native MCP pool carries no caller
-identity, so only the hard guild/channel scope is enforced.
+v6 (transport redesign): the server is a caller-agnostic Discord gateway. The
+neutral tool path is tools/transport.py -> services/* -> adapters/discord_
+gateway.py, with no sessions/responder/job_ref coupling. The lifespan never
+starts the Thyca auto-reply worker or its recovery poll: ``Responder`` is still
+built best-effort (existing mapping + journal + Jev key required) so the
+DEPRECATED correlated tools (``read_context``, ``record_no_reply``,
+``resolve_uncertain_drop``, the ``source_message_id``/``job_ref`` branch of
+``send_message``) keep gating against existing jobs until they are deleted.
+``ack_outbox`` is a pure seq cursor; the responder's safe-prefix guard moved
+out with the deprecated path. Correlation never authenticates the MCP caller:
+the shared native MCP pool carries no caller identity, so only the hard
+guild/channel scope is enforced.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ import discord
 from mcp.server.fastmcp import FastMCP
 from pydantic import StrictInt
 
+from adapters.discord_gateway import GATEWAY_ALLOWED_MENTIONS, DiscordGateway
 from audit import append_audit
 from bot import build_bot, get_scoped_guild, resolve_display_name
 from config import Settings
@@ -54,10 +59,8 @@ from delivery import record_no_reply as _delivery_record_no_reply
 from delivery import resolve_uncertain_drop as _delivery_resolve_uncertain_drop
 from identity import classify_actor
 from outbox import (
-    ack_entries,
     append_entry,
     build_message_entry,
-    read_entries,
 )
 from responder import Responder
 from server_helpers import (
@@ -68,16 +71,18 @@ from server_helpers import (
     _send_meta_args,
     _unvalidated_correlation_args,
 )
-from server_ticks import make_auto_reply_tick, make_heartbeat_tick, make_poll_tick
+from server_ticks import make_heartbeat_tick, make_poll_tick
+from services import message_sender, outbox_service
 from source_messages import SourceDeleted, SourceUnavailable, check_source_message
 from tasks import AUTO_RECOVERY_TASK_NAME, AUTO_REPLY_TASK_NAME, TaskRegistry, TickFn
+from tools.transport import register_transport_tools
 
 MIN_POLL_SECONDS = 30.0
 
 
 def create_server(settings: Settings) -> FastMCP:
     registry = TaskRegistry()
-    state: dict[str, Any] = {"bot": None, "responder": None}
+    state: dict[str, Any] = {"bot": None, "responder": None, "gateway": None}
     # Failure fencing (NOT caller authentication): process-lifetime
     # no-new-send latch for correlated sends whose uncertain hold could
     # not be persisted. Keyed by (channel_id, source_message_id). Set
@@ -115,6 +120,12 @@ def create_server(settings: Settings) -> FastMCP:
             raise RuntimeError("discord bot not ready")
         return bot
 
+    def _gateway() -> DiscordGateway:
+        gateway = state["gateway"]
+        if gateway is None or not gateway.is_ready():
+            raise RuntimeError("discord bot not ready")
+        return gateway
+
     def _audit_sink(*args: Any, **kwargs: Any) -> dict[str, Any]:
         # Fresh lookup of server.append_audit per call: late patches of
         # server.append_audit (after create_server) apply.
@@ -131,10 +142,6 @@ def create_server(settings: Settings) -> FastMCP:
         """Capture-only poll tick (authoritative body in server_ticks)."""
         return make_poll_tick(settings, channel_id, _bot, _audit_sink)
 
-    def _make_auto_reply_tick(responder: Responder) -> tuple[TickFn, dict[str, Any]]:
-        """FIFO worker step (authoritative body in server_ticks)."""
-        return make_auto_reply_tick(settings, responder, _audit_sink)
-
     async def _discord_send(
         channel: discord.TextChannel,
         content: str,
@@ -144,11 +151,15 @@ def create_server(settings: Settings) -> FastMCP:
 
         This MCP tool is the ONLY auto outbound path: the worker tick and the
         Thyca POST body never send. Correlated calls pass a native reply
-        reference; manual calls send plain content exactly as v4 did.
+        reference; manual calls send plain content exactly as v4 did. Every
+        send runs under the pinned gateway mention policy (no everyone/role/
+        reply pings; explicit <@uid> mentions still resolve).
         """
         if reference is None:
-            return await channel.send(content)
-        return await channel.send(content, reference=reference)
+            return await channel.send(content, allowed_mentions=GATEWAY_ALLOWED_MENTIONS)
+        return await channel.send(
+            content, reference=reference, allowed_mentions=GATEWAY_ALLOWED_MENTIONS
+        )
 
     send_blocked: set[tuple[int, int]] = set()
 
@@ -453,6 +464,7 @@ def create_server(settings: Settings) -> FastMCP:
     async def lifespan(app: FastMCP):  # noqa: ARG001 - FastMCP passes the app
         bot = build_bot(settings)
         state["bot"] = bot
+        state["gateway"] = DiscordGateway(bot, settings)
         responder: Responder | None = None
 
         async def _on_message_realtime(message: discord.Message) -> None:
@@ -512,15 +524,34 @@ def create_server(settings: Settings) -> FastMCP:
             # with state behind the log would append duplicate seqs from on_message
             # before the first tool read; corruption must fail here, not capture.
             _check_outbox_consistent(settings)
-            # Always-on v5 worker: constructor validates the existing mapping +
-            # journal only (no network, owner UID not required); missing/corrupt/
-            # outside-SID state FAILS here, before any capture path runs. No
-            # auto-create, reset, native session creation, or prune.
-            responder = Responder(settings, bot)
+            # DEPRECATED path (v6 Option A): the Responder still validates the
+            # existing mapping + journal so correlated legacy tools keep gating
+            # against existing jobs, but its absence never blocks the neutral
+            # gateway: no Thyca config -> responder is None and those tools
+            # report "auto controller not running". The auto-reply tick and
+            # recovery poll are NOT registered or started here anymore; the
+            # dedicated bot owns that worker now.
+            if settings.thyca_session_mapping_path.exists():
+                try:
+                    responder = Responder(settings, bot)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    print(
+                        f"thyca-discord-mcp: legacy responder unavailable "
+                        f"({exc!r}); deprecated correlated tools disabled",
+                        file=sys.stderr,
+                    )
+            else:
+                print(
+                    "thyca-discord-mcp: no Thyca session mapping; running as a "
+                    "pure Discord gateway (deprecated correlated tools disabled)",
+                    file=sys.stderr,
+                )
             state["responder"] = responder
             print(
-                "thyca-discord-mcp: MCP caller is NOT authenticated; auto "
-                "correlation is job-trace based, hard guild/channel scope only",
+                "thyca-discord-mcp: MCP caller is NOT authenticated; hard "
+                "guild/channel scope only",
                 file=sys.stderr,
             )
             bot.add_listener(_on_message_realtime, "on_message")
@@ -540,22 +571,6 @@ def create_server(settings: Settings) -> FastMCP:
                 raise RuntimeError(f"discord gateway failed before ready: {exc!r}") from exc
             await ready_task  # propagate ready-wait errors, if any
             registry.start("heartbeat")
-            # Native protected loops start ONLY after Discord is ready.
-            auto_tick, auto_holder = _make_auto_reply_tick(responder)
-            auto_holder["loop"] = registry.register(
-                AUTO_REPLY_TASK_NAME,
-                auto_tick,
-                seconds=settings.responder_check_seconds,
-                protected=True,
-            )
-            registry.register(
-                AUTO_RECOVERY_TASK_NAME,
-                _make_poll_tick(settings.default_channel_id),
-                seconds=settings.recovery_poll_seconds,
-                protected=True,
-            )
-            registry.start(AUTO_REPLY_TASK_NAME)
-            registry.start(AUTO_RECOVERY_TASK_NAME)
             yield {"bot": bot, "tasks": registry, "responder": responder}
         finally:
             # Ordered internal cleanup (ONLY here may force protected tasks; the
@@ -611,6 +626,7 @@ def create_server(settings: Settings) -> FastMCP:
                 finally:
                     state["bot"] = None
                     state["responder"] = None
+                    state["gateway"] = None
                     if errors:
                         # 3.10-safe: sys.exception() is 3.11+ only.
                         primary = sys.exc_info()[1]
@@ -678,11 +694,15 @@ def create_server(settings: Settings) -> FastMCP:
     @mcp.tool(
         description=(
             "Send a message; defaults to the configured channel. Rejects out-of-guild "
-            "targets. Auto-reply: the agent calls this with the exact "
-            "source_message_id/job_ref from its task; the worker never sends itself. "
-            "If this tool returns status skipped with reason source_deleted, the "
-            "source message was deleted: stop ALL replies for that source -- no "
-            "manual/unthreaded fallback and no retries. "
+            "targets. reply_to_message_id sends a plain Discord reply "
+            "(MessageReference, fail_if_not_exists): no correlation, no job. Every "
+            "send uses a tight mention policy: no everyone/role/reply pings; "
+            "explicit <@uid> mentions still resolve. "
+            "[DEPRECATED] source_message_id+job_ref: the correlated auto-reply "
+            "branch of the retired Thyca worker path, kept for compatibility until "
+            "removal. If a correlated call returns status skipped with reason "
+            "source_deleted, the source message was deleted: stop ALL replies for "
+            "that source -- no manual/unthreaded fallback and no retries. "
             f"{identity_policy}"
         )
     )
@@ -691,34 +711,48 @@ def create_server(settings: Settings) -> FastMCP:
         channel_id: int | None = None,
         source_message_id: StrictInt | None = None,
         job_ref: str | None = None,
+        reply_to_message_id: StrictInt | None = None,
     ) -> str:
         """Send a message. (Agent-facing text is the decorator description above.)
 
-        source_message_id is StrictInt so bools/strings are rejected at the MCP
-        boundary: a lax int annotation would let FastMCP coerce True -> 1 BEFORE
-        the helper's bool guard runs.
+        source_message_id and reply_to_message_id are StrictInt so bools/strings
+        are rejected at the MCP boundary: a lax int annotation would let FastMCP
+        coerce True -> 1 BEFORE the helper's bool guard runs.
         """
         cid = channel_id if channel_id is not None else settings.default_channel_id
         if source_message_id is None and job_ref is None:
             args = _send_meta_args(cid, content)
+            if reply_to_message_id is not None:
+                args["reply_to_message_id"] = reply_to_message_id
             try:
-                bot = _bot()
-                guild = get_scoped_guild(bot, settings.guild_id)
-                channel = await _resolve_text_channel(bot, guild, cid)
-                message = await _discord_send(channel, content)
-                return _ok(
-                    "send_message",
-                    args,
-                    {"message_id": message.id, "channel_id": cid, "jump_url": message.jump_url},
+                receipt = await message_sender.send_message(
+                    _gateway(),
+                    channel_id=cid,
+                    content=content,
+                    reply_to_message_id=reply_to_message_id,
                 )
+                return _ok("send_message", args, receipt)
             except Exception as exc:
                 _fail("send_message", args, exc)
+        if reply_to_message_id is not None:
+            audit(
+                "send_message",
+                _send_meta_args(cid, content),
+                ok=False,
+                error="send_message failed kind=validation_error",
+            )
+            raise ValueError(
+                "send_message: reply_to_message_id cannot combine with "
+                "source_message_id/job_ref"
+            ) from None
         return await _correlated_send(content, cid, source_message_id, job_ref)
 
     @mcp.tool(
+        meta={"deprecated": True},
         description=(
-            "Declare NO reply for a correlated need_context turn; defaults to the "
-            "configured channel. Call with the exact source_message_id/job_ref from "
+            "[DEPRECATED] Declare NO reply for a correlated need_context turn; "
+            "defaults to the configured channel. Call with the exact "
+            "source_message_id/job_ref from "
             "the task plus reason no_reply_needed|missing_context. The declaration "
             "is journaled only -- NEVER terminal and NEVER an ACK at tool time; the "
             "worker completes via native Trace proof. If this tool returns status "
@@ -913,8 +947,9 @@ def create_server(settings: Settings) -> FastMCP:
         )
 
     @mcp.tool(
+        meta={"deprecated": True},
         description=(
-            "Operator-drop a stuck uncertain job with zero send evidence; "
+            "[DEPRECATED] Operator-drop a stuck uncertain job with zero send evidence; "
             "defaults to the configured channel. Call with the exact "
             "source_message_id of an uncertain job whose native turn is final "
             "and produced nothing verifiable (no intents, receipts, trace, "
@@ -983,8 +1018,10 @@ def create_server(settings: Settings) -> FastMCP:
         )
 
     @mcp.tool(
+        meta={"deprecated": True},
         description=(
-            "Read approved-channel context for a correlated turn; defaults to the "
+            "[DEPRECATED] Read approved-channel context for a correlated turn; "
+            "defaults to the "
             "configured channel. Returns up to `limit` (1..20) complete messages "
             "before the source (or before `before_message_id` when paginating "
             "backwards, never future messages). Thyca-only additional context -- "
@@ -1215,7 +1252,8 @@ def create_server(settings: Settings) -> FastMCP:
     async def list_tasks() -> str:
         """List background tasks with running state and loop counts.
 
-        System tasks auto-reply/auto-reply-recovery are always-on and protected."""
+        'heartbeat' is the only built-in system task (protected). The deprecated
+        auto-reply worker loops no longer run; their names stay reserved."""
         try:
             infos = [t.__dict__ for t in registry.list_tasks()]
             return _ok("list_tasks", {}, infos)
@@ -1257,7 +1295,7 @@ def create_server(settings: Settings) -> FastMCP:
         re-adding a task resumes where it left off. Rejects out-of-guild, DM,
         thread and non-text channels, empty names, reserved system names
         ('heartbeat', 'auto-reply', 'auto-reply-recovery') and duplicates.
-        See read_outbox for the mandatory pull protocol and identity policy.
+        See read_outbox for the pull protocol and identity policy.
         """
         cid = channel_id if channel_id is not None else settings.default_channel_id
         args = {"name": name, "channel_id": cid, "seconds": seconds}
@@ -1288,8 +1326,9 @@ def create_server(settings: Settings) -> FastMCP:
 
     @mcp.tool()
     async def remove_poll_task(name: str) -> str:
-        """Stop and remove a poll task. Refuses protected tasks ('heartbeat',
-        'auto-reply', 'auto-reply-recovery'). Cursor is kept."""
+        """Stop and remove a poll task. Refuses protected/reserved tasks
+        ('heartbeat'; 'auto-reply'/'auto-reply-recovery' stay reserved for the
+        deprecated worker path). Cursor is kept."""
         try:
             if name == "heartbeat":
                 raise ValueError("cannot remove reserved task 'heartbeat'")
@@ -1300,17 +1339,20 @@ def create_server(settings: Settings) -> FastMCP:
 
     @mcp.tool(
         description=(
-            "Pull captured Discord messages oldest-first as {entries, acked, latest}. Dedupe "
-            "by message_id (realtime + poll can overlap). Process entries in seq order, then "
-            "ack_outbox the highest processed seq \u2014 never ack before processing. "
-            "The auto-reply controller owns ACK for auto jobs; never ack auto work early. "
+            "Pull captured Discord messages oldest-first as {entries, acked, latest, "
+            "markdown}. 'markdown' is a clean Markdown rendering of the same page "
+            "(oldest to newest); 'entries' are the structured rows it was rendered "
+            "from. Dedupe by message_id (realtime + poll can overlap). Process "
+            "entries in seq order, then ack_outbox the highest processed seq "
+            "\u2014 never ack before processing. The caller owns ACK; ack only "
+            "what you actually processed. "
             f"{identity_policy}"
         )
     )
     async def read_outbox(limit: int = 50, unread_only: bool = True) -> str:
         """Pull the outbox. (Agent-facing text is the decorator description above.)"""
         try:
-            result = read_entries(
+            result = outbox_service.read_outbox(
                 settings.outbox_path,
                 settings.outbox_state_path,
                 limit=limit,
@@ -1324,18 +1366,21 @@ def create_server(settings: Settings) -> FastMCP:
     async def ack_outbox(up_to_seq: int) -> str:
         """Mark outbox entries up to up_to_seq as read. Rejects seq beyond latest.
 
-        The auto-reply controller owns ACK for auto jobs: acks beyond its
-        confirmed processed prefix are rejected, never silently clamped.
-        Double-ack at/below the current acked seq is a no-op.
+        Pure seq cursor: the caller owns ACK, so ack only what was actually
+        processed (never before). Double-ack at/below the current acked seq is
+        a no-op.
         """
         try:
             _check_outbox_consistent(settings)  # state-only ack must not reset on state loss
-            responder = state.get("responder")
-            if responder is not None:
-                responder.guard_ack(up_to_seq)  # beyond-prefix rejected, no silent clamp
-            acked = ack_entries(settings.outbox_state_path, up_to_seq)
-            return _ok("ack_outbox", {"up_to_seq": up_to_seq}, {"acked": acked})
+            result = outbox_service.ack_outbox(
+                settings.outbox_path,
+                settings.outbox_state_path,
+                up_to_seq=up_to_seq,
+            )
+            return _ok("ack_outbox", {"up_to_seq": up_to_seq}, result)
         except Exception as exc:
             _fail("ack_outbox", {"up_to_seq": up_to_seq}, exc)
+
+    register_transport_tools(mcp, settings=settings, get_gateway=_gateway, audit=audit)
 
     return mcp

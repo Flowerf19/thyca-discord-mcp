@@ -1,4 +1,4 @@
-# MCP tools — v1 + v4 implemented (12 preserved); v5 in-progress; Modum adds 3 (15 total, source-only); v2/v3 proposed
+# MCP tools — transport redesign: 17 tools (14 neutral + 3 deprecated correlated); v2/v3 proposed
 
 Scope guard (all tools): operate only on the configured `GUILD_ID`.
 Every call is audited to `audit.jsonl`. Destructive tools run without confirm
@@ -8,13 +8,64 @@ When MCP tool descriptions are not enough for an agent, load this whole file
 into its context (system prompt or reference doc). Priority on conflict: direct
 owner order > plan §8 > this file > tool description.
 
+## Transport redesign — neutral Discord gateway (current)
+
+The MCP surface is a caller-agnostic Discord gateway: scoped reads, sends,
+outbox, and task ops. It has **no Thyca session coupling**: the lifespan runs
+lock → Discord connect → outbox hooks → stdio, starts **no** auto-reply /
+recovery worker loops, and never POSTs `/api/sessions`. Session management,
+auto-reply, Jev decisions, and correlation belong to the dedicated Thyca bot
+(or whichever caller drives the gateway).
+
+Envelope: every tool returns `{ "ok": true, "data": ... }` or
+`{ "ok": false, "error": { "code": "scope_denied|not_found|discord_api|validation", "message": "..." } }`.
+
+Neutral path layout: `tools/transport.py` (thin tool registrations) →
+`services/` (`context_reader`, `message_sender`, `outbox_service`,
+`guild_query`) → `adapters/discord_gateway.py` (discord.py wrapper that
+normalizes SDK objects into `GatewayMessage`) guarded by
+`policy/scope_guard.py`. New tools/services never import `sessions`,
+`responder`, `thyca`, or accept `job_ref`.
+
+### Neutral reads and send
+
+- `read_messages(channel_id, before_message_id?, limit? 1..50)` — channel
+  history, oldest-first rows plus `data.markdown`.
+- `get_message(channel_id, message_id)` — one message row plus `data.markdown`.
+- `send_message(content, channel_id?, reply_to_message_id?)` →
+  `{message_id, channel_id, ts, reply_to_message_id, jump_url}`.
+  `reply_to_message_id` sends a Discord `MessageReference` with
+  `fail_if_not_exists=True` (a deleted target errors instead of silently
+  unthreading). Default `allowed_mentions`: `everyone=False`, `roles=False`,
+  `replied_user=False`; explicit user mentions still work.
+- `read_outbox` additionally returns `data.markdown` rendering of the entries.
+- `ack_outbox(up_to_seq)` is a **pure sequence cursor** owned by the caller:
+  ack ≤ `latest` succeeds regardless of job state; ack beyond `latest` is
+  rejected, never clamped. It no longer consults the delivery controller.
+- `data.markdown` is clean Discord context only — no prompt, memory, or
+  reply instructions are embedded in returned data.
+
+### Deprecated correlated path (kept running, not deleted)
+
+`read_context`, `record_no_reply`, `resolve_uncertain_drop`, and the
+`source_message_id`+`job_ref` branch of `send_message` are marked
+`[DEPRECATED]` (`meta.deprecated = true`). They still run when
+`THYCA_SESSION_MAPPING_PATH` exists (the `Responder` is then built
+best-effort), but the worker loops are not started by the lifespan — a
+caller that still needs them must drive the sequence explicitly. New
+callers use `read_messages` / `get_message` and the neutral
+`send_message`. The sections below describe that deprecated worker path
+in detail and are retained for the later removal review.
+
 ## v1 — implemented
 
 | Tool | Args | Returns |
 |---|---|---|
 | `guild_info` | — | id, name, member_count, channel counts |
 | `list_text_channels` | — | id/name/topic/position list |
-| `send_message` | `content`, `channel_id?` (default channel) | message_id, jump_url |
+| `send_message` | `content`, `channel_id?` (default channel), `reply_to_message_id?` | message_id, channel_id, ts, reply_to_message_id, jump_url |
+| `read_messages` | `channel_id`, `before_message_id?`, `limit?` (1..50) | messages + `markdown` |
+| `get_message` | `channel_id`, `message_id` | message + `markdown` |
 | `whoami` | `uid` | uid, display_name, kind (self/owner/other) |
 | `list_members` | `limit?` (≤500) | uid/display_name/kind list |
 | `list_tasks` | — | name/interval/running/current_loop list |

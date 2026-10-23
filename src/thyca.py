@@ -1,5 +1,12 @@
 """Thyca native-agent adapter: errors, validation, trace, transport, prompt, client.
 
+[DEPRECATED worker path] This adapter is retained for the legacy correlated
+tools only. The neutral MCP surface (``tools/transport.py`` -> ``services/``
+-> ``adapters/discord_gateway.py``) is a pure Discord gateway: it never
+imports this module, never POSTs to Thyca, and never reads the session
+mapping. The MCP lifespan does not start the worker loops that use this
+client. Removal is deferred to a later review.
+
 Single merged module (was six ``thyca_*`` modules, merged verbatim in order:
 errors, validate, trace, transport, prompt, client). Import from here, e.g.
 ``from thyca import ThycaClient, build_conversation_prompt``.

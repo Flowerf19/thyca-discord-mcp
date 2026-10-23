@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -105,7 +106,8 @@ class _FakeMessage:
         scope = guild_id if guild_id is not None else "@me"
         self.jump_url = f"https://discord.com/channels/{scope}/{channel_id}/{mid}"
         self.reference = reference
-        self.created_at = created_at
+        # SDK messages always carry a tz-aware creation timestamp (UTC).
+        self.created_at = created_at or datetime.now(timezone.utc)
 
 
 class _SemanticHistory:
@@ -386,8 +388,7 @@ async def _running(monkeypatch, settings, bot):
     )
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
-        for name in ("auto-reply", "auto-reply-recovery"):
-            await ctx["tasks"].stop(name, allow_protected=True)
+        # v6: the deprecated auto loops are never registered; nothing to park.
         yield mcp, ctx, bot
 
 
@@ -467,15 +468,25 @@ def _seed_need_context(settings, mid=SOURCE_MID, seq=1, job_ref="job-need-1"):
 # --- tool surface -----------------------------------------------------------------
 
 
-async def test_tool_count_15_old_12_unchanged(settings):
+async def test_tool_count_17_neutral_tools_added_legacy_flagged(settings):
     mcp = create_server(settings)
     tools = await mcp.list_tools()
     names = sorted(t.name for t in tools)
-    assert len(names) == 15
+    assert len(names) == 17
     for old in OLD_TOOLS:
         assert old in names
-    assert "read_context" in names and "record_no_reply" in names
-    assert "resolve_uncertain_drop" in names
+    # v6 neutral additions.
+    assert "read_messages" in names and "get_message" in names
+    # v5 correlated tools stay listed but are flagged deprecated.
+    for legacy in ("read_context", "record_no_reply", "resolve_uncertain_drop"):
+        assert legacy in names
+    metas = {t.name: (t.meta or {}) for t in tools}
+    for legacy in ("read_context", "record_no_reply", "resolve_uncertain_drop"):
+        assert metas[legacy].get("deprecated") is True
+        assert "[DEPRECATED]" in (descs := {t.name: t.description or "" for t in tools})[legacy]
+    # Neutral tools are NOT deprecated.
+    for neutral in ("read_messages", "get_message", "send_message", "read_outbox"):
+        assert metas[neutral].get("deprecated") is not True
     descs = {t.name: t.description or "" for t in tools}
     # Old tool contracts intact (identity policy + correlation wording).
     assert str(OWNER_UID) in descs["send_message"]
@@ -488,6 +499,10 @@ async def test_tool_count_15_old_12_unchanged(settings):
     assert "operator_approved_drop" in descs["resolve_uncertain_drop"]
     assert "1..20" in descs["read_context"]
     assert "never auto-forwarded" in descs["read_context"]
+    # Neutral tool contracts.
+    assert "markdown" in descs["read_messages"].lower()
+    assert "1..50" in descs["read_messages"]
+    assert "reply_to_message_id" in descs["send_message"]
 
 
 async def test_manual_send_unchanged(settings, monkeypatch):
@@ -499,7 +514,11 @@ async def test_manual_send_unchanged(settings, monkeypatch):
     assert payload["channel_id"] == CHANNEL_ID
     assert payload["message_id"] == 9000
     assert channel.store["sent"][0][0] == "plain manual"
-    assert channel.store["sent"][0][1] == {}  # no reply reference on manual sends
+    send_kwargs = channel.store["sent"][0][1]
+    assert send_kwargs.get("reference") is None  # no reply reference on manual sends
+    mentions = send_kwargs["allowed_mentions"]  # v6 pinned mention policy
+    assert mentions.everyone is False and mentions.roles is False
+    assert mentions.replied_user is False
 
 
 # --- record_no_reply ----------------------------------------------------------------

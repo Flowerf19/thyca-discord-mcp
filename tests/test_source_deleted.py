@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -73,7 +74,8 @@ class FakeUser:
 
 class FakeMessage:
     def __init__(
-        self, mid, author, content="", channel_id=CHANNEL_ID, guild_id=GUILD_ID, reference=None
+        self, mid, author, content="", channel_id=CHANNEL_ID, guild_id=GUILD_ID,
+        reference=None, created_at=None,
     ):
         self.id = mid
         self.author = author
@@ -83,6 +85,8 @@ class FakeMessage:
         scope = guild_id if guild_id is not None else "@me"
         self.jump_url = f"https://discord.com/channels/{scope}/{channel_id}/{mid}"
         self.reference = reference
+        # SDK messages always carry a tz-aware creation timestamp (UTC).
+        self.created_at = created_at or datetime.now(timezone.utc)
 
 
 def make_text_channel(cid, guild_id=GUILD_ID):
@@ -307,8 +311,7 @@ async def _parked(monkeypatch, settings, bot, backend=None):
         monkeypatch.setattr("server.core.Responder", lambda s, b: Responder(s, b, client=backend))
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
-        for name in ("auto-reply", "auto-reply-recovery"):
-            await ctx["tasks"].stop(name, allow_protected=True)
+        # v6: the deprecated auto loops are never registered; nothing to park.
         yield mcp, ctx
 
 
@@ -1085,11 +1088,10 @@ async def test_full_flow_deletion_during_submit_skips_via_gate(settings, monkeyp
     mcp = create_server(settings)
     backend.mcp = mcp
     async with mcp.settings.lifespan(mcp) as ctx:
-        for name in ("auto-reply", "auto-reply-recovery"):
-            await ctx["tasks"].stop(name, allow_protected=True)
         (handler,) = bot.listeners["on_message"]
         await handler(FakeMessage(701, FakeUser(OWNER_UID, "O"), "hello thyca"))
-        # drive the worker directly (loops parked): checker passes (exists),
+        # drive the worker directly (v6: loops never registered): checker
+        # passes (exists),
         # POST deletes+skips via the real MCP gate, reconcile observes skip.
         outcome = await ctx["responder"].tick()
         assert outcome["status"] == "skipped" and outcome["reason"] == "source_deleted"

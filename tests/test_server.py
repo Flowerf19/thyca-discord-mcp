@@ -19,6 +19,7 @@ import asyncio
 import hashlib
 import json
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -44,11 +45,13 @@ CHANNEL_ID = 444
 EXPECTED_TOOLS = [
     "ack_outbox",
     "add_poll_task",
+    "get_message",
     "guild_info",
     "list_members",
     "list_tasks",
     "list_text_channels",
     "read_context",
+    "read_messages",
     "read_outbox",
     "record_no_reply",
     "remove_poll_task",
@@ -88,7 +91,8 @@ class FakeUser:
 
 class FakeMessage:
     def __init__(
-        self, mid, author, content="", channel_id=CHANNEL_ID, guild_id=GUILD_ID, reference=None
+        self, mid, author, content="", channel_id=CHANNEL_ID, guild_id=GUILD_ID,
+        reference=None, created_at=None,
     ):
         self.id = mid
         self.author = author
@@ -99,6 +103,8 @@ class FakeMessage:
         scope = guild_id if guild_id is not None else "@me"
         self.jump_url = f"https://discord.com/channels/{scope}/{channel_id}/{mid}"
         self.reference = reference
+        # SDK messages always carry a tz-aware creation timestamp (UTC).
+        self.created_at = created_at or datetime.now(timezone.utc)
 
 
 class FakeGuild:
@@ -235,9 +241,10 @@ def make_text_channel(cid, guild_id=GUILD_ID, history=None):
     channel.id = cid
     channel.guild = SimpleNamespace(id=guild_id)
     sent: list[FakeMessage] = []
-    store: dict = {"deleted": set(), "exc": None, "calls": []}
+    store: dict = {"deleted": set(), "exc": None, "calls": [], "send_kwargs": []}
 
     async def fake_send(content, **kwargs):
+        store["send_kwargs"].append(kwargs)
         msg = FakeMessage(
             9000 + len(sent),
             FakeUser(BOT_UID, "ThycaBot", bot=True),
@@ -317,6 +324,16 @@ class FailingRemoveListenerBot(FakeBot):
         raise RuntimeError("remove boom")
 
 
+def _enable_legacy_responder(settings, monkeypatch, cls=FakeResponder):
+    """Opt a test into the deprecated worker path.
+
+    v6 builds the Responder best-effort only when the Thyca session mapping
+    file exists — touch it, then swap in the fake class.
+    """
+    settings.thyca_session_mapping_path.touch()
+    monkeypatch.setattr("server.core.Responder", cls)
+
+
 def _settings_kwargs(tmp_path):
     """Fixture kwargs: tmp/fake-only, immune to ambient .env and env vars."""
     return dict(
@@ -355,17 +372,15 @@ def settings(tmp_path):
 async def running_server(monkeypatch, settings, bot):
     """Enter the real installed lifespan with build_bot + Responder patched to fakes.
 
-    The always-on auto loops are parked immediately after enter: there is no
-    await between their start() calls inside the lifespan and these stops, so
-    their first tick can never run. v4 protocol assertions stay race-free;
-    default-on auto behavior is proven in tests/test_server_responder.py.
+    v6: the deprecated auto loops are never registered or started, so there is
+    nothing left to park; v4 protocol assertions stay race-free by default.
+    The retired worker behavior lives in tests/test_server_responder.py.
     """
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FakeResponder)
+    _enable_legacy_responder(settings, monkeypatch)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
-        for name in ("auto-reply", "auto-reply-recovery"):
-            await ctx["tasks"].stop(name, allow_protected=True)
+        # v6: the deprecated auto loops are never registered; nothing to park.
         yield mcp, ctx, bot
 
 
@@ -461,8 +476,8 @@ async def test_add_poll_task_default_channel(settings, monkeypatch):
         assert status["running"] is True
         assert status["interval_seconds"] == 60.0
         names = {t["name"] for t in await call_json(mcp, "list_tasks")}
-        # v5: the two protected auto loops are always registered by default.
-        assert names == {"heartbeat", "auto-reply", "auto-reply-recovery", "poll-main"}
+        # v6: the deprecated auto loops are never registered by the lifespan.
+        assert names == {"heartbeat", "poll-main"}
         assert await call_json(mcp, "remove_poll_task", {"name": "poll-main"}) == {
             "removed": "poll-main"
         }
@@ -770,7 +785,7 @@ async def test_send_message_scoped_helper_regression(settings, monkeypatch):
 async def test_lifespan_startup_order_and_listener(settings, monkeypatch):
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FakeResponder)
+    _enable_legacy_responder(settings, monkeypatch)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         # Listener registered after build, before login/connect; login before connect.
@@ -778,10 +793,10 @@ async def test_lifespan_startup_order_and_listener(settings, monkeypatch):
         assert "on_message" in bot.listeners
         assert ctx["bot"] is bot
         assert ctx["tasks"].status("heartbeat").running is True
-        # v5 always-on: real Responder slot + both protected loops running.
+        # v6: real Responder slot built best-effort for the deprecated tools;
+        # the auto loops are never registered.
         assert isinstance(ctx["responder"], FakeResponder)
-        assert ctx["tasks"].status("auto-reply").running is True
-        assert ctx["tasks"].status("auto-reply-recovery").running is True
+        assert {t.name for t in ctx["tasks"].list_tasks()} == {"heartbeat"}
     assert ctx["tasks"].status("heartbeat").running is False
     assert "remove_listener" in bot.events
     assert bot.is_closed()
@@ -799,7 +814,7 @@ async def test_lifespan_early_gateway_failure(settings, monkeypatch):
 
     bot.wait_until_ready = hang_ready
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FakeResponder)
+    _enable_legacy_responder(settings, monkeypatch)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="gateway failed before ready"):
         async with mcp.settings.lifespan(mcp):
@@ -828,7 +843,7 @@ async def test_lifespan_login_failure_closes_bot_and_listener(settings, monkeypa
         login_exc=discord.LoginFailure("bad token"),
     )
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FakeResponder)
+    _enable_legacy_responder(settings, monkeypatch)
     mcp = create_server(settings)
     with pytest.raises(discord.LoginFailure, match="bad token"):
         async with mcp.settings.lifespan(mcp):
@@ -853,7 +868,7 @@ async def test_lifespan_ready_failure_cleans_gateway(settings, monkeypatch):
 
     bot.connect = spy_connect
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FakeResponder)
+    _enable_legacy_responder(settings, monkeypatch)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="ready boom"):
         async with mcp.settings.lifespan(mcp):
@@ -892,7 +907,7 @@ async def test_lifespan_cancel_during_readiness_wait_cleans_all(settings, monkey
     bot.wait_until_ready = hang_ready
     bot.connect = spy_connect
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FakeResponder)
+    _enable_legacy_responder(settings, monkeypatch)
     mcp = create_server(settings)
 
     async def _run():
@@ -923,7 +938,7 @@ async def test_lifespan_cancel_during_login_cleans_all(settings, monkeypatch):
 
     bot.login = gated_login
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FakeResponder)
+    _enable_legacy_responder(settings, monkeypatch)
     mcp = create_server(settings)
 
     async def _run():
@@ -956,7 +971,7 @@ async def test_lifespan_close_error_still_settles_tasks(settings, monkeypatch):
 
     bot.connect = spy_connect
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FakeResponder)
+    _enable_legacy_responder(settings, monkeypatch)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="close boom"):
         async with mcp.settings.lifespan(mcp) as ctx:
@@ -984,7 +999,7 @@ async def test_lifespan_startup_refuses_state_behind_log(settings, monkeypatch):
     log_before = settings.outbox_path.read_bytes()
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FakeResponder)
+    _enable_legacy_responder(settings, monkeypatch)
     mcp = create_server(settings)
     with pytest.raises(OutboxError, match="behind the log"):
         async with mcp.settings.lifespan(mcp):
@@ -1007,7 +1022,7 @@ async def test_lifespan_startup_refuses_malformed_log(settings, monkeypatch):
     log_before = settings.outbox_path.read_bytes()
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FakeResponder)
+    _enable_legacy_responder(settings, monkeypatch)
     mcp = create_server(settings)
     with pytest.raises(OutboxError, match="corrupt outbox log"):
         async with mcp.settings.lifespan(mcp):
@@ -1123,12 +1138,8 @@ async def test_add_poll_task_refuses_corrupt_state(settings, monkeypatch):
         settings.outbox_state_path.write_text("corrupt{", encoding="utf-8")
         with pytest.raises(ToolError, match="corrupt"):
             await mcp.call_tool("add_poll_task", {"name": "p"})
-        # v5: the two protected auto loops are always registered by default.
-        assert {t.name for t in ctx["tasks"].list_tasks()} == {
-            "heartbeat",
-            "auto-reply",
-            "auto-reply-recovery",
-        }
+        # v6: heartbeat is the only built-in task the lifespan registers.
+        assert {t.name for t in ctx["tasks"].list_tasks()} == {"heartbeat"}
     assert find_audit(read_audit(settings), "add_poll_task", False)
 
 
@@ -1246,55 +1257,46 @@ async def test_add_poll_task_rejects_reserved_auto_names(settings, monkeypatch, 
     async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
         with pytest.raises(ToolError, match="reserved"):
             await mcp.call_tool("add_poll_task", {"name": reserved, "channel_id": 666})
-        assert {t.name for t in ctx["tasks"].list_tasks()} == {
-            "heartbeat",
-            "auto-reply",
-            "auto-reply-recovery",
-        }
+        assert {t.name for t in ctx["tasks"].list_tasks()} == {"heartbeat"}
     assert find_audit(read_audit(settings), "add_poll_task", False)
 
 
-async def test_stop_task_refuses_protected_loops(settings, monkeypatch):
+async def test_stop_task_unknown_and_heartbeat_stoppable(settings, monkeypatch):
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    # Unparked lifespan: the protected loops must be running to prove the
-    # refusal is about protection, not idleness.
-    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FakeResponder)
-    mcp = create_server(settings)
-    async with mcp.settings.lifespan(mcp) as ctx:
-        assert ctx["tasks"].status("auto-reply").running is True
-        with pytest.raises(ToolError, match="protected"):
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        # v6: the deprecated auto loops are never registered, so their names
+        # resolve as unknown tasks (still reserved for add_poll_task only).
+        with pytest.raises(ToolError, match="unknown task"):
             await mcp.call_tool("stop_task", {"name": "auto-reply"})
-        with pytest.raises(ToolError, match="protected"):
-            await mcp.call_tool("stop_task", {"name": "auto-reply-recovery"})
-        assert ctx["tasks"].status("auto-reply").running is True
-        assert ctx["tasks"].status("auto-reply-recovery").running is True
+        assert ctx["tasks"].status("heartbeat").running is True
+        status = await call_json(mcp, "stop_task", {"name": "heartbeat"})
+        assert status["running"] is False
     assert find_audit(read_audit(settings), "stop_task", False)
 
 
-async def test_remove_poll_task_refuses_protected_loops(settings, monkeypatch):
+async def test_remove_poll_task_unknown_names(settings, monkeypatch):
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
-        with pytest.raises(ToolError, match="protected"):
+        with pytest.raises(ToolError, match="unknown task"):
             await mcp.call_tool("remove_poll_task", {"name": "auto-reply"})
-        with pytest.raises(ToolError, match="protected"):
+        with pytest.raises(ToolError, match="unknown task"):
             await mcp.call_tool("remove_poll_task", {"name": "auto-reply-recovery"})
-        assert {t.name for t in ctx["tasks"].list_tasks()} == {
-            "heartbeat",
-            "auto-reply",
-            "auto-reply-recovery",
-        }
+        with pytest.raises(ToolError, match="reserved"):
+            await mcp.call_tool("remove_poll_task", {"name": "heartbeat"})
+        assert {t.name for t in ctx["tasks"].list_tasks()} == {"heartbeat"}
     assert find_audit(read_audit(settings), "remove_poll_task", False)
 
 
-async def test_start_task_restarts_stopped_protected_loop(settings, monkeypatch):
+async def test_start_task_restarts_stopped_task(settings, monkeypatch):
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
-        # running_server parks the auto loops; the tool may restart them.
-        assert ctx["tasks"].status("auto-reply").running is False
-        status = await call_json(mcp, "start_task", {"name": "auto-reply"})
+        await ctx["tasks"].stop("heartbeat")
+        assert ctx["tasks"].status("heartbeat").running is False
+        status = await call_json(mcp, "start_task", {"name": "heartbeat"})
         assert status["running"] is True
         with pytest.raises(ToolError, match="already running"):
+            await mcp.call_tool("start_task", {"name": "heartbeat"})
+        with pytest.raises(ToolError, match="unknown task"):
             await mcp.call_tool("start_task", {"name": "auto-reply"})
 
 
@@ -1305,7 +1307,13 @@ async def test_send_message_audit_is_metadata_only(settings, monkeypatch):
     async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
         res = await call_json(mcp, "send_message", {"content": "hi SECRET_CANARY_X7"})
         assert res["channel_id"] == CHANNEL_ID
-        assert set(res) == {"message_id", "channel_id", "jump_url"}  # legacy shape kept
+        assert set(res) == {
+            "message_id",
+            "channel_id",
+            "jump_url",
+            "ts",
+            "reply_to_message_id",
+        }  # v6 receipt shape
         with pytest.raises(ToolError, match="refusing to send outside scoped guild"):
             await mcp.call_tool(
                 "send_message", {"content": "nope SECRET_CANARY_X7", "channel_id": 666}
@@ -1355,7 +1363,7 @@ async def test_lifespan_cancel_during_login_with_cleanup_failure_stays_cancelled
 
     bot.login = gated_login
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FailingCloseResponder)
+    _enable_legacy_responder(settings, monkeypatch, FailingCloseResponder)
     mcp = create_server(settings)
 
     async def _run():
@@ -1385,7 +1393,7 @@ async def test_lifespan_startup_failure_with_cleanup_failures_keeps_primary(sett
         close_exc=RuntimeError("bot close boom"),
     )
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FailingCloseResponder)
+    _enable_legacy_responder(settings, monkeypatch, FailingCloseResponder)
     mcp = create_server(settings)
     with pytest.raises(discord.LoginFailure, match="bad token") as excinfo:
         async with mcp.settings.lifespan(mcp):
@@ -1406,13 +1414,13 @@ async def test_lifespan_listener_removal_failure_still_tears_down(settings, monk
     channel = make_text_channel(CHANNEL_ID)
     bot = FailingRemoveListenerBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", RefusingGuardResponder)
+    _enable_legacy_responder(settings, monkeypatch, RefusingGuardResponder)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="remove boom"):
         async with mcp.settings.lifespan(mcp):
-            # Guard active while running: the refusing responder rejects ACK.
-            with pytest.raises(ToolError, match="beyond safe prefix"):
-                await mcp.call_tool("ack_outbox", {"up_to_seq": 0})
+            # v6: ack_outbox is a pure seq cursor — no responder guard. The
+            # refusing class only proves the responder state slot still clears.
+            assert await call_json(mcp, "ack_outbox", {"up_to_seq": 0}) == {"acked": 0}
     # Removal failed, but every remaining step still ran: bot closed, no
     # gateway leaks, and BOTH state entries cleared (send sees no bot, ack
     # sees no guard). The cleanup failure still surfaces on a clean exit.

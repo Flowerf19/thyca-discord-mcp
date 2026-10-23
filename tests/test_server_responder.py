@@ -19,6 +19,7 @@ import json
 import os
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -30,7 +31,6 @@ from mcp.server.fastmcp.exceptions import ToolError
 from config import Settings
 from delivery import (
     DeliveryDurabilityUncertain,
-    DeliveryError,
     enqueue_job,
     get_job,
     initialize_delivery_state,
@@ -64,7 +64,8 @@ class FakeUser:
 
 class FakeMessage:
     def __init__(
-        self, mid, author, content="", channel_id=CHANNEL_ID, guild_id=GUILD_ID, reference=None
+        self, mid, author, content="", channel_id=CHANNEL_ID, guild_id=GUILD_ID,
+        reference=None, created_at=None,
     ):
         self.id = mid
         self.author = author
@@ -74,6 +75,8 @@ class FakeMessage:
         scope = guild_id if guild_id is not None else "@me"
         self.jump_url = f"https://discord.com/channels/{scope}/{channel_id}/{mid}"
         self.reference = reference
+        # SDK messages always carry a tz-aware creation timestamp (UTC).
+        self.created_at = created_at or datetime.now(timezone.utc)
 
 
 class FakeGuild:
@@ -625,13 +628,36 @@ def seed_active_job(settings, *, mid=701, seq=1, author_uid=OWNER_UID, actor_kin
 
 @asynccontextmanager
 async def parked_server(monkeypatch, settings, bot):
-    """Real lifespan with the REAL Responder; auto loops parked before first tick."""
+    """Real lifespan with the REAL Responder; v6 never registers auto loops."""
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
-        for name in ("auto-reply", "auto-reply-recovery"):
-            await ctx["tasks"].stop(name, allow_protected=True)
         yield mcp, ctx, bot
+
+
+def wire_recovery_loop(ctx, settings):
+    """Recreate the retired recovery-poll wiring for deprecated-path tests.
+
+    v6: the lifespan never registers the auto-reply worker or recovery poll —
+    tests that still exercise recovery-poll redelivery rebuild the poll tick
+    here and may then ``start``/``coro()`` it. The auto-reply tick factory was
+    removed as P0 dead code (zero production callers).
+    """
+    import server.core as _core
+    from server_ticks import make_poll_tick
+
+    def sink(*args, **kwargs):  # same late-resolution shape as _audit_sink
+        return _core.append_audit(*args, **kwargs)
+
+    ctx["tasks"].register(
+        "auto-reply-recovery",
+        make_poll_tick(
+            settings, settings.default_channel_id, lambda: ctx["bot"], sink
+        ),
+        seconds=settings.recovery_poll_seconds,
+        protected=True,
+    )
+
 
 
 async def call_json(mcp, name, args=None):
@@ -654,37 +680,39 @@ def find_audit(records, tool, ok):
 # --- lifecycle: always-on default with the real Responder --------------------
 
 
-async def test_auto_loops_start_by_default_after_ready(settings, monkeypatch):
+async def test_lifespan_builds_responder_but_no_auto_loops(settings, monkeypatch):
     write_mapping(settings)
     init_delivery(settings)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
-        # No enable flag, no manual priming: the worker is up once ready.
+        # v6: the deprecated worker path is kept but NEVER auto-started —
+        # the dedicated bot owns the worker now.
         assert isinstance(ctx["responder"], Responder)
         assert ctx["responder"].native_sid == FAKE_SID
-        assert ctx["tasks"].status("auto-reply").running is True
-        assert ctx["tasks"].status("auto-reply").interval_seconds == 0.05
-        assert ctx["tasks"].status("auto-reply-recovery").running is True
-        assert ctx["tasks"].status("auto-reply-recovery").interval_seconds == 30.0
         assert ctx["tasks"].status("heartbeat").running is True
-        for name in ("auto-reply", "auto-reply-recovery"):
-            await ctx["tasks"].stop(name, allow_protected=True)
+        assert {t.name for t in ctx["tasks"].list_tasks()} == {"heartbeat"}
     assert all(not t.running for t in ctx["tasks"].list_tasks())
     assert bot.is_closed()
 
 
-async def test_missing_mapping_fails_before_login(settings, monkeypatch):
+async def test_missing_mapping_runs_pure_gateway(settings, monkeypatch):
     init_delivery(settings)  # journal fine, mapping absent
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     mcp = create_server(settings)
-    with pytest.raises(ValueError, match="mapping is missing"):
-        async with mcp.settings.lifespan(mcp):
-            pass  # pragma: no cover - responder init must raise first
-    assert bot.events == ["remove_listener", "close"]
-    assert bot.listeners.get("on_message") is None
+    # v6: no Thyca session mapping -> pure Discord gateway mode. The lifespan
+    # still starts Discord + outbox; deprecated correlated tools report
+    # "auto controller not running" instead of failing startup.
+    async with mcp.settings.lifespan(mcp) as ctx:
+        assert ctx["responder"] is None
+        assert ctx["tasks"].status("heartbeat").running is True
+        with pytest.raises(ToolError, match="auto controller not running"):
+            await mcp.call_tool(
+                "record_no_reply",
+                {"source_message_id": 1, "job_ref": "x", "reason": "no_reply_needed"},
+            )
     assert bot.is_closed()
     leftovers = [
         t
@@ -694,17 +722,30 @@ async def test_missing_mapping_fails_before_login(settings, monkeypatch):
     assert leftovers == []
 
 
-async def test_delivery_sid_mismatch_fails_before_capture(settings, monkeypatch):
+async def test_broken_mapping_still_runs_pure_gateway(settings, monkeypatch):
+    """Corrupt legacy state no longer blocks startup (fail-open deprecated path)."""
+    settings.thyca_session_mapping_path.write_text("corrupt{", encoding="utf-8")
+    init_delivery(settings)
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
+    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    mcp = create_server(settings)
+    async with mcp.settings.lifespan(mcp) as ctx:
+        assert ctx["responder"] is None
+        assert ctx["tasks"].status("heartbeat").running is True
+    assert bot.is_closed()
+
+
+async def test_delivery_sid_mismatch_keeps_gateway_up(settings, monkeypatch):
     write_mapping(settings, sid=FAKE_SID)
     init_delivery(settings, sid="2026-03-04T05-06-07_cd34")  # outside-SID journal
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     mcp = create_server(settings)
-    with pytest.raises(ValueError, match="native_session_id mismatch"):
-        async with mcp.settings.lifespan(mcp):
-            pass  # pragma: no cover - responder init must raise first
-    assert bot.events == ["remove_listener", "close"]
-    assert bot.listeners.get("on_message") is None
+    # v6: the deprecated worker path is best-effort — a broken legacy mapping
+    # or journal disables it instead of blocking Discord transport startup.
+    async with mcp.settings.lifespan(mcp) as ctx:
+        assert ctx["responder"] is None
+        assert ctx["tasks"].status("heartbeat").running is True
     assert bot.is_closed()
 
 
@@ -860,51 +901,16 @@ async def test_shutdown_stops_protected_loops_and_clears_state(settings, monkeyp
     seed_active_job(settings)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     async with parked_server(monkeypatch, settings, bot) as (mcp, ctx, _):
-        assert ctx["tasks"].status("auto-reply").running is False  # parked by helper
-        await call_json(mcp, "start_task", {"name": "auto-reply"})
+        # v6: rebuild the retired recovery-poll wiring, then let start_task drive it.
+        wire_recovery_loop(ctx, settings)
+        assert ctx["tasks"].status("auto-reply-recovery").running is False
         await call_json(mcp, "start_task", {"name": "auto-reply-recovery"})
-        assert ctx["tasks"].status("auto-reply").running is True
+        assert ctx["tasks"].status("auto-reply-recovery").running is True
     # Internal cleanup forces protected stops; worker closed; state cleared.
     assert all(not t.running for t in ctx["tasks"].list_tasks())
     assert bot.is_closed()
     job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
     assert job["stage"] == "uncertain"
-
-
-async def test_auto_tick_failure_audits_coarse_and_stops_loop(settings, monkeypatch):
-    write_mapping(settings)
-    init_delivery(settings)
-    seed_active_job(settings)
-    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    # Corrupt journal: the failing tick audits coarse, and shutdown surfaces the
-    # close() corruption instead of swallowing it as a clean exit.
-    with pytest.raises(DeliveryError, match="corrupt delivery state"):
-        async with parked_server(monkeypatch, settings, bot) as (mcp, ctx, _):
-            settings.delivery_state_path.write_text("corrupt{", encoding="utf-8")
-            await ctx["tasks"]._loops["auto-reply"].coro()
-            assert ctx["tasks"].status("auto-reply").running is False
-    recs = find_audit(read_audit(settings), "auto_reply_tick", False)
-    assert len(recs) == 1
-    assert recs[0]["args"] == {"error_kind": "delivery_error"}
-    assert recs[0]["error"] == "auto_reply_tick failed kind=delivery_error"
-
-
-async def test_failing_auto_loop_stops_itself_without_reset(settings, monkeypatch):
-    write_mapping(settings)
-    init_delivery(settings)
-    seed_active_job(settings)
-    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    mcp = create_server(settings)
-    with pytest.raises(DeliveryError, match="corrupt delivery state"):
-        async with mcp.settings.lifespan(mcp) as ctx:
-            assert ctx["tasks"].status("auto-reply").running is True
-            settings.delivery_state_path.write_text("corrupt{", encoding="utf-8")
-            await asyncio.sleep(1.0)  # ~20 ticks at 0.05s; first failure stops loop
-            assert ctx["tasks"].status("auto-reply").running is False
-            # Fail closed: corrupt bytes preserved verbatim, never reset.
-            assert settings.delivery_state_path.read_text(encoding="utf-8") == "corrupt{"
-    assert find_audit(read_audit(settings), "auto_reply_tick", False)
 
 
 # --- correlated send: agent-owned MCP path -----------------------------------
@@ -1235,7 +1241,13 @@ async def test_manual_send_does_not_attach_active_job(settings, monkeypatch):
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     async with parked_server(monkeypatch, settings, bot) as (mcp, ctx, _):
         res = await call_json(mcp, "send_message", {"content": "operator note"})
-        assert set(res) == {"message_id", "channel_id", "jump_url"}
+        assert set(res) == {
+            "message_id",
+            "channel_id",
+            "jump_url",
+            "ts",
+            "reply_to_message_id",
+        }  # v6 receipt shape
         (sent,) = channel.sent
         assert sent.reference is None  # plain legacy send, no correlation
         job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
@@ -1328,19 +1340,25 @@ def _seed_ack_case(settings):
         )
 
 
-async def test_ack_guard_rejects_beyond_safe_prefix(settings, monkeypatch):
+async def test_ack_outbox_is_pure_seq_cursor(settings, monkeypatch):
+    """v6: the responder safe-prefix guard moved out with the deprecated path.
+
+    ACK is caller-owned: seq beyond unprocessed-but-present entries is not
+    gated by job state anymore; only beyond-LATEST is still rejected.
+    """
     write_mapping(settings)
     init_delivery(settings)
-    _seed_ack_case(settings)  # all three jobs queued: nothing confirmed
+    _seed_ack_case(settings)  # three queued jobs; irrelevant to ack_outbox now
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     async with parked_server(monkeypatch, settings, bot) as (mcp, ctx, _):
-        with pytest.raises(ToolError, match="beyond safe prefix"):
-            await mcp.call_tool("ack_outbox", {"up_to_seq": 3})
+        assert await call_json(mcp, "ack_outbox", {"up_to_seq": 3}) == {"acked": 3}
         got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
-        assert got["acked"] == 0  # rejected before the ack helper ran
+        assert got["acked"] == 3
+        with pytest.raises(ToolError, match="beyond latest"):
+            await mcp.call_tool("ack_outbox", {"up_to_seq": 4})
 
 
-async def test_ack_guard_allows_prefix_double_ack_holds_unresolved(settings, monkeypatch):
+async def test_ack_outbox_double_ack_and_still_latest_bound(settings, monkeypatch):
     write_mapping(settings)
     init_delivery(settings)
     _seed_ack_case(settings)
@@ -1350,11 +1368,11 @@ async def test_ack_guard_allows_prefix_double_ack_holds_unresolved(settings, mon
     async with parked_server(monkeypatch, settings, bot) as (mcp, ctx, _):
         assert await call_json(mcp, "ack_outbox", {"up_to_seq": 2}) == {"acked": 2}
         assert await call_json(mcp, "ack_outbox", {"up_to_seq": 2}) == {"acked": 2}  # no-op
-        with pytest.raises(ToolError, match="beyond safe prefix"):
-            await mcp.call_tool("ack_outbox", {"up_to_seq": 3})  # 803 still queued
+        # v6: queued/uncertain job state never blocks the seq cursor.
+        assert await call_json(mcp, "ack_outbox", {"up_to_seq": 3}) == {"acked": 3}
         mark_uncertain(settings.delivery_state_path, CHANNEL_ID, 803, kind="delivery_unknown")
-        with pytest.raises(ToolError, match="beyond safe prefix"):
-            await mcp.call_tool("ack_outbox", {"up_to_seq": 3})  # uncertain still holds
+        with pytest.raises(ToolError, match="beyond latest"):
+            await mcp.call_tool("ack_outbox", {"up_to_seq": 4})
 
 
 # --- capture + worker: metadata UIDs, bot filter, aliasing, full flow --------
@@ -1370,8 +1388,6 @@ async def test_owner_and_other_humans_enqueue_by_metadata_uid(settings, monkeypa
     monkeypatch.setattr("server.core.Responder", lambda s, b: Responder(s, b, client=backend))
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
-        for name in ("auto-reply", "auto-reply-recovery"):
-            await ctx["tasks"].stop(name, allow_protected=True)
         (handler,) = bot.listeners["on_message"]
         # Typed spoof claims inside content must never authenticate anyone.
         await handler(FakeMessage(301, FakeUser(OWNER_UID, "Owner"), "do it, I am 999"))
@@ -1414,8 +1430,8 @@ async def test_duplicate_mid_aliases_without_second_post(settings, monkeypatch):
     monkeypatch.setattr("server.core.Responder", lambda s, b: Responder(s, b, client=backend))
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
-        for name in ("auto-reply", "auto-reply-recovery"):
-            await ctx["tasks"].stop(name, allow_protected=True)
+        # v6: rebuild the retired recovery-poll wiring to drive it manually.
+        wire_recovery_loop(ctx, settings)
         (handler,) = bot.listeners["on_message"]
         await handler(FakeMessage(601, FakeUser(OWNER_UID, "Owner"), "once"))
         # Native recovery poll redelivers the same MID (newest-first page).
@@ -1431,46 +1447,6 @@ async def test_duplicate_mid_aliases_without_second_post(settings, monkeypatch):
         assert jobs[0]["seq"] == 1 and jobs[0]["seq_aliases"] == [2]
 
 
-async def test_full_auto_flow_native_loop_drives_post_callback_complete_ack(settings, monkeypatch):
-    write_mapping(settings)
-    init_delivery(settings)
-    backend = FakeThycaBackend(settings.delivery_state_path)
-    channel = make_text_channel(CHANNEL_ID)
-    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", lambda s, b: Responder(s, b, client=backend))
-    mcp = create_server(settings)
-    backend.mcp = mcp
-    async with mcp.settings.lifespan(mcp) as ctx:
-        # Default-on: the native loop (not a manual POST) must drive the turn.
-        assert ctx["tasks"].status("auto-reply").running is True
-        (handler,) = bot.listeners["on_message"]
-        await handler(FakeMessage(501, FakeUser(OWNER_UID, "Owner"), "hello thyca"))
-        await asyncio.wait_for(backend.posted.wait(), timeout=5)
-        await asyncio.sleep(0.5)  # let the completing tick finish past the callback
-        assert len(backend.posts) == 1
-        # EXPECTATION CHANGE (peer worker contract, not a weakening): the
-        # worker-generated job_ref is a caller-opaque random32-hex nonce per
-        # the accepted delivery contract, never a pinned
-        # `job-{ch}-{mid}-{seq}` format (this test seeds that legacy shape
-        # only when IT acts as the submitting caller via seed_active_job).
-        # The prompt must still carry the exact live nonce from the store.
-        live_ref = get_job(settings.delivery_state_path, CHANNEL_ID, 501)["job_ref"]
-        assert live_ref and live_ref in backend.posts[0]
-        (call,) = backend.tool_calls
-        assert backend.trace_requests == [4, 4]  # bind check + verify before complete
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, 501)
-        assert job["stage"] == "completed"
-        assert job["turn_index"] == 4
-        assert len(job["send_intents"]) == 1 and len(job["send_receipts"]) == 1
-        assert job["send_receipts"][0]["sent_message_id"] == call["result"]["message_id"]
-        assert job["send_receipts"][0]["reply_to_message_id"] == 501
-        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
-        assert got["acked"] == 1  # controller ACK, never the model
-    ok_recs = find_audit(read_audit(settings), "send_message", True)
-    assert len(ok_recs) == 1 and ok_recs[0]["args"]["source_message_id"] == 501
-
-
 async def test_own_trace_uncorrelated_send_holds_not_complete(settings, monkeypatch):
     write_mapping(settings)
     init_delivery(settings)
@@ -1483,8 +1459,6 @@ async def test_own_trace_uncorrelated_send_holds_not_complete(settings, monkeypa
     mcp = create_server(settings)
     backend.mcp = mcp
     async with mcp.settings.lifespan(mcp) as ctx:
-        for name in ("auto-reply", "auto-reply-recovery"):
-            await ctx["tasks"].stop(name, allow_protected=True)
         (handler,) = bot.listeners["on_message"]
         await handler(FakeMessage(502, FakeUser(OTHER_UID, "Rando"), "hi"))
         outcome = await ctx["responder"].tick()
@@ -1732,102 +1706,6 @@ async def test_double_storage_fault_latches_no_retry_resend(settings, monkeypatc
     assert failed[0]["error"] == "send_message failed kind=delivery_error"
 
 
-POISON_CANARY_F2 = "CANARY_POISON_F2_QZ"
-SINK_CANARY_F2 = "CANARY_SINK_F2_QZ"
-AUDIT_FAILED_SIGNAL = "thyca-discord-mcp: auto_reply_tick audit failed"
-
-
-def _seed_queued_job(settings, *, mid=701, seq=1):
-    """Outbox entry + queued job (no POST started): the tick reaches snapshot."""
-    append_entry(
-        settings.outbox_path,
-        settings.outbox_state_path,
-        type="message",
-        channel_id=CHANNEL_ID,
-        message_id=mid,
-        author_uid=OWNER_UID,
-        author_name="Owner",
-        actor_kind="owner",
-        content=f"m{mid}",
-        author_is_bot=False,
-    )
-    enqueue_job(
-        settings.delivery_state_path,
-        channel_id=CHANNEL_ID,
-        message_id=mid,
-        author_uid=OWNER_UID,
-        actor_kind="owner",
-        seq=seq,
-    )
-
-
-def _poison_tick_harness(monkeypatch, settings, bot):
-    """REAL Responder over a poison backend + an audit sink raising OSError."""
-    backend = PoisonThycaBackend(RuntimeError(f"native poison {POISON_CANARY_F2}"))
-
-    def _dead_sink(*args, **kwargs):  # noqa: ARG001 - signature mirrors append_audit
-        raise OSError(f"audit sink dead {SINK_CANARY_F2}")
-
-    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", lambda s, b: Responder(s, b, client=backend))
-    monkeypatch.setattr("server.core.append_audit", _dead_sink)
-    return backend
-
-
-def _assert_no_canary_leak(settings, stderr):
-    assert POISON_CANARY_F2 not in stderr
-    assert SINK_CANARY_F2 not in stderr
-    audit_text = (
-        settings.audit_path.read_text(encoding="utf-8") if settings.audit_path.exists() else ""
-    )
-    assert POISON_CANARY_F2 not in audit_text
-    assert SINK_CANARY_F2 not in audit_text
-
-
-async def test_poison_tick_dead_sink_stops_loop_direct(settings, monkeypatch, capsys):
-    write_mapping(settings)
-    init_delivery(settings)
-    _seed_queued_job(settings)
-    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    _poison_tick_harness(monkeypatch, settings, bot)
-    mcp = create_server(settings)
-    async with mcp.settings.lifespan(mcp) as ctx:
-        for name in ("auto-reply", "auto-reply-recovery"):
-            await ctx["tasks"].stop(name, allow_protected=True)
-        loop = ctx["tasks"]._loops["auto-reply"]
-        stops: list[int] = []
-        orig_stop = loop.stop
-
-        def spy_stop(*args, **kwargs):
-            stops.append(1)
-            return orig_stop(*args, **kwargs)
-
-        loop.stop = spy_stop
-        assert await loop.coro() is None  # failure contained, never raised
-        assert stops == [1]  # loop.stop() ran despite the dead audit sink
-    err = capsys.readouterr().err
-    assert err.count(AUDIT_FAILED_SIGNAL) == 1  # fixed signal only, exactly once
-    _assert_no_canary_leak(settings, err)
-
-
-async def test_poison_tick_dead_sink_stops_native_loop(settings, monkeypatch, capsys):
-    write_mapping(settings)
-    init_delivery(settings)
-    _seed_queued_job(settings)
-    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    backend = _poison_tick_harness(monkeypatch, settings, bot)
-    mcp = create_server(settings)
-    async with mcp.settings.lifespan(mcp) as ctx:
-        assert ctx["tasks"].status("auto-reply").running is True
-        for _ in range(200):  # native 0.05s loop must stop itself after failing
-            if not ctx["tasks"].status("auto-reply").running:
-                break
-            await asyncio.sleep(0.05)
-        assert ctx["tasks"].status("auto-reply").running is False
-        assert backend.snapshots >= 1  # the poison actually fired
-    err = capsys.readouterr().err
-    assert err.count(AUDIT_FAILED_SIGNAL) == 1  # one failure, one fixed signal, no retry
-    _assert_no_canary_leak(settings, err)
 
 
 # --- F5: bool/str source MID rejected at the MCP boundary --------------------
@@ -2081,8 +1959,6 @@ async def test_foreign_manual_send_not_attributed_to_auto_job(settings, monkeypa
     mcp = create_server(settings)
     backend.mcp = mcp
     async with mcp.settings.lifespan(mcp) as ctx:
-        for name in ("auto-reply", "auto-reply-recovery"):
-            await ctx["tasks"].stop(name, allow_protected=True)
         (handler,) = bot.listeners["on_message"]
         await handler(FakeMessage(503, FakeUser(OTHER_UID, "Rando"), "hi"))
         outcome = await ctx["responder"].tick()

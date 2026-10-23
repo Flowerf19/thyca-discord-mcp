@@ -169,7 +169,17 @@ acceptance remains incomplete.
   only — no other channel, even in the same guild. Every call enforces the guild scope
   guard on the server.
 
-## V5 auto-reply — deployed backend, operating (plan still in-progress, gaps open)
+## [LEGACY / OUTDATED] V5 auto-reply — historical record only
+
+> **Outdated — superseded by Option A.** This section is a dated history of the
+> V5 worker deployment. On the `redesign/mcp-transport` source the MCP lifespan
+> does **not** run auto-reply and does **not** POST to Thyca (`/api/sessions`).
+> If `THYCA_SESSION_MAPPING_PATH` exists, the lifespan may still *construct* a
+> `Responder` object (so deprecated correlated tools can resolve sessions), but
+> it never starts its tick loop and never POSTs. Auto-reply, session management,
+> and correlation belong to the dedicated Thyca bot. Statements below such as
+> "auto-reply is operating now" describe the past V5 deployment, not this source.
+
 
 - **Status:** V5 source reviewed; base `75c5ea0` stays the historical v4
   checkpoint, not the commit ceiling. The owner authorized review, verified
@@ -491,44 +501,61 @@ FastMCP drives the asyncio loop; the lifespan hook `await`s `bot.login()`, then 
 `bot.connect()` in the background and races it against `wait_until_ready()`, so tools
 `await` discord.py directly with no thread bridge.
 
-## Tools (current source: 15 total; V4 historical snapshot was 12)
+## Tools (current source: 17 total; V4 historical snapshot was 12)
+
+The server is a **neutral Discord gateway**: scoped reads, sends, outbox, and
+task ops, with no Thyca session coupling on the new path. **Envelope scope:** only
+the new transport tools (`read_messages`, `get_message`, and the neutral
+`send_message` path) return `{ "ok": true, "data": ... }` or
+`{ "ok": false, "error": {code, message} }`. Legacy tools (`guild_info`, outbox,
+task ops, etc.) and the **[DEPRECATED]** correlated tools keep their prior
+response shapes; see [docs/TOOLS.md](docs/TOOLS.md) per tool.
+Reads that return messages also include `data.markdown` — a clean Markdown
+rendering with no prompt/memory instructions.
 
 | Tool | What it does |
 |---|---|
 | `guild_info` | id, name, member/channel counts of the scoped guild |
 | `list_text_channels` | id/name/topic/position of text channels |
-| `send_message` | send to a channel (default if omitted); refuses out-of-guild targets |
+| `send_message` | send to a channel (default if omitted); optional `reply_to_message_id`; refuses out-of-guild targets; tight `allowed_mentions` (no everyone/roles/replied_user) |
+| `read_messages` | channel history (`before_message_id?`, `limit` 1..50) + Markdown |
+| `get_message` | fetch one message by id + Markdown |
 | `whoami` | classify a UID as self/owner/other + current display name |
 | `list_members` | members as uid/display_name/kind (max 500) |
 | `list_tasks` / `start_task` / `stop_task` | manage named background tasks |
 | `add_poll_task` | poll a channel into the outbox every ≥30s (capture-only) |
 | `remove_poll_task` | stop + remove a poll task (refuses `heartbeat`) |
-| `read_outbox` | pull captured messages oldest-first (+ `acked`/`latest`) |
-| `ack_outbox` | mark entries up to a seq as read (rejects beyond latest) |
-| `read_context` | read approved-channel context for a correlated turn (≤20, before source) |
-| `record_no_reply` | declare no reply for a correlated `need_context` turn (nonterminal) |
-| `resolve_uncertain_drop` | operator-drop a stuck uncertain job with zero send evidence (terminal) |
+| `read_outbox` | pull captured messages oldest-first (+ `acked`/`latest`/Markdown) |
+| `ack_outbox` | pure sequence cursor: mark entries up to a seq as read (rejects beyond latest) |
+| `read_context` **[DEPRECATED]** | correlated-turn context read requiring `job_ref` (worker path) |
+| `record_no_reply` **[DEPRECATED]** | declare no reply for a correlated turn (worker path) |
+| `resolve_uncertain_drop` **[DEPRECATED]** | operator-drop a stuck uncertain job (worker path) |
+
+The three **[DEPRECATED]** correlated tools and the deprecated
+`source_message_id`+`job_ref` branch of `send_message` still run for
+compatibility when `THYCA_SESSION_MAPPING_PATH` exists, but session
+management, auto-reply, Jev decisions, and correlation belong to the
+dedicated Thyca bot — the MCP lifespan starts no worker loops and POSTs
+nothing to `/api/sessions` (**Option A**). The lifespan may still *construct*
+a `Responder` when the session mapping file exists, but it never ticks it and
+never POSTs. New callers should use `read_messages` /
+`get_message` and the neutral `send_message` path. Removal of the legacy
+tools is deferred to a later review.
 
 v2 (messages/channels) and v3 (members/roles) in [docs/TOOLS.md](docs/TOOLS.md) stay
-proposed; v4 (outbox + poll tasks) is implemented. The V4 historical snapshot
-above was 12 tools; the current source is 15 tools (12 preserved + `read_context`,
-`record_no_reply` and `resolve_uncertain_drop` for Modum, source-complete, not deployed). No
+proposed; v4 (outbox + poll tasks) is implemented. No
 v2/v3 mutation/admin/destructive behavior is implemented or tested (existing
 read-only channel/member listings were exercised in the native 12-tool E2E).
-V5 (in-progress plan, V5 source, backend deployed and operating) adds no tool names beyond its 12 — `send_message`
-gains optional `source_message_id` (StrictInt) + `job_ref` as a both-or-neither pair
-for agent-owned auto replies (unpaired manual sends work exactly as before and are
-never job-attached), `ack_outbox` additionally refuses any seq beyond the
-controller's safe processed prefix, and the `auto-reply` / `auto-reply-recovery`
-loops are protected while `heartbeat` may stop but may never be removed. When MCP tool descriptions are not enough for an agent, load the full
-`docs/TOOLS.md` into its context.
+`heartbeat` may be stopped but never removed. When MCP tool descriptions are
+not enough for an agent, load the full `docs/TOOLS.md` into its context.
 
 ## Outbox (agent pull protocol, no LLM in server — V4 deployed writer)
 
-- **Scope:** this section describes the V4 deployed writer. The V5 tree (same
-  V5 source, backend now deployed and operating) adds a FIFO worker that automatically POSTs a native turn per eligible event with
-  controller-guarded ACK (see "V5 auto-reply — in progress" above); capture itself
-  still contains no LLM, and the server still sends no MCP push.
+- **Scope:** this section describes the V4 deployed writer. The deprecated V5
+  worker path (auto POST per eligible event, controller-guarded ACK) is no
+  longer started by the MCP lifespan; `ack_outbox` is a pure sequence cursor
+  owned by the caller. Capture itself still contains no LLM, and the server
+  still sends no MCP push.
 
 - The server only **captures**: a realtime `on_message` listener (watched channels,
   bot's own messages dropped) plus periodic poll tasks (bot's own kept, tagged `self`).

@@ -1,12 +1,11 @@
 """Background tick factories for the MCP server composition root.
 
-Authoritative owner of the three background ticks registered by
-:func:`server.create_server`: heartbeat liveness,
-capture-only poll, and the v5 auto-reply worker step. Moved verbatim from
-server.py (T4 responsibility cut): the composition root keeps the
-TaskRegistry, state dict, bot getter, tools, lifespan, SDK send, proof, and
-latch logic, and constructs these factories with explicit settings, bot
-getters, and a fresh-resolving audit callback so the root
+Authoritative owner of the background ticks registered by
+:func:`server.create_server`: heartbeat liveness and capture-only poll.
+Moved verbatim from server.py (T4 responsibility cut): the composition root
+keeps the TaskRegistry, state dict, bot getter, tools, lifespan, SDK send,
+proof, and latch logic, and constructs these factories with explicit
+settings, bot getters, and a fresh-resolving audit callback so the root
 ``server.append_audit`` patch target keeps working.
 
 Dependency policy: settings, bot getters, and the audit sink are explicit
@@ -18,18 +17,14 @@ returns an async TickFn that only works when the native loop calls it.
 
 Failure policy (preserved exactly): heartbeat failures are recorded, not
 hidden, and the loop survives; poll errors audit ok:false and leave the
-cursor for retry; auto-reply errors audit coarse kinds only and stop their
-own loop unconditionally (an audit-sink failure emits a fixed sanitized
-stderr signal and still stops); CancelledError always propagates untouched.
+cursor for retry; CancelledError always propagates untouched.
 """
 
 from __future__ import annotations
 
 import asyncio
-import sys
 from collections.abc import Callable
-from contextlib import suppress
-from typing import Any, Protocol
+from typing import Any
 
 import discord
 
@@ -37,17 +32,15 @@ from bot import get_scoped_guild
 from config import Settings
 from identity import classify_actor
 from outbox import append_entry, get_poll_cursor, set_poll_cursor
-from server_helpers import _check_outbox_consistent, _coarse_error_kind, _resolve_text_channel
+from server_helpers import _check_outbox_consistent, _resolve_text_channel
 from tasks import TickFn
 
 __all__ = [
     "AppendAuditFn",
     "GetBotFn",
     "GetBotOrNoneFn",
-    "TickableResponder",
     "make_heartbeat_tick",
     "make_poll_tick",
-    "make_auto_reply_tick",
 ]
 
 # Signature mirrors audit.append_audit; the root passes a fresh-resolving
@@ -59,10 +52,6 @@ GetBotFn = Callable[[], discord.Client]
 GetBotOrNoneFn = Callable[[], discord.Client | None]
 
 
-class TickableResponder(Protocol):
-    """Minimal worker surface the auto-reply tick drives (no Responder import)."""
-
-    async def tick(self) -> dict[str, Any]: ...
 
 
 def make_heartbeat_tick(
@@ -182,54 +171,3 @@ def make_poll_tick(
             return
 
     return _poll_tick
-
-
-def make_auto_reply_tick(
-    settings: Settings,
-    responder: TickableResponder,
-    append_audit_fn: AppendAuditFn,
-) -> tuple[TickFn, dict[str, Any]]:
-    """Drive one FIFO worker step; fail the loop closed on any error.
-
-    Returns the tick coroutine plus a holder the lifespan fills with the
-    registered native Loop, so a failing tick can stop its own loop (no
-    state reset, no blind repeat POST). Failures are audited with coarse
-    kinds only; stopping is UNCONDITIONAL (an audit-sink failure emits a
-    fixed sanitized stderr signal and still stops -- a raise here would
-    let the native Loop backoff-retry instead). Cancellation propagates
-    untouched.
-    """
-    holder: dict[str, Any] = {}
-
-    async def _auto_reply_tick() -> None:
-        try:
-            await responder.tick()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            kind = _coarse_error_kind(exc)
-            try:
-                append_audit_fn(
-                    settings.audit_path,
-                    session_id=settings.session_id,
-                    actor="system",
-                    tool="auto_reply_tick",
-                    args={"error_kind": kind},
-                    ok=False,
-                    error=f"auto_reply_tick failed kind={kind}",
-                )
-            except Exception:
-                # Audit sink failed: fixed sanitized signal only (never the
-                # original exception chain), then still fail closed below.
-                with suppress(Exception):
-                    print(
-                        "thyca-discord-mcp: auto_reply_tick audit failed",
-                        file=sys.stderr,
-                    )
-            finally:
-                loop = holder.get("loop")
-                if loop is not None:
-                    loop.stop()  # fail close: unconditional, never swallowed
-            return
-
-    return _auto_reply_tick, holder

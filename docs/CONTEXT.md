@@ -1,5 +1,14 @@
 # Conversation context and memory
 
+> **Architecture note (transport redesign):** the MCP server is now a neutral
+> Discord gateway. For new callers, conversation context is simply a Discord
+> snapshot returned by `read_messages` / `get_message` (and `read_outbox`) as
+> structured rows plus `data.markdown` — clean Markdown with no embedded
+> prompt or memory instructions. The native-session/Jev pipeline described in
+> the rest of this document is the **[DEPRECATED] worker path**: it remains in
+> source for the legacy correlated tools, but the MCP lifespan does not start
+> it and session memory is the dedicated Thyca bot's concern, not the MCP's.
+
 This document describes the implemented Modum source, not the currently running
 backend. The Jev integration is source-reviewed; deployment and the original V5
 live-failure acceptance remain separate. It does not authorize a start, restart,

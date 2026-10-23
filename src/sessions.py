@@ -1,5 +1,10 @@
 """Daily native-session helpers: SID grammar, logical days, history validation.
 
+[DEPRECATED worker path] Retained for the legacy correlated tools only.
+The neutral MCP surface never imports this module: native-session concerns
+(SID grammar, rotation days, history) belong to the dedicated Thyca bot,
+not to the Discord gateway.
+
 Pure stdlib module (no project imports, no file IO, no clock reads except
 inside the provider closure returned by
 :func:`default_session_day_provider`): the rotation subsystem's owner of
