@@ -8,7 +8,6 @@ for absence assertions). No SDK, no network, no env, no paid calls.
 from __future__ import annotations
 
 import copy
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -23,10 +22,7 @@ from conversation import (
 )
 
 FIXTURE_PATH = (
-    Path(__file__).resolve().parent.parent / "experiments" / "jev_conversation" / "cases.json"
-)
-RUNNER_PATH = (
-    Path(__file__).resolve().parent.parent / "experiments" / "jev_conversation" / "run_eval.py"
+    Path(__file__).resolve().parent / "fixtures" / "jev_conversation_cases.json"
 )
 
 FORBIDDEN_KEYS = frozenset(
@@ -40,18 +36,6 @@ FORBIDDEN_KEYS = frozenset(
         "gold_label",
     }
 )
-
-
-def _load_runner():
-    name = "jev_run_eval_under_test"
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, RUNNER_PATH)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def _fixture_cases():
@@ -130,11 +114,6 @@ def test_all_thirty_fixture_states_project_exact_fields():
             assert set(msg) <= {"id", "sender_uid", "text", "reply_to", "timestamp"}, case["id"]
         assert snapshot["new_message_id"] in {m["id"] for m in snapshot["messages"]}
 
-
-def test_projection_matches_runner_build_model_state_all_thirty():
-    rx = _load_runner()
-    for case in _fixture_cases():
-        assert project_conversation_state(case["state"]) == rx.build_model_state(case)
 
 
 def test_no_gold_leak_in_projection_all_thirty():

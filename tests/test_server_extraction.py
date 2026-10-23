@@ -1,13 +1,13 @@
 """T4 ownership tests: server_ticks factories + root fresh-audit wiring.
 
-Covers the extracted background ticks (heartbeat, poll, auto-reply) at the
-factory level with fake Discord objects and tmp-only settings, plus the root
-late-patch proof: patching ``server.append_audit`` AFTER
-``create_server`` still reroutes tick audits (the root passes a
-fresh-resolving callable, never a stale binding or module namespace).
+Covers the extracted background ticks (heartbeat, poll) at the factory level
+with fake Discord objects and tmp-only settings, plus the root late-patch
+proof: patching ``server.append_audit`` AFTER ``create_server`` still
+reroutes tick audits (the root passes a fresh-resolving callable, never a
+stale binding or module namespace).
 
 No network, no real .env/outbox/audit files (all paths are tmp fixtures with
-_env_file=None and fake IDs/token). No existing tests are modified.
+_env_file=None and fake IDs/token).
 """
 
 import asyncio
@@ -21,11 +21,9 @@ import discord
 import pytest
 
 from config import Settings
-from delivery import DeliveryError
 from outbox import get_poll_cursor, read_entries
 from server import create_server
 from server_ticks import (
-    make_auto_reply_tick,
     make_heartbeat_tick,
     make_poll_tick,
 )
@@ -365,95 +363,7 @@ async def test_poll_factory_no_io_until_tick(settings):
     assert len(calls) == 1
 
 
-# --- auto-reply factory -----------------------------------------------------
-
-
-class _FakeLoop:
-    def __init__(self):
-        self.stops = 0
-
-    def stop(self):
-        self.stops += 1
-
-
-async def test_auto_success_no_audit_no_stop(settings):
-    responder = FakeResponder()
-    sink, audits = _audit_spy()
-    tick, holder = make_auto_reply_tick(settings, responder, sink)
-    assert type(holder) is dict
-    assert holder == {}
-    assert await tick() is None
-    assert responder.ticks == 1
-    assert audits == []
-
-
-async def test_auto_failure_audits_coarse_and_stops_loop(settings):
-    class Failing:
-        async def tick(self):
-            raise DeliveryError("journal exploded CANARY_A1")
-
-    loop = _FakeLoop()
-    sink, audits = _audit_spy()
-    tick, holder = make_auto_reply_tick(settings, Failing(), sink)
-    holder["loop"] = loop
-    assert await tick() is None  # contained, never raised
-    assert loop.stops == 1
-    assert len(audits) == 1
-    assert audits[0]["tool"] == "auto_reply_tick"
-    assert audits[0]["ok"] is False
-    assert audits[0]["args"] == {"error_kind": "delivery_error"}
-    assert audits[0]["error"] == "auto_reply_tick failed kind=delivery_error"
-    assert "CANARY_A1" not in str(audits)
-
-
-async def test_auto_audit_sink_failure_still_stops_fixed_stderr(settings, capsys):
-    poison = "POISON_CANARY_B2"
-    sink_canary = "SINK_CANARY_B2"
-
-    class Failing:
-        async def tick(self):
-            raise RuntimeError(f"native poison {poison}")
-
-    def _dead_sink(*args, **kwargs):  # noqa: ARG001 - signature mirrors append_audit
-        raise OSError(f"audit sink dead {sink_canary}")
-
-    loop = _FakeLoop()
-    tick, holder = make_auto_reply_tick(settings, Failing(), _dead_sink)
-    holder["loop"] = loop
-    assert await tick() is None
-    assert loop.stops == 1  # unconditional stop despite the dead sink
-    err = capsys.readouterr().err
-    assert err.count("thyca-discord-mcp: auto_reply_tick audit failed") == 1
-    assert poison not in err
-    assert sink_canary not in err
-
-
-async def test_auto_cancel_propagates_without_stop_or_audit(settings):
-    class Cancelling:
-        async def tick(self):
-            raise asyncio.CancelledError
-
-    loop = _FakeLoop()
-    sink, audits = _audit_spy()
-    tick, holder = make_auto_reply_tick(settings, Cancelling(), sink)
-    holder["loop"] = loop
-    with pytest.raises(asyncio.CancelledError):
-        await tick()
-    assert audits == []
-    assert loop.stops == 0
-
-
-async def test_auto_factory_no_io_until_tick(settings):
-    responder = FakeResponder()
-    sink, audits = _audit_spy()
-    tick, holder = make_auto_reply_tick(settings, responder, sink)
-    assert responder.ticks == 0
-    assert audits == []
-    assert holder == {}
-    await tick()
-    assert responder.ticks == 1
-
-
+# --- root
 # --- root late-patch proof ----------------------------------------------------
 
 

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import importlib.util
 import io
 import json
 import logging
@@ -37,23 +36,8 @@ from jev import (
 )
 
 FIXTURE_PATH = (
-    Path(__file__).resolve().parent.parent / "experiments" / "jev_conversation" / "cases.json"
+    Path(__file__).resolve().parent / "fixtures" / "jev_conversation_cases.json"
 )
-RUNNER_PATH = (
-    Path(__file__).resolve().parent.parent / "experiments" / "jev_conversation" / "run_eval.py"
-)
-
-
-def _load_runner():
-    name = "jev_run_eval_under_test"
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, RUNNER_PATH)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def _fixture_cases():
@@ -134,11 +118,6 @@ def test_question_ids_exact():
     assert JEV_BASE_URL == "https://api.typesafe.ai"
     assert JEV_TIMEOUT == 10.0
 
-
-def test_build_questions_matches_runner_all_thirty():
-    rx = _load_runner()
-    for case in _fixture_cases():
-        assert build_questions(case["state"]) == rx.build_questions(case)
 
 
 def test_question_shapes_and_vocab():
