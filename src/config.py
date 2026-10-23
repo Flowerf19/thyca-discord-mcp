@@ -39,26 +39,29 @@ class Settings(BaseSettings):
     default_channel_id: int = Field(description="Channel used when a tool omits channel_id.")
     session_id: str = Field(
         default="discord-main",
-        description="Fixed memory session for Discord activity.",
+        description="Audit/heartbeat label for this gateway instance. "
+        "[DEPRECATED] Thyca session semantics moved to the dedicated bot; "
+        "the neutral MCP path only uses this as a log label.",
     )
     daily_session_rotation: bool = Field(
         default=True,
-        description="Rotate to a fresh native Thyca session once per logical "
-        "day (one session per day). Rotation is drain-gated: the worker "
-        "keeps serving the previous session until every delivery job is "
+        description="[DEPRECATED worker path] Rotate to a fresh native Thyca "
+        "session once per logical day (one session per day). Rotation is "
+        "drain-gated: the worker "
         "safe-terminal, then adopts the new day session. Old sessions are "
         "never deleted. Set false to pin the single mapped session forever.",
     )
     session_day_timezone: str = Field(
         default="Asia/Ho_Chi_Minh",
-        description="IANA timezone for the rotation logical day. Must parse "
-        "via zoneinfo; validated eagerly at Settings construction.",
+        description="[DEPRECATED worker path] IANA timezone for the rotation "
+        "logical day. Must parse via zoneinfo; validated eagerly at Settings construction.",
     )
     session_day_rollover_hour: int = Field(
         default=4,
         ge=0,
         le=23,
-        description="Logical-day rollover hour (0..23) in session_day_timezone: "
+        description="[DEPRECATED worker path] Logical-day rollover hour "
+        "(0..23) in session_day_timezone: "
         "the day flips at this wall hour, not at midnight, so a late-night "
         "conversation stays in one session. Env strings with clean ints "
         "coerce; bools/floats are rejected.",
@@ -82,39 +85,50 @@ class Settings(BaseSettings):
     chunk_guilds_at_startup: bool = False
     thyca_base_url: str = Field(
         default="http://127.0.0.1:8765",
-        description="Thyca agent HTTP base URL (loopback). Validated by the native client.",
+        description="[DEPRECATED worker path] Thyca agent HTTP base URL "
+        "(loopback); legacy setting outside the neutral MCP path. Validated "
+        "by the native client.",
     )
     thyca_session_mapping_path: Path = Field(
         default=Path.home() / ".thyca/discord_session.json",
-        description="Channel -> Thyca SID mapping file. Stored only; never read by Settings.",
+        description="[DEPRECATED worker path] Channel -> Thyca SID mapping "
+        "file; legacy setting outside the neutral MCP path. Stored only; "
+        "never read by Settings. When absent the server runs as a pure "
+        "Discord gateway.",
     )
     delivery_state_path: Path = Field(
         default=PROJECT_ROOT / "delivery_state.json",
-        description="Responder delivery cursors. Saved atomically by the delivery module.",
+        description="[DEPRECATED worker path] Responder delivery cursors. "
+        "Saved atomically by the delivery module.",
     )
     responder_check_seconds: float = Field(
         default=1.0,
         gt=0,
-        description="Operational poll tick for the responder loop. Must be finite and > 0.",
+        description="[DEPRECATED worker path] Tick interval for the (now "
+        "unstarted) responder loop.",
     )
     thyca_request_timeout_seconds: float = Field(
         default=900.0,
         gt=0,
-        description="Technical upper bound for one Thyca agent request. Must be finite and > 0.",
+        description="[DEPRECATED worker path] Technical upper bound for one "
+        "Thyca agent request. Must be finite and > 0.",
     )
     recovery_poll_seconds: float = Field(
         default=30.0,
         ge=30,
-        description="Native recovery poll interval floor. Must be finite and >= 30.",
+        description="[DEPRECATED worker path] Native recovery poll interval "
+        "floor. Must be finite and >= 30.",
     )
     typesafe_api_key: SecretStr | None = Field(
         default=None,
-        description="TypeSafe Jev API key for paid classification. Lazy: only read when "
-        "the responder builds its real Jev adapter. Never log or echo.",
+        description="[DEPRECATED worker path] TypeSafe Jev API key for paid "
+        "classification. Lazy: only read when the responder builds its real "
+        "Jev adapter. Never log or echo.",
     )
     jev_state_path: Path | None = Field(
         default=None,
-        description="Jev participation ledger state. Defaults beside the configured "
+        description="[DEPRECATED worker path] Jev participation ledger "
+        "state. Defaults beside the configured "
         "delivery state (same parent, jev_state.json) so tmp delivery paths "
         "never leak ledger writes to the repo root. Must not collide with "
         "delivery/outbox/audit/mapping paths.",
@@ -123,7 +137,8 @@ class Settings(BaseSettings):
         default=20,
         ge=1,
         le=20,
-        description="Canonical context window: whole recent messages, 1..20 "
+        description="[DEPRECATED worker path] Correlated read_context "
+        "window: whole recent messages, 1..20 "
         "(source + exact parent + recents, same approved channel). Env "
         "strings with clean ints coerce; bools/floats are rejected.",
     )

@@ -13,6 +13,7 @@ _env_file=None and fake IDs/token). No existing tests are modified.
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -44,7 +45,8 @@ class FakeUser:
 
 class FakeMessage:
     def __init__(
-        self, mid, author, content="", channel_id=CHANNEL_ID, guild_id=GUILD_ID, reference=None
+        self, mid, author, content="", channel_id=CHANNEL_ID, guild_id=GUILD_ID,
+        reference=None, created_at=None,
     ):
         self.id = mid
         self.author = author
@@ -54,6 +56,8 @@ class FakeMessage:
         scope = guild_id if guild_id is not None else "@me"
         self.jump_url = f"https://discord.com/channels/{scope}/{channel_id}/{mid}"
         self.reference = reference
+        # SDK messages always carry a tz-aware creation timestamp (UTC).
+        self.created_at = created_at or datetime.now(timezone.utc)
 
 
 class FakeGuild:
@@ -218,10 +222,12 @@ def read_audit(settings):
 async def running_server(monkeypatch, settings, bot):
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     monkeypatch.setattr("server.core.Responder", FakeResponder)
+    # v6: the deprecated Responder is built best-effort only when the Thyca
+    # session mapping file exists; touch it so the fake is constructed.
+    settings.thyca_session_mapping_path.touch()
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
-        for name in ("auto-reply", "auto-reply-recovery"):
-            await ctx["tasks"].stop(name, allow_protected=True)
+        # The deprecated auto loops are never registered; nothing to park.
         yield mcp, ctx, bot
 
 
@@ -478,31 +484,14 @@ async def test_root_late_audit_patch_reroutes_all_ticks(settings, monkeypatch):
         await ctx["tasks"]._loops["late-poll"].coro()
         assert {"tool": "poll_tick", "ok": False} in late
 
-        # Auto via the parked worker with a failing tick.
-        async def _boom():
-            raise ValueError("late auto boom")
-
-        ctx["responder"].tick = _boom
-        loop = ctx["tasks"]._loops["auto-reply"]
-        stops: list[int] = []
-        orig_stop = loop.stop
-
-        def spy_stop(*args, **kwargs):
-            stops.append(1)
-            return orig_stop(*args, **kwargs)
-
-        loop.stop = spy_stop
-        await loop.coro()
-        assert {"tool": "auto_reply_tick", "ok": False} in late
-        assert stops == [1]
+        # v6: the deprecated auto-reply tick is never registered by the
+        # lifespan; its factory-level audit/sink coverage stands above.
 
 
 async def test_root_registers_heartbeat_before_worker_loops(settings, monkeypatch):
-    """Register order preserved: heartbeat first, workers only after ready."""
+    """Register order preserved: heartbeat only, worker loops retired."""
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
         names = [t.name for t in ctx["tasks"].list_tasks()]
-        assert names[0] == "heartbeat"
-        assert "auto-reply" in names
-        assert "auto-reply-recovery" in names
+        assert names == ["heartbeat"]

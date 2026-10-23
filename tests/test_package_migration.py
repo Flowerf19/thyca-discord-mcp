@@ -41,13 +41,23 @@ EXPECTED_FILES = (
 )
 
 EXPECTED_PACKAGES = {
+    "adapters": ("__init__.py", "discord_gateway.py"),
     "delivery": ("__init__.py", "queries.py", "store.py", "transitions.py"),
     "participation": ("__init__.py", "errors.py", "ledger.py", "store.py", "validate.py"),
+    "policy": ("__init__.py", "scope_guard.py"),
     "responder": ("__init__.py", "core.py", "input.py", "recovery.py", "rotation.py", "submit.py"),
     "server": ("__init__.py", "core.py"),
+    "services": (
+        "__init__.py",
+        "context_reader.py",
+        "message_sender.py",
+        "outbox_service.py",
+    ),
+    "tools": ("__init__.py", "transport.py"),
 }
 
 EXPECTED_IMPORTS = (
+    "adapters.discord_gateway",
     "audit",
     "bot",
     "config",
@@ -69,6 +79,7 @@ EXPECTED_IMPORTS = (
     "participation.ledger",
     "participation.store",
     "participation.validate",
+    "policy.scope_guard",
     "responder",
     "responder.core",
     "responder.input",
@@ -79,10 +90,14 @@ EXPECTED_IMPORTS = (
     "server.core",
     "server_helpers",
     "server_ticks",
+    "services.context_reader",
+    "services.message_sender",
+    "services.outbox_service",
     "sessions",
     "source_messages",
     "tasks",
     "thyca",
+    "tools.transport",
 )
 
 
@@ -95,10 +110,14 @@ def test_retired_package_dir_gone():
     assert not (ROOT / "src" / _RETIRED).exists()
     assert not (ROOT / "src" / _RETIRED_PKG).exists()
     assert sorted(p.name for p in ROOT.glob("src/*") if p.is_dir() and p.name != "__pycache__") == [
+        "adapters",
         "delivery",
         "participation",
+        "policy",
         "responder",
         "server",
+        "services",
+        "tools",
     ]
 
 
