@@ -13,10 +13,13 @@ paid call, state reset, or ACK of an unresolved job.
 | Native session history and memory | The existing Thyca session's history and native memory handling | Thyca only; this history is not exported to Jev |
 
 The Discord snapshot is not a replacement for native memory. All Discord activity
-uses one native session per logical day (04:00→04:00 `Asia/Ho_Chi_Minh` by
-default), not a new session per message or person. Rotation is automatic,
-drain-gated, and transient-deferring; old sessions are never deleted.
-The mutable session title is cosmetic; `discord-main` remains the audit label.
+flows into the target bot's fixed DM session (`TARGET_BOT_ID`, default
+`march7th`), resolved live every tick — not a new session per message or
+person. Adoption is automatic and drain-gated (every delivery job must be
+safe-terminal or queued first); a blocked adoption still reconciles the head
+blocker on the old session each tick, while an uncertain job halts adoption
+until the operator resolves it. Old sessions are never deleted.
+The mutable session title is cosmetic; the audit label is the target bot id.
 Thyca controls its own history/context selection. The Discord message-count limit
 does not limit the native agent's entire context or guarantee that all native
 history is visible on every turn. This is shared-session behavior, not per-user
@@ -210,9 +213,7 @@ not retroactively converted into a no-reply proof.
 | `CONVERSATION_MAX_MESSAGES` | `20`, strict integer `1..20` | Maximum total selected messages; mandatory parent and fit rules still apply. |
 | `TYPESAFE_API_KEY` | Required for the real adapter; lazy secret | SDK authentication, never included as a context field or logged. |
 | `JEV_STATE_PATH` | `jev_state.json` beside the delivery state | Private metadata-only classification ledger. |
-| `DAILY_SESSION_ROTATION` | `true`; `false` pins the single mapped session | One native session per logical day; drain-gated, transient-deferring, lazy on quiet days, old sessions kept. |
-| `SESSION_DAY_TIMEZONE` | `Asia/Ho_Chi_Minh`, valid IANA zone | Timezone of the rotation logical day; bad zones fail at startup. |
-| `SESSION_DAY_ROLLOVER_HOUR` | `4`, strict int `0..23` | Wall hour the logical day flips; 04:00 keeps late-night context in one session. |
+| `TARGET_BOT_ID` | `march7th`; required, must match bot-id grammar | Bot whose fixed DM session receives auto-reply turns; resolved live every tick. |
 
 Per-call Jev spend has no daily stop (removed by user order); per-day cost is
 reported in the ledger summary for observability only.
@@ -233,7 +234,7 @@ reset or rebinding. See [the example configuration](../.env.example) and
 | Jev participation adapter | [`jev.py`](../src/jev.py) |
 | Durable classification/cache/accounting | [`participation/`](../src/participation/ledger.py) |
 | Prepaid/postpaid guards and routing | [`responder/`](../src/responder/core.py) |
-| Daily session rotation (registry, drain gate, lazy create) | [`sessions.py`](../src/sessions.py), [`responder/rotation.py`](../src/responder/rotation.py) |
+| Target-bot DM adoption (drain gate, reconcile pass, lazy create) | [`sessions.py`](../src/sessions.py) (SID/day/history validation), [`responder/core.py`](../src/responder/core.py) |
 | Trusted frame and untrusted JSON rendering | [`thyca.py`](../src/thyca.py) |
 | MCP context/declaration tools | [`server/`](../src/server/core.py), [tool contracts](TOOLS.md) |
 
@@ -253,33 +254,34 @@ live-channel quality, current production activation, provider billing caps, or
 atomic Discord/journal transactions. Existing uncertain jobs stay unresolved
 unless separately reconciled with evidence and explicit authorization.
 
-## Daily rotation recovery
+## Target-bot DM adoption recovery
 
-Rotation failures are loud and manual-safe (no silent resume, no auto-reset).
-With the MCP server STOPPED (single-writer rule), compare the three SID
-bindings: the mapping `~/.thyca/discord_session.json` (`native_id` +
-`active_date` + `sessions`), `delivery_state.json` (`native_session_id` +
-`native_sessions`), and `jev_state.json` (same two keys).
+Adoption failures are loud and manual-safe (no silent resume, no auto-reset).
+With the MCP server STOPPED (single-writer rule), compare the two SID
+bindings: `delivery_state.json` (`native_session_id` + `native_sessions`)
+and `jev_state.json` (same two keys). There is no mapping file: the DM is
+resolved live every tick and converged delivery-first, ledger-second.
 
-- Deferred rotation (stderr `rotation deferred for <day> (<kind>)`): a
-  transient native blip; the worker keeps serving the previous day and
-  retries every tick. No action; a later `rotated daily session` line
-  confirms recovery.
-- Pruned today-session (every submit 404s to `uncertain`): a foreign native
-  `create` removed the still-blank day session before its first turn. Drop
-  each stuck job with the operator `resolve_uncertain_drop` tool; the next
-  04:00 boundary then rotates fresh automatically. For immediate recovery
-  instead of waiting: `POST /api/sessions` with an empty `{}` body to mint
-  a replacement, then with the server stopped set the SAME new SID in all
-  three files (`native_id` + `sessions[<today>]` + updated `path` stem in
-  the mapping; `native_session_id` + `native_sessions` in delivery and
-  ledger, keeping every older day entry). Restart only with explicit
-  approval.
-- Half-commit (startup `native_session_id mismatch` naming both SIDs after
-  a crash between the sync store writes): the mapping registry is the
-  commit record. If the mapping already seals today, copy its `native_id`
-  + `sessions` map into the lagging delivery/ledger file(s); if the
-  mapping still seals yesterday while delivery/ledger already carry
-  today's SID (present in their `native_sessions`), activate the mapping
-  to match (`native_id`, `active_date`, `sessions`, `path` stem, fresh
-  `created_at`). Never delete old day entries or old native sessions.
+- Deferred adoption (stderr `target DM adoption deferred for <day> (<kind>)`):
+  a transient native blip (retries every tick, no action), or a
+  mid-flight/turn_submitting job blocking the drain gate. While blocked,
+  each tick still runs one reconcile-only pass for the head blocker on
+  the old session (no submits, no classify), so an inflight job drains
+  and adoption converges next tick. An `uncertain` job never auto-drains:
+  resolve it with the operator `resolve_uncertain_drop` tool first,
+  then the next tick adopts. A later `adopted target bot DM session`
+  line confirms recovery.
+- Pruned serving session: SELF-RECOVERING. A definitive pre-POST 404 on the
+  serving SID holds that tick `pending` with zero state mutation; the next
+  tick re-resolves the target DM (recreated natively when deleted) and adopts
+  it. No action. Residual case: a 404 between snapshot and POST
+  (millisecond race) holds that one job `uncertain` -- drop it with the
+  operator `resolve_uncertain_drop` tool and the next message adopts.
+  Manual repair is only for an adoption that cannot converge (see
+  half-commit below).
+- Half-commit (startup `delivery native_session_id mismatch` naming the
+  stored SID after a crash between the sync store writes): delivery is the
+  commit record. Copy its `native_session_id` + `native_sessions` map into
+  the lagging ledger file (records keep their classification-day SIDs, so
+  no record edit is needed). Never delete old day entries or old native
+  sessions.

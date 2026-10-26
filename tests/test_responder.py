@@ -12,17 +12,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 import re
-import stat
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import discord
 import pytest
 
+import delivery
 import responder as responder_mod
 from config import Settings
+from context import context_fingerprint
 from delivery import (
     DeliveryError,
     enqueue_job,
@@ -64,7 +64,6 @@ def _jump(mid: int) -> str:
 
 
 def _settings(tmp_path, **overrides):
-    mapping = tmp_path / "mapping.json"
     delivery_path = tmp_path / "delivery.json"
     outbox_path = tmp_path / "outbox.jsonl"
     state_path = tmp_path / "outbox_state.json"
@@ -73,8 +72,6 @@ def _settings(tmp_path, **overrides):
         "owner_uid": FAKE_OWNER,
         "guild_id": FAKE_GUILD,
         "default_channel_id": FAKE_CHANNEL,
-        "session_id": "discord-main",
-        "thyca_session_mapping_path": mapping,
         "delivery_state_path": delivery_path,
         "outbox_path": outbox_path,
         "outbox_state_path": state_path,
@@ -82,22 +79,8 @@ def _settings(tmp_path, **overrides):
     }
     kwargs.update(overrides)
     settings = Settings(**kwargs)
-    return settings, mapping, delivery_path, outbox_path, state_path
+    return settings, delivery_path, outbox_path, state_path
 
-
-def _write_mapping(path, sid=FAKE_SID, title="discord-main", extra=None, mode=0o600):
-    data = {
-        "native_id": sid,
-        "title": title,
-        "audit_label": title,
-        "created_at": "2026-01-02T03:04:05+00:00",
-        "path": f"/tmp/fake-sessions/{sid}.jsonl",
-    }
-    if extra:
-        data.update(extra)
-    path.write_text(json.dumps(data), encoding="utf-8")
-    os.chmod(path, mode)
-    return data
 
 
 def _init_delivery(path, sid=FAKE_SID, baseline=0, historical=None, skips=None):
@@ -125,10 +108,9 @@ def _entry_fields(**overrides):
 
 
 def _prepare(tmp_path, baseline=0, historical=None, skips=None):
-    settings, mapping, delivery_path, outbox_path, state_path = _settings(tmp_path)
-    _write_mapping(mapping)
+    settings, delivery_path, outbox_path, state_path = _settings(tmp_path)
     _init_delivery(delivery_path, baseline=baseline, historical=historical, skips=skips)
-    return settings, mapping, delivery_path, outbox_path, state_path
+    return settings, delivery_path, outbox_path, state_path
 
 
 class FakeUser:
@@ -237,13 +219,33 @@ class FakeBot:
 
 
 class FakeClient:
-    def __init__(self):
+    """Fake native client: DM resolve defaults to the delivery SID (no adopt).
+
+    ``dm_sid`` overrides the DM the fake resolves (adoption path);
+    ``dm_fn`` replaces the whole resolve (transient/404 failures)."""
+
+    def __init__(self, dm_sid=None):
         self.snapshot_calls: list = []
         self.submit_calls: list = []
         self.trace_calls: list = []
+        self.dm_calls: list = []
+        self.dm_sid = dm_sid
         self.snapshot_fn = None
         self.submit_fn = None
         self.trace_fn = None
+        self.dm_fn = None
+
+    async def get_bot_dm(self, bot_id):
+        self.dm_calls.append(bot_id)
+        if self.dm_fn is not None:
+            return await self.dm_fn(bot_id)
+        sid = self.dm_sid if self.dm_sid is not None else FAKE_SID
+        return {
+            "native_sid": sid,
+            "running": False,
+            "message_count": 0,
+            "proof": "bot_dm",
+        }
 
     async def get_session_snapshot(self, sid, expected_title=None):
         self.snapshot_calls.append((sid, expected_title))
@@ -287,13 +289,13 @@ class FakeClient:
 
 
 def _responder(tmp_path, bot=None, client=None, baseline=0, historical=None, skips=None):
-    settings, mapping, delivery_path, outbox_path, state_path = _prepare(
+    settings, delivery_path, outbox_path, state_path = _prepare(
         tmp_path, baseline=baseline, historical=historical, skips=skips
     )
     bot = bot or FakeBot()
     client = client or FakeClient()
     inst = Responder(settings, bot, client=client)
-    return inst, settings, mapping, delivery_path, outbox_path, state_path
+    return inst, settings, delivery_path, outbox_path, state_path
 
 
 # -- legacy Jev stub (module-only autouse; preserves pre-routing regressions) --
@@ -387,6 +389,7 @@ def _inject_legacy_jev(monkeypatch):
         jev_adapter=None,
         context_collector=None,
         participation_ledger=None,
+        session_day_provider=None,
     ):
         if jev_adapter is None:
             jev_adapter = _LegacyJevAdapter()
@@ -403,6 +406,7 @@ def _inject_legacy_jev(monkeypatch):
             jev_adapter=jev_adapter,
             context_collector=context_collector,
             participation_ledger=participation_ledger,
+            session_day_provider=session_day_provider,
         )
 
     monkeypatch.setattr(Responder, "__init__", patched)
@@ -703,115 +707,34 @@ def test_import_has_no_side_effects():
 
 
 def test_constructor_ok_uses_fake_paths_no_home(tmp_path):
-    inst, settings, mapping, delivery_path, _, _ = _responder(tmp_path)
+    inst, settings, delivery_path, _, _ = _responder(tmp_path)
     assert inst.native_sid == FAKE_SID
     assert inst.settings is settings
-    assert mapping.exists()
-    assert stat.S_IMODE(mapping.stat().st_mode) == 0o600
     # Fake SID differs from any real HOME mapping; success proves no HOME read.
     assert FAKE_SID != "2026-10-05T01-59-55_0f25"
 
 
-def test_constructor_missing_mapping_fails(tmp_path):
-    settings, mapping, delivery_path, _, _ = _settings(tmp_path)
-    _init_delivery(delivery_path)
-    with pytest.raises(ResponderError, match="mapping"):
-        Responder(settings, FakeBot(), client=FakeClient())
-
-
-def test_constructor_mapping_permissions_must_be_600(tmp_path):
-    settings, mapping, delivery_path, _, _ = _settings(tmp_path)
-    _write_mapping(mapping, mode=0o644)
-    _init_delivery(delivery_path)
-    with pytest.raises(ResponderError, match="0600"):
-        Responder(settings, FakeBot(), client=FakeClient())
-
-
-def test_constructor_mapping_symlink_rejected(tmp_path):
-    settings, mapping, delivery_path, _, _ = _settings(tmp_path)
-    real = tmp_path / "real.json"
-    _write_mapping(real)
-    try:
-        mapping.symlink_to(real)
-    except OSError:
-        pytest.skip("symlinks unavailable")
-    _init_delivery(delivery_path)
-    with pytest.raises(ResponderError, match="symlink"):
-        Responder(settings, FakeBot(), client=FakeClient())
-
-
-def test_constructor_mapping_title_mismatch(tmp_path):
-    settings, mapping, delivery_path, _, _ = _settings(tmp_path)
-    _write_mapping(mapping, title="other-session")
-    _init_delivery(delivery_path)
-    with pytest.raises(ResponderError, match="title"):
-        Responder(settings, FakeBot(), client=FakeClient())
-
-
-def test_constructor_mapping_invalid_sid(tmp_path):
-    settings, mapping, delivery_path, _, _ = _settings(tmp_path)
-    _write_mapping(mapping, sid="not-a-sid")
-    # Path stem check would also fail; SID grammar is the first gate.
-    _init_delivery(delivery_path, sid=FAKE_SID)
-    with pytest.raises(ResponderError):
-        Responder(settings, FakeBot(), client=FakeClient())
-
-
-def test_constructor_mapping_path_mismatch_without_opening_session(tmp_path):
-    settings, mapping, delivery_path, _, _ = _settings(tmp_path)
-    data = {
-        "native_id": FAKE_SID,
-        "title": "discord-main",
-        "audit_label": "discord-main",
-        "created_at": "2026-01-02T03:04:05+00:00",
-        "path": "/tmp/fake-sessions/2026-01-03T00-00-00_ffff.jsonl",
-    }
-    mapping.write_text(json.dumps(data), encoding="utf-8")
-    os.chmod(mapping, 0o600)
-    _init_delivery(delivery_path)
-    with pytest.raises(ResponderError, match="path"):
-        Responder(settings, FakeBot(), client=FakeClient())
-    # Nonexistent session file with correct stem still constructs (never opened).
-    data["path"] = f"/tmp/definitely-missing/{FAKE_SID}.jsonl"
-    mapping.write_text(json.dumps(data), encoding="utf-8")
-    os.chmod(mapping, 0o600)
-    inst = Responder(settings, FakeBot(), client=FakeClient())
-    assert inst.native_sid == FAKE_SID
-
-
-def test_constructor_unknown_mapping_keys_ignored(tmp_path):
-    settings, mapping, delivery_path, _, _ = _settings(tmp_path)
-    _write_mapping(mapping, extra={"_future": {"x": 1}, "note": "keep"})
-    _init_delivery(delivery_path)
-    inst = Responder(settings, FakeBot(), client=FakeClient())
-    assert inst.native_sid == FAKE_SID
-
-
-def test_constructor_journal_sid_mismatch(tmp_path):
-    settings, mapping, delivery_path, _, _ = _settings(tmp_path)
-    _write_mapping(mapping, sid=FAKE_SID)
-    _init_delivery(delivery_path, sid="2026-01-03T00-00-00_ffff")
-    with pytest.raises(ResponderError, match="mismatch"):
+def test_constructor_invalid_stored_sid_fails(tmp_path):
+    settings, delivery_path, _, _ = _settings(tmp_path)
+    _init_delivery(delivery_path, sid="not-a-sid")
+    with pytest.raises(ResponderError, match="native_session_id invalid"):
         Responder(settings, FakeBot(), client=FakeClient())
 
 
 def test_constructor_missing_journal_fails_without_reset(tmp_path):
-    settings, mapping, delivery_path, _, _ = _settings(tmp_path)
-    _write_mapping(mapping)
+    settings, delivery_path, _, _ = _settings(tmp_path)
     with pytest.raises(DeliveryError, match="missing"):
         Responder(settings, FakeBot(), client=FakeClient())
     assert not delivery_path.exists()
 
 
 def test_constructor_builds_client_with_settings_url_timeout(tmp_path):
-    settings, mapping, delivery_path, _, _ = _settings(tmp_path)
-    _write_mapping(mapping)
+    settings, delivery_path, _, _ = _settings(tmp_path)
     _init_delivery(delivery_path)
     inst = Responder(settings, FakeBot(), client=None)
     assert isinstance(inst._client, ThycaClient)
     assert inst._client.base_url == settings.thyca_base_url
     assert inst._client.request_timeout_seconds == settings.thyca_request_timeout_seconds
-
 
 # -- prompt builder --
 
@@ -903,7 +826,7 @@ def test_guard_ack_allows_safe_rejects_beyond(tmp_path):
             "reason": "operator_approved_drop",
         },
     ]
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(
+    inst, _, delivery_path, outbox_path, state_path = _responder(
         tmp_path, baseline=21, historical={FAKE_CHANNEL: historical}, skips=skips
     )
     # Seed outbox seq 22..24 with matching MIDs (state starts at 21).
@@ -921,13 +844,13 @@ def test_guard_ack_allows_safe_rejects_beyond(tmp_path):
 
 
 def test_guard_ack_noop_below_acked(tmp_path):
-    inst, _, _, _, outbox_path, state_path = _responder(tmp_path)
+    inst, _, _, outbox_path, state_path = _responder(tmp_path)
     append_entry(outbox_path, state_path, **_entry_fields())
     inst.guard_ack(0)  # at/below acked is a no-op
 
 
 def test_correlated_job_ok_and_validates(tmp_path):
-    inst, _, _, delivery_path, _, _ = _responder(tmp_path)
+    inst, _, delivery_path, _, _ = _responder(tmp_path)
     mid = 820000000000000001
     enqueue_job(
         delivery_path,
@@ -951,7 +874,7 @@ def test_correlated_job_ok_and_validates(tmp_path):
 
 
 def test_correlated_job_rejects_terminal(tmp_path):
-    inst, _, _, delivery_path, _, _ = _responder(tmp_path)
+    inst, _, delivery_path, _, _ = _responder(tmp_path)
     mid = 820000000000000002
     enqueue_job(
         delivery_path,
@@ -984,7 +907,7 @@ async def _busy_snapshot(sid, expected_title):
 async def test_tick_filters_own_bot_and_other_bot_no_name_heuristic(tmp_path):
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    inst, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
     # Own bot UID with human-looking name + misleading content claim.
     append_entry(
         outbox_path,
@@ -1028,7 +951,7 @@ async def test_tick_unknown_flag_fetches_actual_bot(tmp_path):
     bot = FakeBot(members=members)
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(
+    inst, _, delivery_path, outbox_path, state_path = _responder(
         tmp_path, bot=bot, client=client
     )
     # Legacy records: no author_is_bot key at all.
@@ -1058,7 +981,7 @@ async def test_tick_unknown_unresolvable_marks_uncertain_holds_ack(tmp_path):
     bot = FakeBot(members={}, users={})
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(
+    inst, _, delivery_path, outbox_path, state_path = _responder(
         tmp_path, bot=bot, client=client
     )
     append_entry(
@@ -1076,7 +999,7 @@ async def test_tick_unknown_unresolvable_marks_uncertain_holds_ack(tmp_path):
 async def test_tick_out_of_scope_skipped_no_post(tmp_path):
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, settings, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    inst, settings, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
     other_channel = FAKE_CHANNEL + 99
     fields = _entry_fields(message_id=833000000000000001, channel_id=other_channel)
     append_entry(outbox_path, state_path, **fields)
@@ -1091,7 +1014,7 @@ async def test_tick_out_of_scope_skipped_no_post(tmp_path):
 async def test_tick_empty_content_queues_normal(tmp_path):
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    inst, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
     append_entry(
         outbox_path,
         state_path,
@@ -1128,7 +1051,7 @@ async def test_tick_historical_and_skips_no_post_new_queues(tmp_path):
     ]
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(
+    inst, _, delivery_path, outbox_path, state_path = _responder(
         tmp_path, client=client, baseline=21, historical={FAKE_CHANNEL: [hist_mid]}, skips=skips
     )
     state_path.write_text(json.dumps({"seq": 21, "acked": 21, "poll": {}}) + "\n", encoding="utf-8")
@@ -1157,7 +1080,7 @@ async def test_tick_historical_and_skips_no_post_new_queues(tmp_path):
 async def test_tick_busy_snapshot_no_post_job_stays_queued(tmp_path):
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    inst, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
     append_entry(outbox_path, state_path, **_entry_fields(author_is_bot=False))
     result = await inst.tick()
     assert client.submit_calls == []
@@ -1195,7 +1118,7 @@ async def test_tick_snapshot_errors_share_bounded_payload_no_post(tmp_path):
         client.snapshot_fn = _fail
         case_dir = tmp_path / f"case{idx}"
         case_dir.mkdir()
-        inst, _, _, delivery_path, outbox_path, state_path = _responder(case_dir, client=client)
+        inst, _, delivery_path, outbox_path, state_path = _responder(case_dir, client=client)
         append_entry(outbox_path, state_path, **_entry_fields(author_is_bot=False))
         result = await inst.tick()
         # Snapshot attempted once on the same SID, but no POST ever fires.
@@ -1228,7 +1151,7 @@ async def test_tick_snapshot_errors_share_bounded_payload_no_post(tmp_path):
 async def test_tick_fifo_first_pending_blocks_second(tmp_path):
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    inst, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
     append_entry(
         outbox_path, state_path, **_entry_fields(message_id=836000000000000001, author_is_bot=False)
     )
@@ -1252,7 +1175,7 @@ async def test_tick_fifo_first_pending_blocks_second(tmp_path):
 async def test_tick_gap_legal_advances_past_completed(tmp_path):
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    inst, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
     # Manually craft a log gap: seq 1 then seq 5 (crash gap 2..4 is legal).
     state_path.write_text(json.dumps({"seq": 5, "acked": 0, "poll": {}}) + "\n", encoding="utf-8")
     rec1 = {
@@ -1282,7 +1205,7 @@ async def test_tick_no_raw_canary_in_errors_or_state(tmp_path):
     canary = "CANARY_RESPONDER_BODY_9f8e7d6c5b4a"
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    inst, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
     append_entry(
         outbox_path,
         state_path,
@@ -1302,7 +1225,7 @@ async def test_tick_no_raw_canary_in_errors_or_state(tmp_path):
 
 
 async def test_close_marks_midflight_uncertain_queued_stays(tmp_path):
-    inst, _, _, delivery_path, _, _ = _responder(tmp_path)
+    inst, _, delivery_path, _, _ = _responder(tmp_path)
     mid_q = 839000000000000001
     mid_s = 839000000000000002
     mid_i = 839000000000000003
@@ -1328,7 +1251,7 @@ async def test_close_marks_midflight_uncertain_queued_stays(tmp_path):
 
 async def test_restart_uncertain_idle_without_proof_not_resubmit(tmp_path):
     client = FakeClient()
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    inst, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
     mid = 840000000000000001
     append_entry(outbox_path, state_path, **_entry_fields(message_id=mid, author_is_bot=False))
     # Simulate a prior timeout: queued -> uncertain (old core, no fingerprint).
@@ -1348,7 +1271,7 @@ async def test_restart_uncertain_idle_without_proof_not_resubmit(tmp_path):
 
 
 async def test_tick_corrupt_outbox_fails_without_reset(tmp_path):
-    inst, _, _, _, outbox_path, state_path = _responder(tmp_path)
+    inst, _, _, outbox_path, state_path = _responder(tmp_path)
     append_entry(outbox_path, state_path, **_entry_fields())
     outbox_path.write_text("oops\n", encoding="utf-8")
     before = outbox_path.read_bytes()
@@ -1358,7 +1281,7 @@ async def test_tick_corrupt_outbox_fails_without_reset(tmp_path):
 
 
 async def test_tick_busy_guard_prevents_overlap(tmp_path):
-    inst, _, _, _, outbox_path, state_path = _responder(tmp_path)
+    inst, _, _, outbox_path, state_path = _responder(tmp_path)
     append_entry(outbox_path, state_path, **_entry_fields(author_is_bot=False))
     inst._busy = True
     try:
@@ -1374,7 +1297,7 @@ async def test_tick_busy_guard_prevents_overlap(tmp_path):
 
 async def test_owner_human_message_one_post_same_sid_completes(tmp_path):
     mid = 850000000000000001
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("A single reply",))
     inst = Responder(settings, FakeBot(), client=client)
     append_entry(outbox_path, state_path, **_entry_fields(message_id=mid, author_is_bot=False))
@@ -1403,7 +1326,7 @@ async def test_owner_human_message_one_post_same_sid_completes(tmp_path):
 
 async def test_two_chunks_two_intents_receipts_tool_ids(tmp_path):
     mid = 850000000000000002
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path, source_mid=mid, chunks=("chunk one", "chunk two")
     )
@@ -1425,7 +1348,7 @@ async def test_two_chunks_two_intents_receipts_tool_ids(tmp_path):
 async def test_post_await_keeps_loop_live_for_capture_and_sdk(tmp_path):
     mid = 850000000000000003
     mid2 = 850000000000000004
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     incoming: dict = {}
 
     async def during_post(_text):
@@ -1480,7 +1403,7 @@ async def test_post_await_keeps_loop_live_for_capture_and_sdk(tmp_path):
 
 async def test_other_human_uid_prompt_kind_other_no_owner_disclosure(tmp_path):
     mid = 851000000000000001
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path, source_mid=mid, chunks=("Hi back",), pre_max=None, own_index=0
     )
@@ -1534,7 +1457,7 @@ async def test_other_human_uid_prompt_kind_other_no_owner_disclosure(tmp_path):
 
 async def test_alias_realtime_poll_one_post_receipt_ack_prefix(tmp_path):
     mid = 852000000000000001
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("One reply",))
     inst = Responder(settings, FakeBot(), client=client)
     append_entry(outbox_path, state_path, **_entry_fields(message_id=mid, author_is_bot=False))
@@ -1575,7 +1498,7 @@ async def test_historical_skips_then_new_completes_on_later_ticks(tmp_path):
             "reason": "operator_approved_drop",
         },
     ]
-    settings, _, delivery_path, outbox_path, state_path = _prepare(
+    settings, delivery_path, outbox_path, state_path = _prepare(
         tmp_path, baseline=21, historical={FAKE_CHANNEL: [hist_mid]}, skips=skips
     )
     client, mcp, seen = wire_auto_turn(
@@ -1613,7 +1536,7 @@ async def test_historical_skips_then_new_completes_on_later_ticks(tmp_path):
 
 async def test_busy_409_zero_intents_requeues_then_fresh_nonce_completes(tmp_path):
     mid = 854000000000000001
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -1649,7 +1572,7 @@ async def test_busy_409_zero_intents_requeues_then_fresh_nonce_completes(tmp_pat
 
 async def test_busy_with_candidate_intent_uncertain_never_retried(tmp_path):
     mid = 854000000000000002
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -1678,7 +1601,7 @@ async def test_running_true_queues_without_post(tmp_path):
     # Covered behaviorally: native running -> no POST, job stays queued.
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    inst, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
     append_entry(outbox_path, state_path, **_entry_fields(author_is_bot=False))
     result = await inst.tick()
     assert client.submit_calls == []
@@ -1692,7 +1615,7 @@ async def test_running_true_queues_without_post(tmp_path):
 
 async def test_timeout_late_sdk_receipt_then_exact_trace_completes_once(tmp_path):
     mid = 855000000000000001
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -1724,7 +1647,7 @@ async def test_timeout_late_sdk_receipt_then_exact_trace_completes_once(tmp_path
 
 async def test_timeout_idle_alone_not_proof_no_repost_no_ack(tmp_path):
     mid = 855000000000000002
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -1745,7 +1668,7 @@ async def test_timeout_idle_alone_not_proof_no_repost_no_ack(tmp_path):
 
 async def test_repeat_uncertain_tick_no_mutation_no_crash(tmp_path):
     mid = 855000000000000003
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -1775,7 +1698,7 @@ async def test_repeat_uncertain_tick_no_mutation_no_crash(tmp_path):
 
 async def test_cancellation_persists_durable_unknown_and_propagates(tmp_path):
     mid = 856000000000000001
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
 
     async def hang(_text):
         await asyncio.Event().wait()  # HTTP await hangs until cancelled
@@ -1804,7 +1727,7 @@ async def test_cancellation_persists_durable_unknown_and_propagates(tmp_path):
 
 async def test_oversize_frame_holds_ack_no_post(tmp_path):
     mid = 856000000000000002
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid)
     inst = Responder(settings, FakeBot(), client=client)
     append_entry(
@@ -1824,7 +1747,7 @@ async def test_oversize_frame_holds_ack_no_post(tmp_path):
 
 async def test_no_send_turn_holds_ack_not_complete(tmp_path):
     mid = 856000000000000003
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -1840,7 +1763,7 @@ async def test_no_send_turn_holds_ack_not_complete(tmp_path):
 
 async def test_missing_receipt_holds_ack(tmp_path):
     mid = 856000000000000004
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -1857,7 +1780,7 @@ async def test_missing_receipt_holds_ack(tmp_path):
 
 async def test_native_failed_trace_holds_ack_despite_client_flag(tmp_path):
     mid = 856000000000000005
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -1876,7 +1799,7 @@ async def test_native_failed_trace_holds_ack_despite_client_flag(tmp_path):
 
 async def test_wrong_input_hash_binds_nothing_holds(tmp_path):
     mid = 856000000000000006
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path, source_mid=mid, trace_input_override="tampered text"
     )
@@ -1892,7 +1815,7 @@ async def test_wrong_input_hash_binds_nothing_holds(tmp_path):
 
 async def test_receipt_mid_mismatch_holds_ack(tmp_path):
     mid = 856000000000000007
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -1908,7 +1831,7 @@ async def test_receipt_mid_mismatch_holds_ack(tmp_path):
 
 async def test_foreign_uncorrelated_manual_sends_hold(tmp_path):
     mid = 856000000000000008
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -1924,7 +1847,7 @@ async def test_foreign_uncorrelated_manual_sends_hold(tmp_path):
 
 async def test_foreign_manual_receipt_without_own_trace_send_holds(tmp_path):
     mid = 856000000000000009
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     # A foreign manual call with the copied job nonce journaled a receipt, but
     # our OWN trace shows only 1 of the 2 sends: hold, never accept.
     client, mcp, seen = wire_auto_turn(
@@ -1949,7 +1872,7 @@ async def test_no_bridge_sdk_send_attribute_access_ever(tmp_path):
             getattr(bot, name)
     # ... and the FULL accepted flow never trips the guard.
     mid = 856000000000000010
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("no bridge",))
     inst = Responder(settings, bot, client=client)
     append_entry(outbox_path, state_path, **_entry_fields(message_id=mid, author_is_bot=False))
@@ -2005,7 +1928,7 @@ def _raw_frame(base_seq, **overrides):
 )
 async def test_corrupt_frame_fails_before_post_no_reset(tmp_path, overrides):
     client = FakeClient()
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    inst, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
     frame = _raw_frame(1, **overrides)
     _write_raw_entries(outbox_path, state_path, [frame])
     before_out = outbox_path.read_bytes()
@@ -2023,7 +1946,7 @@ async def test_absent_bot_flag_resolves_actual_bot_not_assumed_false(tmp_path):
     bot = FakeBot(members=members)
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(
+    inst, _, delivery_path, outbox_path, state_path = _responder(
         tmp_path, bot=bot, client=client
     )
     # Legacy frame (flag absent) whose ACTUAL user is a bot: filtered, and the
@@ -2046,7 +1969,7 @@ async def test_absent_bot_flag_resolves_actual_bot_not_assumed_false(tmp_path):
 
 
 async def test_guard_ack_manual_at_latest_refused_while_pending(tmp_path):
-    inst, _, _, _, outbox_path, state_path = _responder(tmp_path)
+    inst, _, _, outbox_path, state_path = _responder(tmp_path)
     append_entry(outbox_path, state_path, **_entry_fields(author_is_bot=False))
     with pytest.raises(ResponderError, match="safe prefix"):
         inst.guard_ack(1)  # up_to_seq == latest while pending
@@ -2059,7 +1982,7 @@ async def test_guard_ack_manual_at_latest_refused_while_pending(tmp_path):
 def test_guard_ack_gaps_20_22_actual_safe_no_contiguity(tmp_path):
     mid20 = 862000000000000020
     mid22 = 862000000000000022
-    inst, _, _, _, outbox_path, state_path = _responder(
+    inst, _, _, outbox_path, state_path = _responder(
         tmp_path, baseline=19, historical={FAKE_CHANNEL: [mid20, mid22]}
     )
     state_path.write_text(json.dumps({"seq": 22, "acked": 19, "poll": {}}) + "\n", encoding="utf-8")
@@ -2079,7 +2002,7 @@ async def test_alias_known_seq_source_conflict_raises(tmp_path):
     mid = 863000000000000001
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    inst, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
     # Job already recorded from the owner; a redelivered frame with the SAME
     # known seq but a different author must raise (no actor_kind override).
     enqueue_job(
@@ -2104,7 +2027,7 @@ async def test_alias_new_seq_source_conflict_raises(tmp_path):
     mid = 863000000000000002
     client = FakeClient()
     client.snapshot_fn = _busy_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    inst, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
     enqueue_job(
         delivery_path,
         channel_id=FAKE_CHANNEL,
@@ -2132,7 +2055,7 @@ async def test_alias_new_seq_source_conflict_raises(tmp_path):
 
 async def test_binds_own_index_not_later_manual_turn(tmp_path):
     mid = 857000000000000001
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     # After our POST completes, a manual turn makes the LAST user index 3
     # while our auto turn is index 2. The POST result even claims index 3 with
     # stored_match False; the exact request-hash scan must bind 2, not guess.
@@ -2155,7 +2078,7 @@ async def test_binds_own_index_not_later_manual_turn(tmp_path):
 
 async def test_ambiguous_two_matching_indices_hold(tmp_path):
     mid = 857000000000000002
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -2175,7 +2098,7 @@ async def test_ambiguous_two_matching_indices_hold(tmp_path):
 
 async def test_trace_coverage_reports_attempted_succeeded(tmp_path):
     mid = 857000000000000003
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -2194,7 +2117,7 @@ async def test_trace_coverage_reports_attempted_succeeded(tmp_path):
 
 async def test_fresh_session_pre_turn_index_none_binds_actual(tmp_path):
     mid = 857000000000000004
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -2217,7 +2140,7 @@ async def test_privacy_canary_absent_from_journal_and_status(tmp_path):
     canary_user = "USER_CANARY_1a2b3c"
     canary_reply = "REPLY_CANARY_4d5e6f"
     mid = 858000000000000001
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=(canary_reply,))
     inst = Responder(settings, FakeBot(), client=client)
     append_entry(
@@ -2237,7 +2160,7 @@ async def test_privacy_canary_absent_from_journal_and_status(tmp_path):
 async def test_privacy_error_body_canary_never_leaks(tmp_path):
     canary_body = "RAWHTTP_CANARY_7g8h9i"
     mid = 858000000000000002
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid)
 
     async def raw_error(sid, text, model, effort):
@@ -2265,7 +2188,7 @@ async def test_no_raw_user_or_reply_text_in_completed_journal(tmp_path):
     raw_user = "RAWUSER_001122334455"
     raw_reply = "RAWREPLY_667788990011"
     mid = 858000000000000003
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path, source_mid=mid, chunks=(raw_reply,), pre_max=None, own_index=0
     )
@@ -2294,7 +2217,7 @@ async def test_no_raw_user_or_reply_text_in_completed_journal(tmp_path):
 @pytest.mark.parametrize("title_match", [True, False, None])
 async def test_sid_pinned_title_ignored_completes(tmp_path, title_match):
     mid = 870000000000000001
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("SID pinned reply",))
     orig_snapshot = seen["snapshot_fn"]
 
@@ -2336,7 +2259,7 @@ async def test_sid_pinned_title_ignored_completes(tmp_path, title_match):
 @pytest.mark.parametrize("title_match", [True, False, None])
 async def test_sid_pinned_title_ignored_restart_reconcile_completes(tmp_path, title_match):
     mid = 870000000000000002
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -2400,7 +2323,7 @@ async def test_sid_mismatch_before_post_blocks_no_post(tmp_path):
         }
 
     client.snapshot_fn = mismatch_snapshot
-    inst, _, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
+    inst, _, delivery_path, outbox_path, state_path = _responder(tmp_path, client=client)
     append_entry(outbox_path, state_path, **_entry_fields(author_is_bot=False))
     result = await inst.tick()
     assert result["status"] == "pending" and result["reason"] == "snapshot_mismatch"
@@ -2418,7 +2341,7 @@ async def test_sid_mismatch_before_post_blocks_no_post(tmp_path):
 
 async def test_sid_mismatch_after_post_holds_uncertain(tmp_path):
     mid = 870000000000000003
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("reply",))
     orig_snapshot = seen["snapshot_fn"]
     calls = {"n": 0}
@@ -2452,7 +2375,7 @@ async def test_sid_mismatch_after_post_holds_uncertain(tmp_path):
 
 async def test_sid_mismatch_restart_reconcile_holds_no_repost(tmp_path):
     mid = 870000000000000004
-    settings, _, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
     client, mcp, seen = wire_auto_turn(
         delivery_path,
         source_mid=mid,
@@ -2482,3 +2405,645 @@ async def test_sid_mismatch_restart_reconcile_holds_no_repost(tmp_path):
         assert expected_title is None
     assert get_job(delivery_path, FAKE_CHANNEL, mid)["stage"] == "uncertain"
     assert r2["acked"] == 0
+
+
+# == target-bot DM adoption (DM-only routing, no mapping file) ==
+
+DM_SID = "2026-03-04T05-06-07_cd34"
+DM_DAY = "2026-03-04"
+
+
+async def test_adopt_first_tick_converges_empty_journal_to_dm(tmp_path, capsys):
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client = FakeClient(dm_sid=DM_SID)
+    inst = Responder(settings, FakeBot(), client=client, session_day_provider=lambda: DM_DAY)
+    assert inst.native_sid == FAKE_SID
+    result = await inst.tick()
+    assert result["status"] == "idle"
+    assert client.dm_calls == ["march7th"]
+    assert inst.native_sid == DM_SID
+    state = delivery.load_delivery_state(delivery_path)
+    assert state["native_session_id"] == DM_SID
+    assert state["native_sessions"] == {DM_DAY: DM_SID}
+    assert "adopted target bot DM session" in capsys.readouterr().err
+
+
+async def test_adopt_queued_job_submits_to_dm_sid_with_no_bot_field(tmp_path):
+    mid = 850000000000000101
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("A single reply",))
+    client.dm_sid = DM_SID
+    inst = Responder(settings, FakeBot(), client=client, session_day_provider=lambda: DM_DAY)
+    append_entry(outbox_path, state_path, **_entry_fields(message_id=mid, author_is_bot=False))
+    result = await inst.tick()
+    assert result["status"] == "completed"
+    assert len(client.submit_calls) == 1
+    sid, text, model, effort = client.submit_calls[0]
+    # The turn posts into the DM session; no routing field is needed.
+    assert sid == DM_SID
+    assert model is None and effort is None
+    job = get_job(delivery_path, FAKE_CHANNEL, mid)
+    assert job["stage"] == "completed"
+    state = delivery.load_delivery_state(delivery_path)
+    assert state["native_session_id"] == DM_SID
+
+
+async def test_adopt_defers_whole_tick_when_job_inflight(tmp_path, capsys):
+    mid = 850000000000000102
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    append_entry(outbox_path, state_path, **_entry_fields(message_id=mid, author_is_bot=False))
+    client = FakeClient(dm_sid=DM_SID)
+    inst = Responder(settings, FakeBot(), client=client, session_day_provider=lambda: DM_DAY)
+    # Advance the job to a mid-flight stage with zero evidence: the DM
+    # adopt must wait for the CURRENT session's reconcile first.
+    enqueue_job(
+        delivery_path,
+        channel_id=FAKE_CHANNEL,
+        message_id=mid,
+        author_uid=FAKE_OWNER,
+        actor_kind="owner",
+        seq=1,
+    )
+    delivery.bind_jev_decision(
+        delivery_path,
+        FAKE_CHANNEL,
+        mid,
+        context_sha256="ab" * 32,
+        attempt_id="cd" * 16,
+        model="jev-1.13.0",
+        participation="respond",
+    )
+    delivery.mark_turn_submitting(
+        delivery_path,
+        FAKE_CHANNEL,
+        mid,
+        job_ref="ef" * 16,
+        pre_turn_index=None,
+        submitted_text_sha256="12" * 32,
+        submitted_text_len=10,
+    )
+    delivery.mark_inflight(delivery_path, FAKE_CHANNEL, mid, turn_index=3)
+    result = await inst.tick()
+    assert result["status"] == "pending" and result["reason"] == "target_dm_blocked"
+    assert client.submit_calls == []
+    assert inst.native_sid == FAKE_SID
+    state = delivery.load_delivery_state(delivery_path)
+    assert state["native_session_id"] == FAKE_SID
+    assert "target DM adoption deferred" in capsys.readouterr().err
+
+
+async def test_adopt_transient_dm_failure_defers_without_job_mutation(tmp_path):
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client = FakeClient()
+    client.dm_fn = _raise_transient
+    inst = Responder(settings, FakeBot(), client=client, session_day_provider=lambda: DM_DAY)
+    result = await inst.tick()
+    assert result["status"] == "pending" and result["reason"] == "target_dm_deferred"
+    assert client.submit_calls == [] and client.snapshot_calls == []
+    assert inst.native_sid == FAKE_SID
+
+
+async def _raise_transient(bot_id):
+    raise ThycaSubmissionUncertainError(reason="timeout")
+
+
+async def test_adopt_unknown_bot_404_fails_closed(tmp_path):
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client = FakeClient()
+
+    async def _missing(bot_id):
+        raise ThycaPreconditionError(status_code=404, reason="http_404")
+
+    client.dm_fn = _missing
+    inst = Responder(settings, FakeBot(), client=client, session_day_provider=lambda: DM_DAY)
+    with pytest.raises(ResponderError, match="target bot DM missing"):
+        await inst.tick()
+
+
+async def test_snapshot_404_holds_pending_then_next_tick_adopts_recreated_dm(tmp_path):
+    mid = 850000000000000103
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("A single reply",))
+    # First tick: serving DM itself is verifiably gone -> pending, no POST.
+    client.dm_sid = DM_SID
+
+    async def _gone_snapshot(sid, expected_title=None):
+        raise ThycaPreconditionError(status_code=404, reason="http_404")
+
+    client.snapshot_fn = _gone_snapshot
+    inst = Responder(settings, FakeBot(), client=client, session_day_provider=lambda: DM_DAY)
+    append_entry(outbox_path, state_path, **_entry_fields(message_id=mid, author_is_bot=False))
+    first = await inst.tick()
+    assert first["status"] == "pending" and first["reason"] == "snapshot_gone"
+    assert client.submit_calls == []
+    # Adoption already converged before the snapshot proved the DM gone.
+    assert inst.native_sid == DM_SID
+    assert delivery.load_delivery_state(delivery_path)["native_session_id"] == DM_SID
+    # Next tick: the DM was recreated natively under a new SID -> adopt + submit.
+    recreated = "2026-03-05T06-07-08_ef56"
+    client.dm_sid = recreated
+    client.snapshot_fn = seen["snapshot_fn"]
+    second = await inst.tick()
+    assert second["status"] == "completed"
+    assert client.submit_calls and client.submit_calls[0][0] == recreated
+    assert inst.native_sid == recreated
+
+
+# == edited-message frames: latest captured frame binds ==
+
+
+def _edited_content_collector(owner_uid, bot_uid, content, sender_uid=None):
+    """Snapshot from live Discord state: always the current message text."""
+
+    async def collect(entry):
+        mid = entry["message_id"]
+        author = sender_uid if sender_uid is not None else entry["author_uid"]
+        parts = [
+            {"uid": str(owner_uid), "display_name": "Owner"},
+            {"uid": str(bot_uid), "display_name": "Bot"},
+        ]
+        if str(author) not in (str(owner_uid), str(bot_uid)):
+            parts.append({"uid": str(author), "display_name": "Rando"})
+        return {
+            "assistant_uid": str(bot_uid),
+            "owner_uid": str(owner_uid),
+            "participants": parts,
+            "messages": [{"id": str(mid), "sender_uid": str(author), "text": content}],
+            "new_message_id": str(mid),
+        }
+
+    return collect
+
+
+async def test_edited_message_latest_frame_binds_and_submits(tmp_path):
+    """Stale first frame + edited alias: the EDITED frame binds, POST runs.
+
+    Regression: the source message was edited after capture, so the live
+    snapshot carries the edited text. Selecting the first frame pended on
+    context_mismatch forever; the latest frame matches and submits."""
+    mid = 853000000000000001
+    stale = "nắng mua là chuyện của trời"
+    edited = "nắng mưa là chuyện của trời"
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("Got it",))
+    inst = Responder(
+        settings,
+        FakeBot(),
+        client=client,
+        context_collector=_edited_content_collector(FAKE_OWNER, FAKE_BOT, edited),
+    )
+    append_entry(
+        outbox_path, state_path,
+        **_entry_fields(message_id=mid, content=stale, author_is_bot=False),
+    )
+    append_entry(
+        outbox_path, state_path,
+        **_entry_fields(message_id=mid, content=edited, author_is_bot=False),
+    )
+    result = await inst.tick()
+    assert result["status"] == "completed"
+    assert len(client.submit_calls) == 1  # one POST, not a forever-pending head
+    job = get_job(delivery_path, FAKE_CHANNEL, mid)
+    assert job["stage"] == "completed"
+    assert job["seq"] == 1 and job["seq_aliases"] == [2]
+    assert result["acked"] == 2
+
+
+async def test_nontext_mismatch_still_pends_without_post(tmp_path):
+    """Sender mismatch is NOT rebound: pending, zero POST.
+
+    The live-frame rebind fires only when the SOLE mismatch is the
+    message text. A snapshot naming a different sender keeps pending
+    on context_mismatch exactly as before -- no loosening."""
+    mid = 853000000000000102
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("Got it",))
+    inst = Responder(
+        settings,
+        FakeBot(),
+        client=client,
+        context_collector=_edited_content_collector(
+            FAKE_OWNER, FAKE_BOT, "live text", sender_uid=999000000000000999
+        ),
+    )
+    append_entry(
+        outbox_path, state_path,
+        **_entry_fields(message_id=mid, content="captured text", author_is_bot=False),
+    )
+    result = await inst.tick()
+    assert result["status"] == "pending" and result["reason"] == "context_mismatch"
+    assert client.submit_calls == []
+    assert get_job(delivery_path, FAKE_CHANNEL, mid)["stage"] == "queued"
+
+
+async def test_edited_source_without_new_frame_rebinds_live_text_and_submits(tmp_path):
+    """Stale single frame + live-edited source: rebind to live text, POST runs.
+
+    Regression (seq-593 class, no re-capture): the source was edited but the
+    poll window never re-captured it, so the only outbox frame holds the
+    pre-edit text while the live snapshot carries the edited text. Binding
+    against the frozen frame pended on context_mismatch forever; rebinding
+    to the live frame (local copy only, stored outbox untouched) submits."""
+    mid = 853000000000000101
+    old = "nắng mua là chuyện của trời"
+    live = "nắng mưa là chuyện của trời"
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("Got it",))
+    inst = Responder(
+        settings,
+        FakeBot(),
+        client=client,
+        context_collector=_edited_content_collector(FAKE_OWNER, FAKE_BOT, live),
+    )
+    append_entry(
+        outbox_path, state_path,
+        **_entry_fields(message_id=mid, content=old, author_is_bot=False),
+    )
+    result = await inst.tick()
+    assert result["status"] == "completed"
+    assert len(client.submit_calls) == 1  # one POST, not a forever-pending head
+    assert live in seen["texts"][0] and old not in seen["texts"][0]
+    job = get_job(delivery_path, FAKE_CHANNEL, mid)
+    assert job["stage"] == "completed"
+
+
+async def test_deleted_source_inflight_zero_evidence_reaches_skipped(tmp_path):
+    """Proven-deleted source mid-flight with zero sends reaches skipped.
+
+    Regression: recovery never consults the source itself and the MCP
+    pre-send gate only fires on send attempts, so a job whose source was
+    deleted while turn_submitting/inflight with zero send evidence
+    stranded uncertain (FIFO head blocked) instead of the durable
+    source_deleted skip. The tick-time proven-no-send gate converges it.
+    """
+    from source_messages import SourceDeleted
+
+    mid = 854000000000000001
+    job_ref = "ef" * 16
+    fp_sha = "ab" * 32
+    fp_len = 64
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    enqueue_job(
+        delivery_path,
+        channel_id=FAKE_CHANNEL,
+        message_id=mid,
+        author_uid=FAKE_OWNER,
+        actor_kind="owner",
+        seq=1,
+    )
+    delivery.mark_turn_submitting(
+        delivery_path,
+        FAKE_CHANNEL,
+        mid,
+        job_ref=job_ref,
+        pre_turn_index=2,
+        submitted_text_sha256=fp_sha,
+        submitted_text_len=fp_len,
+    )
+    delivery.mark_inflight(delivery_path, FAKE_CHANNEL, mid, turn_index=3)
+    client = FakeClient()
+
+    async def matching_trace(sid, idx, job_ref, source_mid_arg, channel_arg, guild_arg):
+        assert (sid, idx, job_ref, source_mid_arg, channel_arg) == (
+            FAKE_SID, 3, "ef" * 16, mid, FAKE_CHANNEL,
+        )
+        return {
+            "request_input_sha256": fp_sha,
+            "request_input_len": fp_len,
+            "status": "completed",
+            "error_present": False,
+            "trace_session_match": True,
+            "turn_index_match": True,
+            "request_user_count": 1,
+            "all_sends_confirmed": True,
+            "legacy_uncorrelated_count": 0,
+            "sends": [],
+            "observation_calls": [],
+        }
+
+    client.trace_fn = matching_trace
+
+    async def gone(cid, _mid):
+        raise SourceDeleted("gone")
+
+    inst = Responder(settings, FakeBot(), client=client, source_checker=gone)
+    result = await inst.tick()
+    assert result == {"status": "skipped", "reason": "source_deleted",
+                      "safe_prefix": 0, "acked": 0, "latest": 0}
+    job = get_job(delivery_path, FAKE_CHANNEL, mid)
+    assert job["stage"] == "skipped" and job["skip_reason"] == "source_deleted"
+    assert job["send_intents"] == [] and job["send_receipts"] == []
+
+
+async def test_inflight_zero_evidence_live_source_reconciles_unchanged(tmp_path):
+    """Gate fires only on proven deletion: a live source reconciles as before.
+
+    Same mid-flight zero-evidence shape with the source proven existent:
+    no skip is recorded; normal reconcile runs (here uncertain on zero
+    sends, exactly as before the gate)."""
+    mid = 854000000000000002
+    job_ref = "ef" * 16
+    fp_sha = "ab" * 32
+    fp_len = 64
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    enqueue_job(
+        delivery_path,
+        channel_id=FAKE_CHANNEL,
+        message_id=mid,
+        author_uid=FAKE_OWNER,
+        actor_kind="owner",
+        seq=1,
+    )
+    delivery.mark_turn_submitting(
+        delivery_path,
+        FAKE_CHANNEL,
+        mid,
+        job_ref=job_ref,
+        pre_turn_index=2,
+        submitted_text_sha256=fp_sha,
+        submitted_text_len=fp_len,
+    )
+    delivery.mark_inflight(delivery_path, FAKE_CHANNEL, mid, turn_index=3)
+    client = FakeClient()
+
+    async def matching_trace(sid, idx, job_ref, source_mid_arg, channel_arg, guild_arg):
+        return {
+            "request_input_sha256": fp_sha,
+            "request_input_len": fp_len,
+            "status": "completed",
+            "error_present": False,
+            "trace_session_match": True,
+            "turn_index_match": True,
+            "request_user_count": 1,
+            "all_sends_confirmed": True,
+            "legacy_uncorrelated_count": 0,
+            "sends": [],
+            "observation_calls": [],
+        }
+
+    client.trace_fn = matching_trace
+
+    async def live(cid, _mid):
+        return None
+
+    inst = Responder(settings, FakeBot(), client=client, source_checker=live)
+    result = await inst.tick()
+    assert result["status"] == "uncertain" and result["reason"] == "send_count_mismatch"
+    job = get_job(delivery_path, FAKE_CHANNEL, mid)
+    assert job["stage"] == "uncertain"
+    assert job.get("skip_reason") is None
+
+
+def _scripted_collector(owner_uid, bot_uid, scripts):
+    """Collector replaying per-call snapshots: scripts[i] = (text, extras).
+
+    Call i uses scripts[min(i, last)]; extras are extra message dicts
+    appended after the source message (context drift without source change).
+    """
+
+    async def collect(entry):
+        idx = getattr(collect, "_n", 0)
+        collect._n = idx + 1  # type: ignore[attr-defined]
+        text, extras = scripts[min(idx, len(scripts) - 1)]
+        mid = entry["message_id"]
+        author = entry["author_uid"]
+        messages = [{"id": str(mid), "sender_uid": str(author), "text": text}]
+        messages.extend(extras)
+        return {
+            "assistant_uid": str(bot_uid),
+            "owner_uid": str(owner_uid),
+            "participants": [
+                {"uid": str(owner_uid), "display_name": "Owner"},
+                {"uid": str(bot_uid), "display_name": "Bot"},
+            ],
+            "messages": messages,
+            "new_message_id": str(mid),
+        }
+
+    return collect
+
+
+async def test_edit_after_classify_proven_skips_without_post(tmp_path):
+    """E4: refresh text differs from classified text -> skipped, no POST.
+
+    The source was edited between classification and the pre-POST refresh.
+    Same message_id + sender binding, only the text drifted: proven edit,
+    so the job skips instead of answering stale text or pending forever."""
+    mid = 855000000000000001
+    old = "nắng mua là chuyện của trời"
+    live = "nắng mưa là chuyện của trời"
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("Got it",))
+    inst = Responder(
+        settings,
+        FakeBot(),
+        client=client,
+        context_collector=_scripted_collector(FAKE_OWNER, FAKE_BOT, [(old, []), (live, [])]),
+    )
+    append_entry(
+        outbox_path, state_path,
+        **_entry_fields(message_id=mid, content=old, author_is_bot=False),
+    )
+    result = await inst.tick()
+    assert result["status"] == "skipped" and result["reason"] == "source_edited_after_classify"
+    assert client.submit_calls == []
+    job = get_job(delivery_path, FAKE_CHANNEL, mid)
+    assert job["stage"] == "skipped" and job["skip_reason"] == "source_edited_after_classify"
+    assert job["send_intents"] == [] and job["send_receipts"] == []
+    assert result["acked"] == 1  # terminal skip advances the safe prefix
+
+
+async def test_edit_after_classify_drift_only_still_pends(tmp_path):
+    """E4: source text unchanged, window drifted -> pending, NOT skipped.
+
+    Only the fingerprint moved (another message entered the window); the
+    classified source text is intact. Not a proven edit: pending exactly
+    as today, no POST, job stays queued."""
+    mid = 855000000000000002
+    text = "nắng mưa là chuyện của trời"
+    drift = [{"id": "999", "sender_uid": str(FAKE_OWNER), "text": "later message"}]
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("Got it",))
+    inst = Responder(
+        settings,
+        FakeBot(),
+        client=client,
+        context_collector=_scripted_collector(FAKE_OWNER, FAKE_BOT, [(text, []), (text, drift)]),
+    )
+    append_entry(
+        outbox_path, state_path,
+        **_entry_fields(message_id=mid, content=text, author_is_bot=False),
+    )
+    result = await inst.tick()
+    assert result["status"] == "pending" and result["reason"] == "context_mismatch"
+    assert client.submit_calls == []
+    assert get_job(delivery_path, FAKE_CHANNEL, mid)["stage"] == "queued"
+
+
+class _MismatchLedger:
+    """Ledger stub: classification started elsewhere, now fingerprint-drifted.
+
+    ``stored_fp`` simulates the record fingerprint the real ledger holds
+    for this key (the snapshot the classification bound). ``None`` means
+    the stub has no record lookup (unprovable, keeps pending)."""
+
+    def __init__(self, stored_fp: str | None = None):
+        self.stored_fp = stored_fp
+
+    @property
+    def ledger_id(self) -> str:
+        return "1e" * 16
+
+    def get(self, channel_id, message_id):
+        if self.stored_fp is None:
+            return None
+        return {"fingerprint": self.stored_fp}
+
+    async def classify(self, adapter, state, *, channel_id, message_id, author_uid):
+        from participation import ParticipationPending, ParticipationReason
+
+        raise ParticipationPending(ParticipationReason.CONTEXT_MISMATCH)
+
+
+async def test_edit_after_started_proven_skips_without_post(tmp_path):
+    """E3: ledger started-record mismatch with proven live edit -> skipped.
+
+    The stored frame still holds the pre-edit text while the live snapshot
+    carries the edited text (same id + sender). The stub record holds the
+    fingerprint the classification bound on the captured text, so reverting
+    the live text reproduces it exactly: proven post-classify edit, skip
+    instead of pending forever."""
+    mid = 855000000000000003
+    old = "nắng mua là chuyện của trời"
+    live = "nắng mưa là chuyện của trời"
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("Got it",))
+    plain = _edited_content_collector(FAKE_OWNER, FAKE_BOT, old)
+    snap_x = await plain({"message_id": mid, "author_uid": FAKE_OWNER})
+    inst = Responder(
+        settings,
+        FakeBot(),
+        client=client,
+        context_collector=_edited_content_collector(FAKE_OWNER, FAKE_BOT, live),
+        participation_ledger=_MismatchLedger(stored_fp=context_fingerprint(snap_x)),
+    )
+    append_entry(
+        outbox_path, state_path,
+        **_entry_fields(message_id=mid, content=old, author_is_bot=False),
+    )
+    result = await inst.tick()
+    assert result["status"] == "skipped" and result["reason"] == "source_edited_after_classify"
+    assert client.submit_calls == []
+    job = get_job(delivery_path, FAKE_CHANNEL, mid)
+    assert job["stage"] == "skipped" and job["skip_reason"] == "source_edited_after_classify"
+
+
+async def test_started_mismatch_unproven_still_pends(tmp_path):
+    """E3: ledger mismatch without proven edit -> pending, NOT skipped.
+
+    The live text already matches the stored frame (drift only): nothing
+    proves an edit after classification started, so pending as today."""
+    mid = 855000000000000004
+    text = "nắng mưa là chuyện của trời"
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("Got it",))
+    inst = Responder(
+        settings,
+        FakeBot(),
+        client=client,
+        context_collector=_edited_content_collector(FAKE_OWNER, FAKE_BOT, text),
+        participation_ledger=_MismatchLedger(),
+    )
+    append_entry(
+        outbox_path, state_path,
+        **_entry_fields(message_id=mid, content=text, author_is_bot=False),
+    )
+    result = await inst.tick()
+    assert result["status"] == "pending" and result["reason"] == "context_mismatch"
+    assert client.submit_calls == []
+    assert get_job(delivery_path, FAKE_CHANNEL, mid)["stage"] == "queued"
+
+
+async def test_rebind_then_drift_still_pends_not_skipped(tmp_path):
+    """F1: E2 rebind bound the live text; later pure drift must NOT skip.
+
+    The ledger record holds the fingerprint classified on the live text
+    (via an earlier rebind). A later window drift triggers CONTEXT_MISMATCH,
+    but reverting the live text to the frame text does NOT reproduce the
+    stored fingerprint -- the record was never bound to the frame text.
+    Pending, not skipped: a bare live-text != frame-text comparison would
+    falsely skip here (silent lost reply)."""
+    mid = 855000000000000005
+    old = "nắng mua là chuyện của trời"
+    live = "nắng mưa là chuyện của trời"
+    drift = [{"id": "999", "sender_uid": str(FAKE_OWNER), "text": "later message"}]
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    client, mcp, seen = wire_auto_turn(delivery_path, source_mid=mid, chunks=("Got it",))
+    plain = _edited_content_collector(FAKE_OWNER, FAKE_BOT, live)
+    snap_y = await plain({"message_id": mid, "author_uid": FAKE_OWNER})
+    inst = Responder(
+        settings,
+        FakeBot(),
+        client=client,
+        context_collector=_scripted_collector(FAKE_OWNER, FAKE_BOT, [(live, drift)]),
+        participation_ledger=_MismatchLedger(stored_fp=context_fingerprint(snap_y)),
+    )
+    append_entry(
+        outbox_path, state_path,
+        **_entry_fields(message_id=mid, content=old, author_is_bot=False),
+    )
+    result = await inst.tick()
+    assert result["status"] == "pending" and result["reason"] == "context_mismatch"
+    assert client.submit_calls == []
+    assert get_job(delivery_path, FAKE_CHANNEL, mid)["stage"] == "queued"
+
+
+async def test_blocked_adoption_reconciles_then_converges_next_tick(tmp_path):
+    """F2: jobs-blocked deferral still reconciles the head blocker.
+
+    Tick 1: inflight blocker + deleted source -> adoption deferred, but
+    the reconcile-only pass (no submit, no classify) converges the job to
+    the durable source_deleted skip on the CURRENT sid. Tick 2: nothing
+    blocks adoption anymore -> DM adopted, normal flow resumes."""
+    from source_messages import SourceDeleted
+
+    mid = 855000000000000201
+    settings, delivery_path, outbox_path, state_path = _prepare(tmp_path)
+    append_entry(outbox_path, state_path, **_entry_fields(message_id=mid, author_is_bot=False))
+    enqueue_job(
+        delivery_path,
+        channel_id=FAKE_CHANNEL,
+        message_id=mid,
+        author_uid=FAKE_OWNER,
+        actor_kind="owner",
+        seq=1,
+    )
+    delivery.mark_turn_submitting(
+        delivery_path,
+        FAKE_CHANNEL,
+        mid,
+        job_ref="ef" * 16,
+        pre_turn_index=None,
+        submitted_text_sha256="12" * 32,
+        submitted_text_len=10,
+    )
+    delivery.mark_inflight(delivery_path, FAKE_CHANNEL, mid, turn_index=3)
+    client = FakeClient(dm_sid=DM_SID)
+
+    async def gone(cid, _mid):
+        raise SourceDeleted("gone")
+
+    inst = Responder(
+        settings, FakeBot(), client=client, source_checker=gone,
+        session_day_provider=lambda: DM_DAY,
+    )
+    first = await inst.tick()
+    assert first["status"] == "pending" and first["reason"] == "target_dm_blocked"
+    assert client.submit_calls == []
+    job = get_job(delivery_path, FAKE_CHANNEL, mid)
+    assert job["stage"] == "skipped" and job["skip_reason"] == "source_deleted"
+    assert inst.native_sid == FAKE_SID
+    second = await inst.tick()
+    assert inst.native_sid == DM_SID
+    assert delivery.load_delivery_state(delivery_path)["native_session_id"] == DM_SID
+    assert second["status"] == "idle"

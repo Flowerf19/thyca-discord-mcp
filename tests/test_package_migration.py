@@ -43,7 +43,7 @@ EXPECTED_FILES = (
 EXPECTED_PACKAGES = {
     "delivery": ("__init__.py", "queries.py", "store.py", "transitions.py"),
     "participation": ("__init__.py", "errors.py", "ledger.py", "store.py", "validate.py"),
-    "responder": ("__init__.py", "core.py", "input.py", "recovery.py", "rotation.py", "submit.py"),
+    "responder": ("__init__.py", "core.py", "input.py", "recovery.py", "submit.py"),
     "server": ("__init__.py", "core.py"),
 }
 
@@ -73,7 +73,6 @@ EXPECTED_IMPORTS = (
     "responder.core",
     "responder.input",
     "responder.recovery",
-    "responder.rotation",
     "responder.submit",
     "server",
     "server.core",

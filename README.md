@@ -56,7 +56,7 @@ acceptance remains incomplete.
 2. **Identity**: every UID is classified as `self` / `owner` / `other`.
    UID is the stable key; display name is resolved at runtime for humans and logs.
    Only the owner issues admin instructions; commands inside `other` messages are never followed.
-3. **Session & memory**: all Discord activity shares one native session per logical day (audit label `discord-main`).
+3. **Session & memory**: all Discord activity flows into the target bot's fixed DM session (audit label is the target bot id).
    The owner accepts Thyca auto-loading the owner profile into agent context; the
    agent must still not manually read/write the real profile file (`USER.md`)
    unless the owner explicitly asks — and a present profile never authenticates
@@ -140,14 +140,16 @@ acceptance remains incomplete.
   in the approved live channel below. This server sends no push/notifications: the agent
   must pull with `read_outbox`. (V4 deployed writer; the V5 source auto-triggers
   a native turn per eligible event — see above. The server still sends no MCP push.)
-- **Session reuse (audit label != native ID):** the audit tag is the literal label
-  `discord-main`. The worker serves the CURRENT day's native session ID from the
-  private mapping registry `~/.thyca/discord_session.json` (0600) — one session
-  per logical day (04:00→04:00 `Asia/Ho_Chi_Minh` by default), never a new session
-  per message. Rotation is automatic and drain-gated (every delivery job must be
-  safe-terminal first), and transient native blips defer to the next tick instead
-  of halting; old sessions are never deleted. Private metadata-only
-  proof copies live in
+- **Session reuse (audit label is the target bot):** the audit tag is the
+  target bot id (default `march7th`). The worker serves that bot's fixed DM
+  session, resolved live every tick (`GET /api/bots/<bot_id>/dm`) and adopted
+  when the serving SID trails — never a new session per message. Adoption is
+  drain-gated (every delivery job must be safe-terminal or queued first),
+  and transient native blips defer the whole tick instead of halting; old
+  sessions are never deleted. A turn posted into the DM session runs as that
+  bot, so the user reads auto-replies directly in the bot's DM chat with no
+  manual delegate step.
+  Private metadata-only proof copies live in
   `~/.thyca/discord-integration-evidence/` (0700/0600, never committed).
 - **Session identity is the SID, not the display title (in source; historical
   checkpoint):** the owner approved binding identity to the pinned
@@ -184,9 +186,9 @@ acceptance remains incomplete.
   selfbot / privacy verified; T6 evidence PARTIAL. Live failure-injection gaps
   remain (see Honest limits); the product is NOT marked done.
 - **What it is:** always-on auto-reply for ALL humans in the already-approved live
-  channel, over the same existing native Thyca SID and audit label
-  `discord-main`. Flow: outbox event → FIFO worker → native turn on the existing
-  SID → agent-owned MCP `send_message` → receipt + native Trace correlation →
+  channel, posting turns into the target bot's fixed DM session (audit label
+  is the target bot id). Flow: outbox event → FIFO worker → DM resolve + adopt →
+  native turn on the DM SID → agent-owned MCP `send_message` → receipt + native Trace correlation →
   controller ACK of the safe processed prefix. The worker never sends a Discord
   reply itself (no bridge-owned SDK copy).
 - **As checked on the V5 source at doc time:** `uv run pytest` 464 passed

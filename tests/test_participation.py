@@ -2001,3 +2001,136 @@ def test_ledger_id_readonly_property_no_setter(tmp_path):
     assert len(ledger.ledger_id) == 32
     assert path.read_bytes() == before
     assert "SENTINEL" not in ledger.ledger_id
+
+
+# ---------------------------------------------------------------------------
+# adopt_native_session (DM-only routing: no drain gate, records keep day SIDs)
+# ---------------------------------------------------------------------------
+
+ADOPT_SID = "2026-02-02T01-02-03_bbbb"
+ADOPT_DAY = "2026-02-02"
+
+
+def test_adopt_converges_sid_and_history_retiring_dropped_outgoing(tmp_path):
+    _, path = make_ledger(tmp_path)
+    from participation import adopt_native_session
+
+    snap = adopt_native_session(
+        path,
+        expected_current=FAKE_SID,
+        new_sid=ADOPT_SID,
+        day=ADOPT_DAY,
+        history={ADOPT_DAY: ADOPT_SID},
+    )
+    assert snap["native_session_id"] == ADOPT_SID
+    assert snap["native_sessions"] == {ADOPT_DAY: ADOPT_SID}
+    # FAKE_SID drops out of history (fresh ledger had none): retired.
+    assert snap["retired_sessions"] == [FAKE_SID]
+    # Already-adopted file fails closed (no silent resume).
+    with pytest.raises(ParticipationError, match="native_session_id|mismatch|changed"):
+        adopt_native_session(
+            path,
+            expected_current=FAKE_SID,
+            new_sid=ADOPT_SID,
+            day=ADOPT_DAY,
+            history={ADOPT_DAY: ADOPT_SID},
+        )
+    with pytest.raises(ParticipationError, match="history does not bind"):
+        adopt_native_session(
+            path,
+            expected_current=ADOPT_SID,
+            new_sid=ADOPT_SID,
+            day=ADOPT_DAY,
+            history={ADOPT_DAY: FAKE_SID},
+        )
+
+
+def test_adopt_same_day_overwrite_retires_outgoing_sid(tmp_path):
+    """Same-day DM delete+recreate keeps old records loadable.
+
+    The outgoing SID's only history binding is today; adopting the
+    recreated DM rebinds today, so the outgoing SID must move to
+    retired_sessions (retired-from-service) or the reload under the new
+    SID fails closed on the stranded record."""
+    import asyncio
+
+    from participation import adopt_native_session
+
+    outgoing = "2026-02-02T01-02-03_bbbb"
+    recreated = "2026-02-02T04-05-06_cccc"
+    day = "2026-02-02"
+    ledger, path = make_ledger(tmp_path, sid=outgoing, day=day)
+    state = make_state()
+    adapter = FakeAdapter(success_fn(state))
+    record = asyncio.run(
+        ledger.classify(adapter, state, channel_id=CHANNEL, message_id=100, author_uid=AUTHOR)
+    )
+    assert record["native_session_id"] == outgoing
+    ledger_id_before = ledger.ledger_id
+    snap = adopt_native_session(
+        path,
+        expected_current=outgoing,
+        new_sid=recreated,
+        day=day,
+        history={day: recreated},
+    )
+    assert snap["native_session_id"] == recreated
+    assert snap["retired_sessions"] == [outgoing]
+    # Reload under the new SID succeeds and the old record is intact.
+    reloaded = ParticipationLedger(path, native_sid=recreated, day_provider=DayCtl(day))
+    assert reloaded.ledger_id == ledger_id_before
+    kept = reloaded.get(CHANNEL, 100)
+    assert kept is not None
+    assert kept["native_session_id"] == outgoing
+    assert kept["fingerprint"] == record["fingerprint"]
+    assert kept["attempt_id"] == record["attempt_id"]
+
+
+def test_adopt_outgoing_still_in_history_leaves_retired_untouched(tmp_path):
+    """Multi-day history keeps the outgoing SID: no retire write."""
+    from participation import adopt_native_session
+
+    _, path = make_ledger(tmp_path)
+    snap = adopt_native_session(
+        path,
+        expected_current=FAKE_SID,
+        new_sid=OTHER_SID,
+        day="2026-02-02",
+        history={"2026-01-01": FAKE_SID, "2026-02-02": OTHER_SID},
+    )
+    assert snap["retired_sessions"] == []
+
+
+def test_adopt_readopted_sid_leaves_retired(tmp_path):
+    """A->B->A same-day cycle: A serves again, so it is un-retired.
+
+    Without the drop, the saved file fails closed on next load (current
+    SID must never be retired). Records under both SIDs stay valid via
+    current/history/retired membership."""
+    from participation import ParticipationLedger, adopt_native_session
+
+    day = "2026-02-02"
+    sid_a = "2026-02-02T01-02-03_aaaa"
+    sid_b = "2026-02-02T04-05-06_bbbb"
+    _, path = make_ledger(tmp_path, sid=sid_a, day=day)
+    first = adopt_native_session(
+        path,
+        expected_current=sid_a,
+        new_sid=sid_b,
+        day=day,
+        history={day: sid_b},
+    )
+    assert first["native_session_id"] == sid_b
+    assert first["retired_sessions"] == [sid_a]
+    second = adopt_native_session(
+        path,
+        expected_current=sid_b,
+        new_sid=sid_a,
+        day=day,
+        history={day: sid_a},
+    )
+    assert second["native_session_id"] == sid_a
+    assert second["retired_sessions"] == [sid_b]
+    reloaded = ParticipationLedger(path, native_sid=sid_a, day_provider=DayCtl(day))
+    assert reloaded.ledger_id is not None
+    assert reloaded.summary()["native_session_id"] == sid_a

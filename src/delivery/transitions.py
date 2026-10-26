@@ -457,14 +457,16 @@ def skip_job(
 ) -> dict[str, Any]:
     """Move any non-terminal job -> ``skipped`` with an explicit reason.
 
-    ``source_deleted`` is the proven-no-send gate: it is refused whenever
-    the freshly reloaded job shows ANY send evidence (intents, receipts,
-    or trace refs) or an ``uncertain``/``completed`` stage, so a partly
-    delivered job can never be terminalized as "no send". The idempotent
-    repeat stays valid only with the same reason and zero evidence. All
-    other reasons keep their approved behavior. Only stage/skip_reason/
-    updated_at change; job_ref, fingerprints, aliases, timestamps, and
-    unknown fields are preserved.
+    ``source_deleted`` and ``source_edited_after_classify`` are proven
+    zero-send gates: either is refused whenever the freshly reloaded job
+    shows ANY send evidence (intents, receipts, or trace refs), so a
+    partly delivered job can never be terminalized as "no send". The
+    edited-after-classify reason additionally requires a fresh ``queued``
+    stage (post-bind jobs carry POST evidence semantics, even with zero
+    intents). The idempotent repeat stays valid only with the same reason
+    and zero evidence. All other reasons keep their approved behavior.
+    Only stage/skip_reason/updated_at change; job_ref, fingerprints,
+    aliases, timestamps, and unknown fields are preserved.
     """
     file = Path(path)
     if not isinstance(reason, str) or reason not in SKIP_REASONS:
@@ -472,7 +474,7 @@ def skip_job(
     state = _load_state(file)
     key = _require_job(state, file, channel_id, message_id)
     job = state["jobs"][key]
-    if reason == "source_deleted" and (
+    if reason in ("source_deleted", "source_edited_after_classify") and (
         job["send_intents"] or job["send_receipts"] or job["trace_refs"] is not None
     ):
         raise DeliveryError(f"delivery state {file}: job {key} has send evidence; cannot skip")
@@ -480,6 +482,10 @@ def skip_job(
         if job["skip_reason"] == reason:
             return copy.deepcopy(job)
         raise DeliveryError(f"delivery state {file}: job {key} skip reason mismatch")
+    if reason == "source_edited_after_classify" and job["stage"] != "queued":
+        raise DeliveryError(
+            f"delivery state {file}: job {key} stage {job['stage']} cannot skip as edited"
+        )
     if job["stage"] in ("completed", "uncertain", "observed"):
         raise DeliveryError(f"delivery state {file}: job {key} stage {job['stage']} cannot skip")
     job["skip_reason"] = reason
@@ -870,7 +876,7 @@ def complete_observation(
     return copy.deepcopy(job)
 
 
-def rotate_native_session(
+def adopt_native_session(
     path: str | Path,
     *,
     expected_current: str,
@@ -878,22 +884,27 @@ def rotate_native_session(
     day: str,
     history: dict[str, str],
 ) -> dict[str, Any]:
-    """Adopt a new daily native session; drain-gated, provenance-preserving.
+    """Adopt the target bot DM session; drain-gated, provenance-preserving.
 
-    Daily-rotation commit for the delivery journal. Loads FRESH state and
-    requires, in order:
+    DM-routing commit for the delivery journal. Unlike the old rotation,
+    there is no mapping registry and no trigger job: every tick resolves
+    the DM live and converges here when the serving SID trails. Loads
+    FRESH state and requires, in order:
 
-    1. ``new_sid`` is a strict native SID and ``day`` a real calendar day;
-       ``history`` is a valid day -> SID map with ``history[day] ==
-       new_sid`` and ``expected_current`` among its values (the outgoing
-       SID stays in provenance; never silently dropped).
+    1. ``new_sid`` is a strict native SID and ``day`` a real calendar
+       day; ``history`` is a valid day -> SID map with ``history[day] ==
+       new_sid`` (the outgoing session stays in provenance through the
+       history values; the map is the only registry now).
     2. The stored ``native_session_id`` equals ``expected_current``;
-       anything else (including an already-rotated file) fails loudly --
+       anything else (including an already-adopted file) fails loudly --
        partial multi-file states never silently resume, they fail closed
        for operator recovery.
-    3. EVERY job is safe-terminal (completed/skipped/observed): a queued,
-       mid-flight, or uncertain job refuses rotation, because its future
-       reconcile needs the CURRENT session's native trace.
+    3. EVERY job is safe-terminal or ``queued``: a mid-flight or
+       uncertain job refuses adoption, because its future reconcile
+       needs the CURRENT session's native trace. Queued jobs carry no
+       POST evidence (queued-fresh is schema-enforced at load: no
+       pre/turn index, no intents/receipts, no trace, no submitted
+       fingerprint), so carrying them onto the DM session is safe.
 
     On success the top-level ``native_session_id`` becomes ``new_sid``
     and ``native_sessions`` becomes ``history``; jobs are untouched.
@@ -911,15 +922,13 @@ def rotate_native_session(
         raise DeliveryError(f"delivery state {file}: history does not bind day to new_sid")
     if not isinstance(expected_current, str) or not expected_current:
         raise DeliveryError(f"invalid expected_current for delivery state {file}")
-    if expected_current not in clean_history.values():
-        raise DeliveryError(f"delivery state {file}: history drops the current session")
     state = _load_state(file)
     if state.get("native_session_id") != expected_current:
         raise DeliveryError(f"delivery state {file}: native session mismatch")
     for key, job in state["jobs"].items():
-        if job.get("stage") not in SAFE_TERMINAL_STAGES:
+        if job.get("stage") not in SAFE_TERMINAL_STAGES and job.get("stage") != "queued":
             raise DeliveryError(
-                f"delivery state {file}: job {key} stage {job.get('stage')} blocks rotation"
+                f"delivery state {file}: job {key} stage {job.get('stage')} blocks adoption"
             )
     state["native_session_id"] = new_sid
     state["native_sessions"] = clean_history

@@ -1850,3 +1850,96 @@ async def test_default_transport_fulfilled_length_invalid_json_is_protocol() -> 
         assert _InvalidJsonHandler.hits == ["POST", "GET"]
     finally:
         _stop(server)
+
+
+# ---- get_bot_dm (target-bot DM resolve, DM-only routing) ----
+
+
+def _dm_detail(bot_id: str = "march7th", sid: str = VALID_SID) -> dict:
+    return {
+        "id": sid,
+        "dm": bot_id,
+        "bots": [bot_id],
+        "running": False,
+        "messages": [_msg("user", "hello")],
+    }
+
+
+async def test_get_bot_dm_resolves_fixed_dm_metadata_only() -> None:
+    async def _handler(method: str, url: str, body: bytes | None):  # noqa: ANN001, ANN202
+        assert method == "GET"
+        assert url == f"{BASE}/api/bots/march7th/dm"
+        assert body is None
+        return 200, _json_bytes(_dm_detail())
+
+    client = ThycaClient(BASE, transport=FakeTransport(_handler))
+    dm = await client.get_bot_dm("march7th")
+    assert dm == {
+        "native_sid": VALID_SID,
+        "running": False,
+        "message_count": 1,
+        "proof": "bot_dm",
+    }
+    _assert_no_canary(dm)
+
+
+async def test_get_bot_dm_unknown_bot_404_is_precondition() -> None:
+    async def _handler(method: str, url: str, body: bytes | None):  # noqa: ANN001, ANN202
+        return 404, b""
+
+    client = ThycaClient(BASE, transport=FakeTransport(_handler))
+    with pytest.raises(ThycaPreconditionError) as exc_info:
+        await client.get_bot_dm("nope")
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p.update({"id": "not-a-sid"}),
+        lambda p: p.update({"dm": "other-bot"}),
+        lambda p: p.update({"bots": ["march7th", "other-bot"]}),
+        lambda p: p.update({"bots": []}),
+        lambda p: p.update({"running": "yes"}),
+        lambda p: p.update({"messages": [{"role": "owner"}]}),
+        lambda p: p.update({"messages": "nope"}),
+    ],
+)
+async def test_get_bot_dm_malformed_fails_closed(mutate) -> None:  # noqa: ANN001
+    payload = _dm_detail()
+    mutate(payload)
+
+    async def _handler(method: str, url: str, body: bytes | None):  # noqa: ANN001, ANN202
+        return 200, _json_bytes(payload)
+
+    client = ThycaClient(BASE, transport=FakeTransport(_handler))
+    with pytest.raises(ThycaProtocolError):
+        await client.get_bot_dm("march7th")
+
+
+async def test_get_bot_dm_bad_shape_fails_before_http() -> None:
+    async def _handler(method: str, url: str, body: bytes | None):  # noqa: ANN001, ANN202
+        raise AssertionError("must not call HTTP")
+
+    transport = FakeTransport(_handler)
+    client = ThycaClient(BASE, transport=transport)
+    for bad in ["", "  ", "March7th", "a_b", "-x", "x-", "x y", 5, None]:
+        with pytest.raises(ThycaPreconditionError) as exc_info:
+            await client.get_bot_dm(bad)  # type: ignore[arg-type]
+        assert exc_info.value.field == "bot"
+    assert transport.calls == []
+
+
+async def test_submit_turn_body_has_no_bot_field() -> None:
+    """Turns post into the DM session; no routing field is sent."""
+
+    async def _handler(method: str, url: str, body: bytes | None):  # noqa: ANN001, ANN202
+        assert method == "POST"
+        assert url == f"{BASE}/api/sessions/{VALID_SID}/turn"
+        assert body is not None
+        assert json.loads(body.decode("utf-8")) == {"text": "hello"}
+        return 200, _json_bytes(_session_detail(VALID_SID, "t", False, [_msg("user", "hello")]))
+
+    client = ThycaClient(BASE, transport=FakeTransport(_handler))
+    result = await client.submit_turn(VALID_SID, "  hello  ")
+    assert result["completed"] is True

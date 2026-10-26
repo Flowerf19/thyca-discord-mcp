@@ -21,6 +21,7 @@ orchestrator imports this mixin, not the reverse). ``self`` attributes
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import uuid
 from typing import Any
@@ -40,9 +41,11 @@ from participation import (
 )
 from source_messages import SourceDeleted, SourceUnavailable
 from thyca import (
+    CONTENT_MAX,
     PROMPT_MAX,
     ThycaBusyError,
     ThycaClientError,
+    ThycaPreconditionError,
     ThycaPromptError,
     ThycaSubmissionUncertainError,
     build_conversation_prompt,
@@ -58,6 +61,26 @@ _VALID_PARTICIPATIONS = frozenset({"respond", "observe", "need_context"})
 
 def _sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _source_message_of(projected: Any, message_id: int) -> dict[str, Any] | None:
+    """New-message row of a projected snapshot, or None when unbound.
+
+    Pure lookup by the snapshot's own ``new_message_id`` (never the
+    entry): both edit-proof sites compare classified vs live snapshots
+    through this single shape."""
+    if not isinstance(projected, dict):
+        return None
+    new_id = projected.get("new_message_id")
+    if new_id != str(message_id):
+        return None
+    messages = projected.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("id") == new_id:
+            return msg
+    return None
 
 
 class ResponderSubmitMixin:
@@ -101,16 +124,18 @@ class ResponderSubmitMixin:
 
     def _validate_routing_snapshot(
         self, channel_id: int, message_id: int, snapshot: Any, entry: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any]] | dict[str, Any]:
         """Validate a collected snapshot before any paid call.
 
-        Returns the projected snapshot on success, else a status dict to
-        return (the caller must not proceed). Projection/count/fit failures
-        are collector bugs or necessary-pairs overflow: ``uncertain`` with
-        zero paid call (never truncate bodies). Binding mismatches against
-        the frozen entry are held ``pending`` (edit/race; not reclassified
-        now). Classifier sender/addressee answers are diagnostic only and
-        are never consulted here; only SDK entry metadata authenticates.
+        Returns ``(projected, submit_entry)`` on success, else a status
+        dict to return (the caller must not proceed). Projection/count/fit
+        failures are collector bugs or necessary-pairs overflow:
+        ``uncertain`` with zero paid call (never truncate bodies). A
+        binding mismatch against the frozen entry is held ``pending``
+        (edit/race; not reclassified now) -- except the sole-text
+        live-frame rebind below. Classifier sender/addressee answers are
+        diagnostic only and are never consulted here; only SDK entry
+        metadata authenticates.
         """
         try:
             projected = project_conversation_state(snapshot)
@@ -136,8 +161,18 @@ class ResponderSubmitMixin:
             and projected["owner_uid"] == str(self._settings.owner_uid)
             and projected["assistant_uid"] == str(self._bot_uid())
         )
+        submit_entry = entry
         if not bound:
-            return {"status": "pending", "reason": "context_mismatch"}
+            # Live-frame rebind: the source was edited after its latest
+            # capture, so the live snapshot text differs from the newest
+            # captured frame while every other binding field matches.
+            # Proceed on a LOCAL copy carrying the live text (the stored
+            # outbox is never mutated). Any other mismatch keeps pending
+            # exactly as today -- no silent fallthrough.
+            rebound = self._rebind_live_frame(projected, new_message, entry, message_id)
+            if rebound is None:
+                return {"status": "pending", "reason": "context_mismatch"}
+            submit_entry = rebound
         if len(projected["messages"]) > self._settings.conversation_max_messages:
             skipped = self._source_deleted_status(channel_id, message_id)
             if skipped is not None:
@@ -154,7 +189,7 @@ class ResponderSubmitMixin:
             try:
                 build_conversation_prompt(
                     projected,
-                    entry,
+                    submit_entry,
                     FIT_NONCE,
                     owner_uid=self._settings.owner_uid,
                     guild_id=self._settings.guild_id,
@@ -168,7 +203,140 @@ class ResponderSubmitMixin:
                     return skipped
                 self._mark_uncertain(channel_id, message_id, kind="delivery_unknown")
                 return {"status": "uncertain", "reason": "snapshot_oversize"}
-        return projected
+        return projected, submit_entry
+
+    def _rebind_live_frame(
+        self,
+        projected: dict[str, Any],
+        new_message: dict[str, Any] | None,
+        entry: dict[str, Any],
+        message_id: int,
+    ) -> dict[str, Any] | None:
+        """Rebind to the live snapshot text when it is the sole mismatch.
+
+        The source was edited after its latest capture: message id,
+        sender, owner, and assistant all bind exactly and only the text
+        differs from the newest captured frame. Returns a LOCAL copy of
+        the entry carrying the live text for this submit (the stored
+        outbox is never mutated); returns None when any other field
+        mismatches, so those keep pending exactly as today. The live
+        text must be a non-empty string within the renderer bound --
+        anything else also keeps pending. Downstream proofs need no
+        weakening: the ledger fingerprint already binds the exact live
+        snapshot, and the prompt renderer re-validates entry-vs-snapshot
+        binding on the rebound copy.
+        """
+        if new_message is None:
+            return None
+        if projected.get("new_message_id") != str(message_id):
+            return None
+        if new_message.get("sender_uid") != str(entry.get("author_uid")):
+            return None
+        if projected.get("owner_uid") != str(self._settings.owner_uid):
+            return None
+        if projected.get("assistant_uid") != str(self._bot_uid()):
+            return None
+        live_text = new_message.get("text")
+        if (
+            not isinstance(live_text, str)
+            or not live_text
+            or len(live_text) > CONTENT_MAX
+        ):
+            return None
+        rebound = dict(entry)
+        rebound["content"] = live_text
+        return rebound
+
+    def _proven_edit_after_classify(
+        self,
+        classified: Any,
+        fresh: Any,
+        message_id: int,
+    ) -> bool:
+        """True only when the source text provably changed post-classify.
+
+        Compares the classified snapshot's source message against the
+        refreshed snapshot's source message (same message_id + sender
+        binding, same owner/assistant binding): a text difference is a
+        proven edit after classification started. Any other drift (extra
+        window messages, reply changes, sender/owner drift, missing or
+        non-string text) returns False -- never skip on suspicion.
+        """
+        old = _source_message_of(classified, message_id)
+        new = _source_message_of(fresh, message_id)
+        if old is None or new is None:
+            return False
+        old_sender = old.get("sender_uid")
+        new_sender = new.get("sender_uid")
+        if not isinstance(old_sender, str) or not isinstance(new_sender, str):
+            return False
+        if old_sender != new_sender:
+            return False
+        if fresh.get("owner_uid") != classified.get("owner_uid"):
+            return False
+        if fresh.get("assistant_uid") != classified.get("assistant_uid"):
+            return False
+        old_text = old.get("text")
+        new_text = new.get("text")
+        if not isinstance(old_text, str) or not isinstance(new_text, str):
+            return False
+        return old_text != new_text
+
+    def _proven_edit_since_capture(
+        self,
+        channel_id: int,
+        message_id: int,
+        snapshot: Any,
+        captured_text: Any,
+    ) -> bool:
+        """True only when the ledger-bound text provably differs live.
+
+        The ledger already holds a started/decided record whose
+        fingerprint no longer matches the current snapshot. Rebuild the
+        classification-bound candidate by reverting the live source text
+        to the newest captured frame text and fingerprint it: equality
+        with the record's stored fingerprint proves the record was
+        classified on the captured text and the live text is a
+        post-classify edit. Anything else -- drift the record never saw,
+        a record already bound to the live text (E2 rebind), unparsable
+        shapes, a missing record -- keeps pending. In particular a bare
+        live-text != frame-text comparison is NOT enough on its own, so
+        an E2 rebind followed by pure context drift can never skip here
+        (the forbidden silent lost reply). The stored frame is never
+        mutated. Sender/owner/assistant binding is inherent in the
+        fingerprint equality itself.
+        """
+        if not isinstance(captured_text, str) or not captured_text:
+            return False
+        try:
+            projected_now = project_conversation_state(snapshot)
+        except ConversationError:
+            return False
+        now = _source_message_of(projected_now, message_id)
+        if now is None:
+            return False
+        now_text = now.get("text")
+        if not isinstance(now_text, str) or now_text == captured_text:
+            return False
+        get_record = getattr(self._participation_ledger, "get", None)
+        if not callable(get_record):
+            # Ledger without record lookup (test stubs): unprovable.
+            return False
+        record = get_record(channel_id, message_id)
+        if not isinstance(record, dict):
+            return False
+        stored_fp = record.get("fingerprint")
+        if not isinstance(stored_fp, str) or len(stored_fp) != 64:
+            return False
+        candidate = copy.deepcopy(projected_now)
+        for msg in candidate.get("messages", []):
+            if isinstance(msg, dict) and msg.get("id") == candidate.get("new_message_id"):
+                msg["text"] = captured_text
+        try:
+            candidate_fp = context_fingerprint(candidate)
+        except (ConversationError, ValueError, TypeError):
+            return False
+        return candidate_fp == stored_fp
 
     def _validate_decision_record(
         self, channel_id: int, message_id: int, record: Any
@@ -211,7 +379,13 @@ class ResponderSubmitMixin:
         )
 
     def _handle_participation_pending(
-        self, channel_id: int, message_id: int, exc: BaseException
+        self,
+        channel_id: int,
+        message_id: int,
+        exc: BaseException,
+        *,
+        snapshot: Any = None,
+        captured_text: Any = None,
     ) -> dict[str, Any]:
         """Map a ledger participation hold to a pending/uncertain status.
 
@@ -241,6 +415,18 @@ class ResponderSubmitMixin:
             self._mark_uncertain(channel_id, message_id, kind="transport_error")
             return {"status": "uncertain", "reason": "classification_failed"}
         if reason is ParticipationReason.CONTEXT_MISMATCH:
+            # Owner policy: a source edited after classification started
+            # is skipped, never answered on stale text and never
+            # reclassified (no rebill). Proven only by fingerprint: the
+            # record's stored fingerprint must equal the live snapshot
+            # with its source text reverted to the captured frame text.
+            # A bare live-text != frame-text comparison is NOT enough (an
+            # E2 rebind binds the live text, so later pure drift would
+            # falsely skip); any unproven drift keeps pending as today.
+            if self._proven_edit_since_capture(
+                channel_id, message_id, snapshot, captured_text
+            ):
+                return self._skip_source_edited(channel_id, message_id)
             return {"status": "pending", "reason": "context_mismatch"}
         if reason is ParticipationReason.IN_PROGRESS:
             return {"status": "pending", "reason": "classification_started"}
@@ -288,16 +474,22 @@ class ResponderSubmitMixin:
     ) -> dict[str, Any]:
         channel_id = job["channel_id"]
         message_id = job["message_id"]
-        entry = next(
-            (
-                e
-                for e in entries
-                if e.get("channel_id") == channel_id and e.get("message_id") == message_id
-            ),
-            None,
-        )
-        if entry is None:
+        matches = [
+            e
+            for e in entries
+            if e.get("channel_id") == channel_id and e.get("message_id") == message_id
+        ]
+        if not matches:
             return {"status": "pending", "reason": "entry_not_found"}
+        # Latest frame wins: a message edited after capture redelivers under
+        # a new seq (aliased to the same job), while the context snapshot is
+        # built from live Discord state. Binding against the stale first
+        # frame would pend on context_mismatch forever; the newest captured
+        # frame is the frame the live snapshot can match. All guards below
+        # stay: the snapshot must still exactly match this frame and live
+        # SDK state, and an edit newer than the latest captured frame still
+        # pends until its frame arrives.
+        entry = max(matches, key=lambda e: e.get("seq", 0))
         # Proven-no-send gate BEFORE any paid work (Jev classification or
         # native POST): a confirmed-deleted source skips with zero work; an
         # unproven source holds queued (retry reads later) with zero work.
@@ -325,6 +517,18 @@ class ResponderSubmitMixin:
                 "error_status": exc.status_code,
             }
         except ThycaClientError as exc:
+            # Definitive 404 on the serving SID: the native session is
+            # verifiably gone (deleted/pruned). Hold pending with zero
+            # state mutation; the next tick re-resolves the target bot DM
+            # (recreated natively when deleted) and adopts it. Any other
+            # snapshot failure holds pending as before.
+            if isinstance(exc, ThycaPreconditionError) and exc.status_code == 404:
+                return {
+                    "status": "pending",
+                    "reason": "snapshot_gone",
+                    "error_kind": exc.kind,
+                    "error_status": exc.status_code,
+                }
             return {
                 "status": "pending",
                 "reason": "snapshot_unavailable",
@@ -359,9 +563,11 @@ class ResponderSubmitMixin:
             return {"status": "pending", "reason": "context_unavailable"}
         except Exception:
             return {"status": "pending", "reason": "context_unavailable"}
-        projected = self._validate_routing_snapshot(channel_id, message_id, snapshot, entry)
-        if "new_message_id" not in projected:
-            return projected
+        stored_text = entry.get("content")
+        validated = self._validate_routing_snapshot(channel_id, message_id, snapshot, entry)
+        if isinstance(validated, dict):
+            return validated
+        projected, entry = validated
         guard = self._fresh_queued_guard(channel_id, message_id)
         if guard is not None:
             return guard
@@ -386,7 +592,9 @@ class ResponderSubmitMixin:
         except asyncio.CancelledError:
             raise
         except ParticipationPending as exc:
-            return self._handle_participation_pending(channel_id, message_id, exc)
+            return self._handle_participation_pending(
+                channel_id, message_id, exc, snapshot=snapshot, captured_text=stored_text
+            )
         except ParticipationDurabilityUncertain:
             raise ResponderError("participation durability uncertain") from None
         except Exception:
@@ -439,6 +647,11 @@ class ResponderSubmitMixin:
         except ConversationError:
             return {"status": "pending", "reason": "context_unavailable"}
         if fresh_fp != context_sha256:
+            skipped = self._source_deleted_status(channel_id, message_id)
+            if skipped is not None:
+                return skipped
+            if self._proven_edit_after_classify(projected, fresh_projected, message_id):
+                return self._skip_source_edited(channel_id, message_id)
             return {"status": "pending", "reason": "context_mismatch"}
         # Current SDK-auth binding on the refresh (transitively implied by
         # the fingerprint match, verified explicitly per parent guard): the

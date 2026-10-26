@@ -77,11 +77,9 @@ def _settings(tmp_path, **overrides):
         "owner_uid": OWNER,
         "guild_id": GUILD,
         "default_channel_id": CHANNEL,
-        "session_id": "discord-main",
         "audit_path": tmp_path / "audit.jsonl",
         "outbox_path": tmp_path / "outbox.jsonl",
         "outbox_state_path": tmp_path / "outbox_state.json",
-        "thyca_session_mapping_path": tmp_path / "mapping.json",
         "delivery_state_path": tmp_path / "delivery.json",
         "_env_file": None,
     }
@@ -89,22 +87,6 @@ def _settings(tmp_path, **overrides):
     settings = Settings(**kwargs)
     assert settings.jev_state_path.parent == tmp_path  # derived beside tmp delivery
     return settings
-
-
-def _write_mapping(settings):
-    settings.thyca_session_mapping_path.write_text(
-        json.dumps(
-            {
-                "native_id": SID,
-                "title": settings.session_id,
-                "audit_label": settings.session_id,
-                "created_at": "2026-01-02T03:04:05+00:00",
-                "path": f"/tmp/fake-sessions/{SID}.jsonl",
-            }
-        ),
-        encoding="utf-8",
-    )
-    os.chmod(settings.thyca_session_mapping_path, 0o600)
 
 
 def _init_delivery(settings):
@@ -215,9 +197,19 @@ class _FakeClient:
         self.snapshot_calls: list = []
         self.submit_calls: list = []
         self.trace_calls: list = []
+        self.dm_calls: list = []
         self.snapshot_fn = None
         self.submit_fn = None
         self.trace_fn = None
+
+    async def get_bot_dm(self, bot_id):
+        self.dm_calls.append(bot_id)
+        return {
+            "native_sid": SID,
+            "running": False,
+            "message_count": 0,
+            "proof": "bot_dm",
+        }
 
     async def get_session_snapshot(self, sid, expected_title=None):
         self.snapshot_calls.append((sid, expected_title))
@@ -542,7 +534,6 @@ def _wire_turn(client, settings, *, source_mid, own_index=0, pre_max=None, agent
 
 def _prepare(tmp_path):
     settings = _settings(tmp_path)
-    _write_mapping(settings)
     _init_delivery(settings)
     return settings
 
@@ -1004,7 +995,13 @@ async def test_collector_unavailable_holds_zero_paid(tmp_path):
     assert get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)["stage"] == "queued"
 
 
-async def test_edit_fp_mismatch_holds_no_bind_no_post(tmp_path):
+async def test_edit_fp_mismatch_proven_skips_no_bind_no_post(tmp_path):
+    """E4 owner policy: proven post-classify edit skips, never binds/POSTs.
+
+    The refresh text differs from the classified text (same id + sender):
+    proven edit, so the stranded job converges to the terminal skip
+    instead of pending forever. The one paid call is sunk; the frozen
+    frame is never bound and nothing is posted."""
     settings = _prepare(tmp_path)
     client = _FakeClient()
     adapter = _FakeAdapter("respond")
@@ -1014,10 +1011,11 @@ async def test_edit_fp_mismatch_holds_no_bind_no_post(tmp_path):
     _wire_turn(client, settings, source_mid=SOURCE_MID)
     _append(settings)
     result = await inst.tick()
-    assert result["status"] == "pending" and result["reason"] == "context_mismatch"
+    assert result["status"] == "skipped" and result["reason"] == "source_edited_after_classify"
     assert len(adapter.calls) == 1
     job = get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)
     assert job.get("jev_decision") is None  # frozen frame never bound under an edit
+    assert job["stage"] == "skipped" and job["skip_reason"] == "source_edited_after_classify"
     assert client.submit_calls == []
 
 
@@ -1529,7 +1527,6 @@ async def test_runtime_orphan_started_preserved_no_reset(tmp_path):
 async def test_binding_errors_disclose_nothing(tmp_path):
     """Binding failures carry no source text, IDs, marker values, or keys."""
     settings = _settings(tmp_path, typesafe_api_key="sk-fake-secret-key")
-    _write_mapping(settings)
     _init_delivery(settings)
     secret = "SECRET-CONTENT-58291-private"
     client = _FakeClient()

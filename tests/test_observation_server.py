@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -316,6 +315,9 @@ class _StubNative:
     async def submit_turn(self, *args, **kwargs):
         raise AssertionError("MCP tool tests never POST")
 
+    async def get_bot_dm(self, *args, **kwargs):
+        raise AssertionError("MCP tool tests never resolve the DM")
+
     async def get_trace_evidence(self, *args, **kwargs):
         raise AssertionError("MCP tool tests never trace")
 
@@ -330,12 +332,10 @@ def _settings_kwargs(tmp_path):
         owner_uid=OWNER_UID,
         guild_id=GUILD_ID,
         default_channel_id=CHANNEL_ID,
-        session_id="discord-test",
         audit_path=tmp_path / "audit.jsonl",
         outbox_path=tmp_path / "outbox.jsonl",
         outbox_state_path=tmp_path / "outbox_state.json",
         watch_channel_ids=[CHANNEL_ID],
-        thyca_session_mapping_path=tmp_path / "mapping.json",
         delivery_state_path=tmp_path / "delivery.json",
         responder_check_seconds=0.05,
         thyca_request_timeout_seconds=5.0,
@@ -346,19 +346,6 @@ def _settings_kwargs(tmp_path):
 @pytest.fixture
 def settings(tmp_path):
     settings = Settings(**_settings_kwargs(tmp_path))
-    settings.thyca_session_mapping_path.write_text(
-        json.dumps(
-            {
-                "native_id": FAKE_SID,
-                "title": settings.session_id,
-                "audit_label": settings.session_id,
-                "created_at": "2026-01-02T03:04:05+00:00",
-                "path": f"/tmp/fake-sessions/{FAKE_SID}.jsonl",
-            }
-        ),
-        encoding="utf-8",
-    )
-    os.chmod(settings.thyca_session_mapping_path, 0o600)
     initialize_delivery_state(
         settings.delivery_state_path,
         native_session_id=FAKE_SID,

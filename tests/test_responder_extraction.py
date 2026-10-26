@@ -11,7 +11,6 @@ wiring.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from types import SimpleNamespace
 
@@ -44,8 +43,6 @@ def _settings(tmp_path, **overrides):
         "owner_uid": OWNER,
         "guild_id": GUILD,
         "default_channel_id": CHANNEL,
-        "session_id": "discord-main",
-        "thyca_session_mapping_path": tmp_path / "mapping.json",
         "delivery_state_path": tmp_path / "delivery.json",
         "outbox_path": tmp_path / "outbox.jsonl",
         "outbox_state_path": tmp_path / "outbox_state.json",
@@ -53,22 +50,6 @@ def _settings(tmp_path, **overrides):
     }
     kwargs.update(overrides)
     return Settings(**kwargs)
-
-
-def _write_mapping(settings):
-    settings.thyca_session_mapping_path.write_text(
-        json.dumps(
-            {
-                "native_id": FAKE_SID,
-                "title": settings.session_id,
-                "audit_label": settings.session_id,
-                "created_at": "2026-01-02T03:04:05+00:00",
-                "path": f"/tmp/fake-sessions/{FAKE_SID}.jsonl",
-            }
-        ),
-        encoding="utf-8",
-    )
-    os.chmod(settings.thyca_session_mapping_path, 0o600)
 
 
 def _init_delivery(settings):
@@ -90,8 +71,18 @@ class _FakeClient:
     def __init__(self):
         self.snapshot_calls: list = []
         self.trace_calls: list = []
+        self.dm_calls: list = []
         self.snapshot_fn = None
         self.trace_fn = None
+
+    async def get_bot_dm(self, bot_id):
+        self.dm_calls.append(bot_id)
+        return {
+            "native_sid": FAKE_SID,
+            "running": False,
+            "message_count": 0,
+            "proof": "bot_dm",
+        }
 
     async def get_session_snapshot(self, sid, expected_title=None):
         self.snapshot_calls.append((sid, expected_title))
@@ -138,7 +129,6 @@ class _FakeLedger:
 
 def _responder(tmp_path, client=None):
     settings = _settings(tmp_path)
-    _write_mapping(settings)
     _init_delivery(settings)
     bot = _FakeBot()
     client = client or _FakeClient()
@@ -275,7 +265,6 @@ def test_recovery_evidence_matches_pure():
 
 async def test_recovery_direct_bound_mismatch_calls_callback(tmp_path):
     settings = _settings(tmp_path)
-    _write_mapping(settings)
     _init_delivery(settings)
     mid = 710000000000000001
     enqueue_job(
@@ -333,7 +322,6 @@ async def test_recovery_direct_bound_mismatch_calls_callback(tmp_path):
 
 async def test_recovery_direct_source_deleted_wins(tmp_path):
     settings = _settings(tmp_path)
-    _write_mapping(settings)
     _init_delivery(settings)
     mid = 720000000000000001
     enqueue_job(
@@ -372,7 +360,6 @@ async def test_bound_reconcile_late_source_deleted_status(
     from thyca import ThycaProtocolError
 
     settings = _settings(tmp_path, typesafe_api_key=None)
-    _write_mapping(settings)
     _init_delivery(settings)
     client = _FakeClient()
 
@@ -559,7 +546,6 @@ def test_constructor_bind_last_after_ledger_and_recovery_no_io(tmp_path, monkeyp
     from participation import ParticipationLedger
 
     settings = _settings(tmp_path)
-    _write_mapping(settings)
     _init_delivery(settings)
     order: list = []
     orig_bind = delivery.bind_jev_ledger

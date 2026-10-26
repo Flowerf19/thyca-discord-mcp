@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import pytest
 from pydantic import ValidationError
 
@@ -16,7 +14,7 @@ def test_settings_from_env(monkeypatch):
     assert settings.owner_uid == 222
     assert settings.guild_id == 333
     assert settings.default_channel_id == 444
-    assert settings.session_id == "discord-main"
+    assert settings.target_bot_id == "march7th"
     assert settings.intent_message_content is True
     assert settings.intent_members is True
 
@@ -93,7 +91,7 @@ def test_outbox_paths_default_under_project_root():
 
 _V5_ENV_VARS = (
     "THYCA_BASE_URL",
-    "THYCA_SESSION_MAPPING_PATH",
+    "TARGET_BOT_ID",
     "DELIVERY_STATE_PATH",
     "RESPONDER_CHECK_SECONDS",
     "THYCA_REQUEST_TIMEOUT_SECONDS",
@@ -113,9 +111,10 @@ def test_v5_defaults(monkeypatch):
         owner_uid=1,
         guild_id=2,
         default_channel_id=3,
+        _env_file=None,
     )
     assert settings.thyca_base_url == "http://127.0.0.1:8765"
-    assert settings.thyca_session_mapping_path == Path.home() / ".thyca/discord_session.json"
+    assert settings.target_bot_id == "march7th"
     assert settings.delivery_state_path == PROJECT_ROOT / "delivery_state.json"
     assert settings.responder_check_seconds == 1.0
     assert settings.thyca_request_timeout_seconds == 900.0
@@ -123,41 +122,74 @@ def test_v5_defaults(monkeypatch):
 
 
 def test_v5_env_overrides(monkeypatch, tmp_path):
-    mapping = tmp_path / "mapping.json"  # fake paths; must be stored, never read
     state = tmp_path / "delivery.json"
     monkeypatch.setenv("DISCORD_TOKEN", "test")
     monkeypatch.setenv("OWNER_UID", "1")
     monkeypatch.setenv("GUILD_ID", "2")
     monkeypatch.setenv("DEFAULT_CHANNEL_ID", "3")
     monkeypatch.setenv("THYCA_BASE_URL", "http://127.0.0.1:9999")
-    monkeypatch.setenv("THYCA_SESSION_MAPPING_PATH", str(mapping))
+    monkeypatch.setenv("TARGET_BOT_ID", "helper-bot")
     monkeypatch.setenv("DELIVERY_STATE_PATH", str(state))
     monkeypatch.setenv("RESPONDER_CHECK_SECONDS", "2.5")
     monkeypatch.setenv("THYCA_REQUEST_TIMEOUT_SECONDS", "60")
     monkeypatch.setenv("RECOVERY_POLL_SECONDS", "45")
     settings = Settings()
     assert settings.thyca_base_url == "http://127.0.0.1:9999"
-    assert settings.thyca_session_mapping_path == mapping
+    assert settings.target_bot_id == "helper-bot"
     assert settings.delivery_state_path == state
     assert settings.responder_check_seconds == 2.5
     assert settings.thyca_request_timeout_seconds == 60.0
     assert settings.recovery_poll_seconds == 45.0
-    assert not mapping.exists() and not state.exists()
+    assert not state.exists()
 
 
 def test_v5_constructor_paths_not_read(tmp_path):
-    mapping = tmp_path / "nonexistent" / "mapping.json"
     state = tmp_path / "nonexistent" / "delivery.json"
     settings = Settings(
         discord_token="test",
         owner_uid=1,
         guild_id=2,
         default_channel_id=3,
-        thyca_session_mapping_path=mapping,
         delivery_state_path=state,
     )
-    assert settings.thyca_session_mapping_path == mapping
     assert settings.delivery_state_path == state
+
+
+@pytest.mark.parametrize(
+    "bad_bot", ["", "   ", "March7th", "a_b", "-x", "x-", "x--y", "x y", 5, None, True]
+)
+def test_target_bot_id_rejections(monkeypatch, bad_bot):
+    """Empty/None/invalid bot ids fail: there is no legacy fallback."""
+    _clear_v5_env(monkeypatch)
+    with pytest.raises(ValidationError):
+        Settings(
+            discord_token="test",
+            owner_uid=1,
+            guild_id=2,
+            default_channel_id=3,
+            target_bot_id=bad_bot,
+            _env_file=None,
+        )
+    with pytest.raises(ValidationError):
+        monkeypatch.setenv("TARGET_BOT_ID", bad_bot if isinstance(bad_bot, str) else "")
+        Settings(
+            discord_token="test",
+            owner_uid=1,
+            guild_id=2,
+            default_channel_id=3,
+            _env_file=None,
+        )
+
+
+def test_target_bot_id_strips_whitespace():
+    settings = Settings(
+        discord_token="test",
+        owner_uid=1,
+        guild_id=2,
+        default_channel_id=3,
+        target_bot_id="  march7th  ",
+    )
+    assert settings.target_bot_id == "march7th"
 
 
 @pytest.mark.parametrize(

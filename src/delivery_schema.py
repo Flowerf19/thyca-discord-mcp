@@ -47,6 +47,7 @@ SKIP_REASONS = frozenset(
         "bot_filtered",
         "duplicate_superseded",
         "source_deleted",
+        "source_edited_after_classify",
     }
 )
 UNCERTAIN_KINDS = frozenset(
@@ -917,7 +918,7 @@ def _validate_state(raw: Any, path: Path) -> dict[str, Any]:
     else:
         raise DeliveryError(f"corrupt delivery state {path}: invalid jev_ledger_id")
     # Optional top-level daily-session history (day -> native SID
-    # provenance). Missing key means a pre-rotation state file: treat as
+    # provenance). Missing key means a pre-adoption state file: treat as
     # empty for compatibility. When present, every key must be a real
     # calendar day and every value a strict native SID. Provenance only;
     # no cross-check against native_session_id or jobs at load (the

@@ -4,8 +4,7 @@ Canonical re-exports of the previous :mod:`responder` surface.
 Internal layout: :mod:`responder.core` (orchestrator),
 :mod:`responder.submit` (pre-POST submit mixin),
 :mod:`responder.input` (pure input validation),
-:mod:`responder.recovery` (native POST recovery + trace proof),
-:mod:`responder.rotation` (mapping registry + daily session rotation).
+:mod:`responder.recovery` (native POST recovery + trace proof).
 """
 
 import delivery  # noqa: F401 - module re-export so the established
@@ -27,7 +26,6 @@ from .core import (  # noqa: F401 - canonical re-exports
     _is_strict_int,
     _is_strict_ledger_id,
     _is_strict_positive_int,
-    _load_mapping,
     _sha256_hex,
     _validate_id_string,
     build_auto_prompt,

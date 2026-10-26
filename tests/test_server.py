@@ -327,7 +327,6 @@ def _settings_kwargs(tmp_path):
         owner_uid=OWNER_UID,
         guild_id=GUILD_ID,
         default_channel_id=CHANNEL_ID,
-        session_id="discord-test",
         audit_path=tmp_path / "audit.jsonl",
         outbox_path=tmp_path / "outbox.jsonl",
         outbox_state_path=tmp_path / "outbox_state.json",
@@ -335,8 +334,7 @@ def _settings_kwargs(tmp_path):
         responder_check_seconds=1.0,
         recovery_poll_seconds=30.0,
         # v5 worker paths stay tmp-only even though FakeResponder never reads them.
-        thyca_session_mapping_path=tmp_path / "discord_session.json",
-        delivery_state_path=tmp_path / "delivery_state.json",
+        delivery_state_path=tmp_path / "delivery.json",
     )
 
 
@@ -1475,10 +1473,10 @@ def test_settings_fixture_disables_dotenv_source(tmp_path, monkeypatch):
 
 def test_settings_fixture_pins_env_sensitive_defaults(tmp_path, monkeypatch):
     """Explicit fixture values win over ambient environment variables."""
-    monkeypatch.setenv("SESSION_ID", "env-hijack")
+    monkeypatch.setenv("TARGET_BOT_ID", "env-hijack")
     monkeypatch.setenv("RESPONDER_CHECK_SECONDS", "999")
     monkeypatch.setenv("RECOVERY_POLL_SECONDS", "999")
-    made = _make_settings(tmp_path)
-    assert made.session_id == "discord-test"
+    made = _make_settings(tmp_path, target_bot_id="pinned-bot")
+    assert made.target_bot_id == "pinned-bot"
     assert made.responder_check_seconds == 1.0
     assert made.recovery_poll_seconds == 30.0

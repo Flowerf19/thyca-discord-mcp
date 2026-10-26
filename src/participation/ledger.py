@@ -211,6 +211,7 @@ class ParticipationLedger:
             "ledger_id": uuid.uuid4().hex,
             "native_session_id": native_sid,
             "native_sessions": {},
+            "retired_sessions": [],
             "attempts": {},
         }
         _validate_ledger(json.loads(json.dumps(fresh)), file, native_sid)
@@ -483,7 +484,7 @@ class ParticipationLedger:
         _save_ledger(self._path, fresh)
 
 
-def rotate_native_session(
+def adopt_native_session(
     path: str | Path,
     *,
     expected_current: str,
@@ -491,27 +492,37 @@ def rotate_native_session(
     day: str,
     history: dict[str, str],
 ) -> dict[str, Any]:
-    """Adopt a new daily native session; provenance-preserving.
+    """Adopt the target bot DM session; provenance-preserving.
 
-    Daily-rotation commit for the participation ledger. Loads FRESH
-    state and requires, in order:
+    DM-routing commit for the participation ledger. Records keep the SID
+    of their classification day (still valid: records may carry any SID
+    in {current} + history + retired), so no drain gate is needed and no
+    record is touched. Loads FRESH state and requires, in order:
 
     1. ``new_sid`` is a strict native SID and ``day`` a real calendar
        day; ``history`` is a valid day -> SID map with ``history[day]
-       == new_sid`` and ``expected_current`` among its values (the
-       outgoing SID stays in provenance; never silently dropped).
+       == new_sid``.
     2. The stored top-level ``native_session_id`` equals
-       ``expected_current``; anything else (including an already-rotated
+       ``expected_current``; anything else (including an already-adopted
        file) fails loudly -- partial multi-file states never silently
        resume, they fail closed for operator recovery.
 
     On success the top-level ``native_session_id`` becomes ``new_sid``
-    and ``native_sessions`` becomes ``history``; every attempt record
-    keeps the SID of its classification day (still valid: records may
-    carry any SID in {current} + history). ``ledger_id``, attempts, and
-    unknown keys are untouched. The caller owns drain-gating (the
-    delivery journal refuses rotation while jobs are unresolved). No
-    network, no clock.
+    and ``native_sessions`` becomes ``history``; ``ledger_id``,
+    attempts, and unknown keys are untouched. When the outgoing
+    ``expected_current`` SID would drop out of the new history values
+    (same-day overwrite: ``history[today]`` was the outgoing SID, now
+    rebound to the DM SID) and it is not already retired, it is appended
+    to ``retired_sessions`` on save -- retired here means
+    retired-from-service (the old session still exists), so old
+    classification records carrying that SID stay loadable (allowed set
+    = current + history + retired). When ``expected_current`` remains in
+    the history values, ``retired_sessions`` stays untouched. A ``new_sid``
+    that is currently retired is dropped from ``retired_sessions`` on
+    save: it serves again (TARGET_BOT_ID A->B->A same-day cycle), and the
+    loader refuses a current SID that is still retired. The caller owns
+    drain-gating (the delivery journal refuses adoption while jobs are
+    unresolved). No network, no clock.
     """
     file = Path(path)
     if sessions.validate_native_sid(new_sid) is None:
@@ -525,11 +536,29 @@ def rotate_native_session(
         raise ParticipationError(f"participation ledger {file}: history does not bind day")
     if not isinstance(expected_current, str) or not expected_current:
         raise ParticipationError(f"invalid expected_current for participation ledger {file}")
-    if expected_current not in clean_history.values():
-        raise ParticipationError(f"participation ledger {file}: history drops the current session")
     # Fresh load under the outgoing SID: a wrong-SID file (including
-    # an already-rotated one) fails here, never silently resumed.
+    # an already-adopted one) fails here, never silently resumed.
     state = _load_ledger(file, expected_current)
+    retired = list(state.get("retired_sessions", []))
+    if expected_current not in clean_history.values() and expected_current not in retired:
+        # Same-day overwrite (DM delete+recreate): the outgoing SID drops
+        # out of history. Retire it (retired-from-service, never deleted)
+        # so records classified under it stay loadable. Both SIDs are
+        # already validated strict above, so the append preserves the
+        # unique-strict-SID invariant (re-validated fail-closed anyway).
+        retired.append(expected_current)
+    if new_sid in retired:
+        # Re-adopting a retired SID (TARGET_BOT_ID A->B->A same-day
+        # cycle): it serves again, and the loader refuses a current SID
+        # that is still retired -- so drop it. History (not deletion):
+        # records referencing it stay valid via current/history membership.
+        retired = [s for s in retired if s != new_sid]
+    clean_retired = sessions.validate_retired_sessions(retired)
+    if clean_retired is None:
+        raise ParticipationError(
+            f"participation ledger {file}: retired list invalid"
+        )
+    state["retired_sessions"] = clean_retired
     state["native_session_id"] = new_sid
     state["native_sessions"] = clean_history
     _save_ledger(file, state)

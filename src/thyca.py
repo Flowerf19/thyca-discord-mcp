@@ -114,6 +114,8 @@ MODEL_MAX = 200
 EFFORT_MAX = 200
 JOB_REF_MAX = 200
 TITLE_EXPECTED_MAX = 1000
+#: Explicit-bot turn routing grammar (same as the serve bot routes).
+_BOT_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 # Exact native MCP tool names. Prefix/substring matches are rejected.
 SEND_TOOL_NAME = "discord__send_message"
@@ -208,6 +210,12 @@ def _validate_model_effort(model: str | None, effort: str | None) -> tuple[str |
         ):
             raise ThycaPreconditionError(field=field, reason="local_validation")
     return model, effort
+
+
+def _validate_bot(bot: str | None) -> str:
+    if not isinstance(bot, str) or not _BOT_RE.fullmatch(bot):
+        raise ThycaPreconditionError(field="bot", reason="local_validation")
+    return bot
 
 
 def _validate_turn_index(turn_index: int) -> int:
@@ -1196,6 +1204,10 @@ class ThycaClient:
         quoted = urllib.parse.quote(native_sid, safe="")
         return f"{self._base_url}/api/traces/{quoted}/{turn_index}"
 
+    def _bot_dm_url(self, bot_id: str) -> str:
+        quoted = urllib.parse.quote(bot_id, safe="")
+        return f"{self._base_url}/api/bots/{quoted}/dm"
+
     def _sync_http(self, method: str, url: str, body: bytes | None) -> tuple[int, bytes]:
         return sync_http_request(method, url, body, request_timeout_seconds=self._timeout)
 
@@ -1282,6 +1294,44 @@ class ThycaClient:
             "proof": "session_detail_turn_slices",
         }
 
+    async def get_bot_dm(self, bot_id: str) -> dict:
+        """Resolve the bot's fixed DM session; return adoption metadata only.
+
+        Uses ``GET /api/bots/<bot_id>/dm`` (deterministic find-or-create
+        on the native side). The payload is validated strictly: ``id`` a
+        strict native SID, ``dm`` exactly ``bot_id``, ``bots`` exactly
+        ``[bot_id]``, ``running`` a bool, and ``messages`` a valid role
+        list. Returns ``native_sid``, ``running``, ``message_count``,
+        and a fixed ``proof`` marker. Titles, raw messages, and bodies
+        are dropped locally. HTTP statuses map exactly like the turn POST
+        (404 for an unknown/paused bot, never a raw body).
+        """
+        _validate_bot(bot_id)
+        assert isinstance(bot_id, str)
+        status, body = await self._request("GET", self._bot_dm_url(bot_id), None)
+        _map_http_status(status)
+        payload = _parse_json_dict(body)
+        sid_ret = payload.get("id")
+        dm_ret = payload.get("dm")
+        bots_ret = payload.get("bots")
+        running_ret = payload.get("running")
+        messages_ret = payload.get("messages")
+        if not isinstance(sid_ret, str) or _SID_RE.fullmatch(sid_ret) is None:
+            raise ThycaProtocolError(reason="malformed")
+        if dm_ret != bot_id:
+            raise ThycaProtocolError(reason="malformed")
+        if bots_ret != [bot_id]:
+            raise ThycaProtocolError(reason="malformed")
+        if running_ret is not True and running_ret is not False:
+            raise ThycaProtocolError(reason="malformed")
+        messages = _validate_message_roles(messages_ret)
+        return {
+            "native_sid": sid_ret,
+            "running": running_ret,
+            "message_count": len(messages),
+            "proof": "bot_dm",
+        }
+
     async def create_session(self) -> dict:
         """Create a fresh native session; return creation metadata only.
 
@@ -1332,8 +1382,10 @@ class ThycaClient:
         """Run one synchronous native turn; return completion metadata only.
 
         The POST body is exactly ``{"text", "model"?, "effort"?}`` with
-        ``None`` values omitted to preserve owner defaults. Reply text, raw
-        messages, tool arguments, and provider errors are dropped locally.
+        ``None`` values omitted to preserve owner defaults. Turns are posted
+        directly into the target bot's DM session, so no routing field is
+        needed. Reply text, raw messages, tool arguments, and provider
+        errors are dropped locally.
         """
         _validate_sid(native_sid)
         cleaned = _validate_text(text)

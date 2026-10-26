@@ -180,14 +180,12 @@ def _settings_kwargs(tmp_path):
         owner_uid=OWNER_UID,
         guild_id=GUILD_ID,
         default_channel_id=CHANNEL_ID,
-        session_id="discord-test",
         audit_path=tmp_path / "audit.jsonl",
         outbox_path=tmp_path / "outbox.jsonl",
         outbox_state_path=tmp_path / "outbox_state.json",
         watch_channel_ids=[CHANNEL_ID],
         responder_check_seconds=0.05,
         recovery_poll_seconds=30.0,
-        thyca_session_mapping_path=tmp_path / "discord_session.json",
         delivery_state_path=tmp_path / "delivery_state.json",
     )
 

@@ -289,10 +289,10 @@ def _validate_record(
 ) -> dict[str, Any]:
     """Validate one attempt record; its SID must be the current or historical.
 
-    ``allowed_sids`` is the rotation-aware SID set (current top-level SID
+    ``allowed_sids`` is the adoption-aware SID set (current top-level SID
     plus every ``native_sessions`` history value); records keep the SID of
-    the day they were classified on, so post-rotation files legitimately
-    span SIDs. ``None`` means ``{expected_sid}`` (pre-rotation behavior).
+    the day they were classified on, so post-adoption files legitimately
+    span SIDs. ``None`` means ``{expected_sid}`` (pre-adoption behavior).
     Cache correctness never depends on the SID: hits still require the
     exact channel/mid/author/fingerprint match.
     """
@@ -547,7 +547,7 @@ def _validate_ledger(raw: Any, path: Path, expected_sid: str) -> dict[str, Any]:
         raise ParticipationError(f"participation ledger {path}: session mismatch")
     state["native_session_id"] = sid
     # Optional top-level daily-session history (day -> native SID
-    # provenance). Missing key means a pre-rotation ledger: treat as
+    # provenance). Missing key means a pre-adoption ledger: treat as
     # empty for compatibility. When present, every key must be a real
     # calendar day and every value a strict native SID. Records may
     # carry any SID in {current} + history values (their classification
@@ -563,6 +563,24 @@ def _validate_ledger(raw: Any, path: Path, expected_sid: str) -> dict[str, Any]:
         history = validated
     state["native_sessions"] = history
     allowed_sids = frozenset({sid, *history.values()})
+    # Optional retired-SID list (verifiably-gone sessions old records may
+    # still reference). Missing key means a ledger without retired: treat as
+    # empty for compatibility. Entries must be unique strict SIDs, and
+    # the live top-level SID must never be retired. Records may carry
+    # any SID in {current} + history + retired.
+    if "retired_sessions" not in raw:
+        retired: list[str] = []
+    else:
+        validated_retired = sessions.validate_retired_sessions(raw.get("retired_sessions"))
+        if validated_retired is None:
+            raise ParticipationError(
+                f"corrupt participation ledger {path}: invalid retired_sessions"
+            )
+        retired = validated_retired
+    if sid in retired:
+        raise ParticipationError(f"corrupt participation ledger {path}: current session is retired")
+    state["retired_sessions"] = retired
+    allowed_sids = frozenset({sid, *history.values(), *retired})
     attempts_raw = raw["attempts"]
     if not isinstance(attempts_raw, dict):
         raise ParticipationError(

@@ -17,9 +17,9 @@ from .ledger import (  # noqa: F401 - canonical re-exports
     ConversationError,
     JevError,
     ParticipationLedger,
+    adopt_native_session,
     build_questions,
     project_conversation_state,
-    rotate_native_session,
     validate_answers,
     validate_model_id,
 )
@@ -71,5 +71,5 @@ __all__ = [
     "ParticipationLedger",
     "ParticipationPending",
     "ParticipationReason",
-    "rotate_native_session",
+    "adopt_native_session",
 ]

@@ -9,7 +9,7 @@ poll tasks append Discord messages to outbox.jsonl; the agent pulls them with
 read_outbox/ack_outbox and summarizes itself (this server has no LLM, no push).
 
 v5 adds an always-on auto-reply worker (see responder.py): the lifespan builds
-a Responder over the existing native mapping + delivery journal, then starts
+a Responder over the existing delivery journal + participation ledger, then starts
 two protected native loops (auto-reply tick + recovery poll) once Discord is
 ready. The agent owns the reply send via MCP send_message with exact
 source_message_id/job_ref correlation; the worker never sends itself, and the
@@ -93,7 +93,7 @@ def create_server(settings: Settings) -> FastMCP:
     def audit(tool: str, args: dict[str, Any], ok: bool = True, error: str | None = None) -> None:
         append_audit(
             settings.audit_path,
-            session_id=settings.session_id,
+            session_id=settings.target_bot_id,
             actor="mcp",
             tool=tool,
             args=args,
@@ -489,7 +489,7 @@ def create_server(settings: Settings) -> FastMCP:
                     err_args = {}
                 append_audit(
                     settings.audit_path,
-                    session_id=settings.session_id,
+                    session_id=settings.target_bot_id,
                     actor="system",
                     tool="on_message",
                     args=err_args,
@@ -500,7 +500,7 @@ def create_server(settings: Settings) -> FastMCP:
         # Extra listener (not an on_message override): command processing is untouched,
         # and no commands are executed from message content — capture only.
         # One try/finally covers responder init + registration + login + readiness +
-        # serve: a mapping/journal failure, login failure, readiness error, or init
+        # serve: a journal failure, login failure, readiness error, or init
         # cancellation must still settle loops, close the worker, remove the
         # listener, close the HTTP bot, and settle both gateway tasks.
         connect_task: asyncio.Task[None] | None = None
@@ -512,7 +512,7 @@ def create_server(settings: Settings) -> FastMCP:
             # with state behind the log would append duplicate seqs from on_message
             # before the first tool read; corruption must fail here, not capture.
             _check_outbox_consistent(settings)
-            # Always-on v5 worker: constructor validates the existing mapping +
+            # Always-on v5 worker: constructor validates the existing journal +
             # journal only (no network, owner UID not required); missing/corrupt/
             # outside-SID state FAILS here, before any capture path runs. No
             # auto-create, reset, native session creation, or prune.

@@ -42,7 +42,7 @@ from delivery import (
 from outbox import append_entry, read_entries
 from responder import Responder
 from server import create_server
-from thyca import ThycaBusyError
+from thyca import ThycaBusyError, ThycaClient
 
 BOT_UID = 111
 OWNER_UID = 222
@@ -243,7 +243,19 @@ def make_text_channel(cid, guild_id=GUILD_ID, history=None):
     return channel
 
 
-class FakeThycaBackend:
+class _DmMixin:
+    async def get_bot_dm(self, bot_id):
+        assert bot_id == "march7th"
+        return {
+            "native_sid": FAKE_SID,
+            "running": False,
+            "message_count": 0,
+            "proof": "bot_dm",
+        }
+
+
+
+class FakeThycaBackend(_DmMixin):
     """Scripted native Thyca backend with same-loop MCP send callback.
 
     ``submit_turn`` reads the FRESH job (job_ref) from the persisted delivery
@@ -382,7 +394,7 @@ class FakeThycaBackend:
         }
 
 
-class BusyThycaBackend:
+class BusyThycaBackend(_DmMixin):
     """Backend whose snapshot reports busy: tick must hold without any POST."""
 
     def __init__(self):
@@ -400,7 +412,7 @@ class BusyThycaBackend:
         raise AssertionError("no trace proof exists without a POST")
 
 
-class PoisonThycaBackend:
+class PoisonThycaBackend(_DmMixin):
     """Backend whose snapshot raises a NON-Thyca error: the tick must propagate it.
 
     A plain RuntimeError (never ThycaClientError) bypasses the worker's
@@ -437,12 +449,10 @@ def _settings_kwargs(tmp_path):
         owner_uid=OWNER_UID,
         guild_id=GUILD_ID,
         default_channel_id=CHANNEL_ID,
-        session_id="discord-test",
         audit_path=tmp_path / "audit.jsonl",
         outbox_path=tmp_path / "outbox.jsonl",
         outbox_state_path=tmp_path / "outbox_state.json",
         watch_channel_ids=[CHANNEL_ID],
-        thyca_session_mapping_path=tmp_path / "discord_session.json",
         delivery_state_path=tmp_path / "delivery_state.json",
         responder_check_seconds=0.05,
         thyca_request_timeout_seconds=5.0,
@@ -459,23 +469,6 @@ def _make_settings(tmp_path, **overrides):
 @pytest.fixture
 def settings(tmp_path):
     return _make_settings(tmp_path)
-
-
-def write_mapping(settings, *, sid=FAKE_SID):
-    """Write a valid 0600 native mapping for the configured session id."""
-    settings.thyca_session_mapping_path.write_text(
-        json.dumps(
-            {
-                "native_id": sid,
-                "title": settings.session_id,
-                "audit_label": settings.session_id,
-                "created_at": "2026-01-02T03:04:05+00:00",
-                "path": f"/fake/native/{sid}.json",
-            }
-        ),
-        encoding="utf-8",
-    )
-    os.chmod(settings.thyca_session_mapping_path, 0o600)
 
 
 def init_delivery(settings, *, sid=FAKE_SID):
@@ -627,6 +620,18 @@ def seed_active_job(settings, *, mid=701, seq=1, author_uid=OWNER_UID, actor_kin
 async def parked_server(monkeypatch, settings, bot):
     """Real lifespan with the REAL Responder; auto loops parked before first tick."""
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
+    # DM-only routing resolves the target DM live on every tick. Stub just
+    # that resolve to the journal SID so parked ticks stay offline; every
+    # other native call uses the real client exactly as production does.
+    async def _fake_dm(self, bot_id):
+        return {
+            "native_sid": FAKE_SID,
+            "running": False,
+            "message_count": 0,
+            "proof": "bot_dm",
+        }
+
+    monkeypatch.setattr(ThycaClient, "get_bot_dm", _fake_dm)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
         for name in ("auto-reply", "auto-reply-recovery"):
@@ -655,7 +660,6 @@ def find_audit(records, tool, ok):
 
 
 async def test_auto_loops_start_by_default_after_ready(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
@@ -675,32 +679,23 @@ async def test_auto_loops_start_by_default_after_ready(settings, monkeypatch):
     assert bot.is_closed()
 
 
-async def test_missing_mapping_fails_before_login(settings, monkeypatch):
-    init_delivery(settings)  # journal fine, mapping absent
+async def test_lifespan_starts_without_any_mapping_file(settings, monkeypatch):
+    init_delivery(settings)  # journal only; no mapping file exists anymore
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     mcp = create_server(settings)
-    with pytest.raises(ValueError, match="mapping is missing"):
-        async with mcp.settings.lifespan(mcp):
-            pass  # pragma: no cover - responder init must raise first
-    assert bot.events == ["remove_listener", "close"]
-    assert bot.listeners.get("on_message") is None
+    async with mcp.settings.lifespan(mcp) as ctx:
+        assert isinstance(ctx["responder"], Responder)
+        assert ctx["responder"].native_sid == FAKE_SID
     assert bot.is_closed()
-    leftovers = [
-        t
-        for t in asyncio.all_tasks()
-        if t.get_name() in ("discord-gateway", "discord-ready") and not t.done()
-    ]
-    assert leftovers == []
 
 
-async def test_delivery_sid_mismatch_fails_before_capture(settings, monkeypatch):
-    write_mapping(settings, sid=FAKE_SID)
-    init_delivery(settings, sid="2026-03-04T05-06-07_cd34")  # outside-SID journal
+async def test_delivery_invalid_stored_sid_fails_before_capture(settings, monkeypatch):
+    init_delivery(settings, sid="not-a-sid")  # corrupt stored session
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     mcp = create_server(settings)
-    with pytest.raises(ValueError, match="native_session_id mismatch"):
+    with pytest.raises(ValueError, match="native_session_id invalid"):
         async with mcp.settings.lifespan(mcp):
             pass  # pragma: no cover - responder init must raise first
     assert bot.events == ["remove_listener", "close"]
@@ -709,7 +704,6 @@ async def test_delivery_sid_mismatch_fails_before_capture(settings, monkeypatch)
 
 
 async def test_login_failure_closes_real_responder_no_orphans(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     seed_active_job(settings)  # mid-flight at shutdown -> uncertain, not dropped
     bot = FakeBot(
@@ -761,7 +755,6 @@ async def test_lifespan_cleanup_without_sys_exception_keeps_primary(settings, mo
     assert not hasattr(sys, "exception")
     with pytest.raises(AttributeError):
         sys.exception()  # effectiveness proof of the fault injection
-    write_mapping(settings)
     init_delivery(settings)
     seed_active_job(settings)
     primary_exc = discord.LoginFailure("bad token")
@@ -793,7 +786,6 @@ async def test_lifespan_cancel_without_sys_exception_stays_cancelled(settings, m
     """Cancelled startup with cleanup failure still presents as cancelled (no sys.exception)."""
     monkeypatch.delattr(sys, "exception")
     assert not hasattr(sys, "exception")
-    write_mapping(settings)
     init_delivery(settings)
     seed_active_job(settings)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
@@ -855,7 +847,6 @@ def test_server_source_has_no_sys_exception_attribute():
 
 
 async def test_shutdown_stops_protected_loops_and_clears_state(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     seed_active_job(settings)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
@@ -872,7 +863,6 @@ async def test_shutdown_stops_protected_loops_and_clears_state(settings, monkeyp
 
 
 async def test_auto_tick_failure_audits_coarse_and_stops_loop(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     seed_active_job(settings)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
@@ -890,7 +880,6 @@ async def test_auto_tick_failure_audits_coarse_and_stops_loop(settings, monkeypa
 
 
 async def test_failing_auto_loop_stops_itself_without_reset(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     seed_active_job(settings)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
@@ -911,7 +900,6 @@ async def test_failing_auto_loop_stops_itself_without_reset(settings, monkeypatc
 
 
 async def test_correlated_send_records_intent_sdk_receipt(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -951,7 +939,6 @@ async def test_correlated_send_records_intent_sdk_receipt(settings, monkeypatch)
 
 
 async def test_correlated_send_partial_pair_rejected(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -967,7 +954,6 @@ async def test_correlated_send_partial_pair_rejected(settings, monkeypatch):
 
 
 async def test_correlated_send_unknown_job_rejected(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
@@ -986,7 +972,6 @@ async def test_correlated_send_unknown_job_rejected(settings, monkeypatch):
 
 
 async def test_correlated_send_job_ref_mismatch_rejected(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1008,7 +993,6 @@ async def test_correlated_send_job_ref_mismatch_rejected(settings, monkeypatch):
 
 
 async def test_correlated_send_wrong_channel_rejected(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1030,7 +1014,6 @@ async def test_correlated_send_wrong_channel_rejected(settings, monkeypatch):
 
 @pytest.mark.parametrize("stage", ["queued", "skipped"])
 async def test_correlated_send_stage_ineligible_rejected(settings, monkeypatch, stage):
-    write_mapping(settings)
     init_delivery(settings)
     append_entry(
         settings.outbox_path,
@@ -1072,7 +1055,6 @@ async def test_correlated_send_stage_ineligible_rejected(settings, monkeypatch, 
 
 @pytest.mark.parametrize("bad", ["", "x" * 2001])
 async def test_correlated_send_text_bounds_rejected_before_intent(settings, monkeypatch, bad):
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1095,7 +1077,6 @@ async def test_correlated_send_text_bounds_rejected_before_intent(settings, monk
 
 @pytest.mark.parametrize("bad_mid", [0, -5])
 async def test_correlated_send_invalid_source_mid_rejected(settings, monkeypatch, bad_mid):
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1115,7 +1096,6 @@ async def test_correlated_send_invalid_source_mid_rejected(settings, monkeypatch
 
 
 async def test_correlated_send_empty_job_ref_rejected(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1135,7 +1115,6 @@ async def test_correlated_send_empty_job_ref_rejected(settings, monkeypatch):
 
 
 async def test_correlated_send_sdk_error_marks_uncertain_no_retry(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1164,7 +1143,6 @@ async def test_correlated_send_sdk_error_marks_uncertain_no_retry(settings, monk
 
 
 async def test_correlated_send_wrong_receipt_marks_uncertain(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1200,7 +1178,6 @@ async def test_correlated_send_wrong_receipt_marks_uncertain(settings, monkeypat
 
 
 async def test_correlated_send_cancel_journals_uncertain_and_propagates(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1228,7 +1205,6 @@ async def test_correlated_send_cancel_journals_uncertain_and_propagates(settings
 
 
 async def test_manual_send_does_not_attach_active_job(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1244,7 +1220,6 @@ async def test_manual_send_does_not_attach_active_job(settings, monkeypatch):
 
 
 async def test_concurrent_manual_sends_never_deadlock(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     channel = make_text_channel(CHANNEL_ID)
     gate = asyncio.Event()
@@ -1274,7 +1249,6 @@ async def test_concurrent_manual_sends_never_deadlock(settings, monkeypatch):
 
 
 async def test_send_audits_never_carry_content_or_canary(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1329,7 +1303,6 @@ def _seed_ack_case(settings):
 
 
 async def test_ack_guard_rejects_beyond_safe_prefix(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     _seed_ack_case(settings)  # all three jobs queued: nothing confirmed
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
@@ -1341,7 +1314,6 @@ async def test_ack_guard_rejects_beyond_safe_prefix(settings, monkeypatch):
 
 
 async def test_ack_guard_allows_prefix_double_ack_holds_unresolved(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     _seed_ack_case(settings)
     skip_job(settings.delivery_state_path, CHANNEL_ID, 801, reason="out_of_scope")
@@ -1361,7 +1333,6 @@ async def test_ack_guard_allows_prefix_double_ack_holds_unresolved(settings, mon
 
 
 async def test_owner_and_other_humans_enqueue_by_metadata_uid(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     backend = BusyThycaBackend()  # hold at snapshot: enqueue asserts, no POST either way
     channel = make_text_channel(CHANNEL_ID)
@@ -1385,7 +1356,6 @@ async def test_owner_and_other_humans_enqueue_by_metadata_uid(settings, monkeypa
 
 
 async def test_other_bot_captured_but_worker_skips_without_post(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
@@ -1404,7 +1374,6 @@ async def test_other_bot_captured_but_worker_skips_without_post(settings, monkey
 
 
 async def test_duplicate_mid_aliases_without_second_post(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     backend = BusyThycaBackend()  # hold at snapshot: alias asserts, no POST either way
     hist, _calls, hstate = make_history()
@@ -1432,7 +1401,6 @@ async def test_duplicate_mid_aliases_without_second_post(settings, monkeypatch):
 
 
 async def test_full_auto_flow_native_loop_drives_post_callback_complete_ack(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     backend = FakeThycaBackend(settings.delivery_state_path)
     channel = make_text_channel(CHANNEL_ID)
@@ -1472,7 +1440,6 @@ async def test_full_auto_flow_native_loop_drives_post_callback_complete_ack(sett
 
 
 async def test_own_trace_uncorrelated_send_holds_not_complete(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     backend = FakeThycaBackend(settings.delivery_state_path)
     backend.own_trace_uncorrelated_content = "own trace uncorrelated"
@@ -1524,7 +1491,6 @@ def _fsync_fault(monkeypatch, *, fail_on):
 
 
 async def test_intent_durability_fault_preserves_intent_no_sdk_send(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1557,7 +1523,6 @@ async def test_intent_durability_fault_preserves_intent_no_sdk_send(settings, mo
 
 
 async def test_receipt_durability_fault_preserves_receipt_single_sdk_send(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1669,7 +1634,6 @@ async def test_double_storage_fault_latches_no_retry_resend(settings, monkeypatc
     cannot promise exactly-once; the worker still never blind-POSTs).
     """
     content = f"auto reply CANARY_LATCH_{case['fail_on']}Q"
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1785,7 +1749,6 @@ def _assert_no_canary_leak(settings, stderr):
 
 
 async def test_poison_tick_dead_sink_stops_loop_direct(settings, monkeypatch, capsys):
-    write_mapping(settings)
     init_delivery(settings)
     _seed_queued_job(settings)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
@@ -1811,7 +1774,6 @@ async def test_poison_tick_dead_sink_stops_loop_direct(settings, monkeypatch, ca
 
 
 async def test_poison_tick_dead_sink_stops_native_loop(settings, monkeypatch, capsys):
-    write_mapping(settings)
     init_delivery(settings)
     _seed_queued_job(settings)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
@@ -1837,7 +1799,6 @@ async def test_bool_and_str_source_mid_rejected_int_control_accepted(settings, m
     # MID 1 is journaled on purpose: under the old lax-int coercion True/"1"
     # would BOTH have become int 1 and hit this very job. StrictInt must
     # reject them before the tool body (zero sends, zero audits); int 1 works.
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings, mid=1, seq=1)
     channel = make_text_channel(CHANNEL_ID)
@@ -1947,7 +1908,6 @@ def _mismatch_receipt(case, content):
     ],
 )
 async def test_correlated_send_receipt_scope_mismatch_holds_uncertain(settings, monkeypatch, case):
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -1982,7 +1942,6 @@ async def test_correlated_send_receipt_scope_mismatch_holds_uncertain(settings, 
 async def test_correlated_send_fully_scoped_receipt_journals_sent(settings, monkeypatch):
     # Positive control: exact scope everywhere (reference IDs + jump-URL IDs)
     # journals the receipt and leaves the job sent (worker owns completion).
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -2014,7 +1973,6 @@ async def test_correlated_send_fully_scoped_receipt_journals_sent(settings, monk
 async def test_invalid_job_ref_canary_never_reaches_audit(settings, monkeypatch):
     canary = "CANARY_JOBREF_F7_XQ"
     bogus_ref = f"bogus-{canary}-ref"
-    write_mapping(settings)
     init_delivery(settings)
     seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -2043,7 +2001,6 @@ async def test_invalid_job_ref_canary_never_reaches_audit(settings, monkeypatch)
 
 
 async def test_accepted_correlation_ids_audited_raw(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     job_ref = seed_active_job(settings)
     channel = make_text_channel(CHANNEL_ID)
@@ -2070,7 +2027,6 @@ async def test_accepted_correlation_ids_audited_raw(settings, monkeypatch):
 
 
 async def test_foreign_manual_send_not_attributed_to_auto_job(settings, monkeypatch):
-    write_mapping(settings)
     init_delivery(settings)
     backend = FakeThycaBackend(settings.delivery_state_path)
     backend.foreign_manual_content = "foreign sid manual"
@@ -2146,10 +2102,10 @@ def test_settings_fixture_disables_dotenv_source(tmp_path, monkeypatch):
 
 def test_settings_fixture_pins_env_sensitive_defaults(tmp_path, monkeypatch):
     """Explicit fixture values win over ambient environment variables."""
-    monkeypatch.setenv("SESSION_ID", "env-hijack")
+    monkeypatch.setenv("TARGET_BOT_ID", "env-hijack")
     monkeypatch.setenv("RESPONDER_CHECK_SECONDS", "999")
     monkeypatch.setenv("RECOVERY_POLL_SECONDS", "999")
-    made = _make_settings(tmp_path)
-    assert made.session_id == "discord-test"
+    made = _make_settings(tmp_path, target_bot_id="pinned-bot")
+    assert made.target_bot_id == "pinned-bot"
     assert made.responder_check_seconds == 0.05
     assert made.recovery_poll_seconds == 30.0

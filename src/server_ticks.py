@@ -86,7 +86,7 @@ def make_heartbeat_tick(
             guild = get_scoped_guild(bot, settings.guild_id)
             append_audit_fn(
                 settings.audit_path,
-                session_id=settings.session_id,
+                session_id=settings.target_bot_id,
                 actor="system",
                 tool="heartbeat",
                 args={"members": guild.member_count},
@@ -96,7 +96,7 @@ def make_heartbeat_tick(
             # Heartbeat failure is recorded, not hidden; the loop itself survives.
             append_audit_fn(
                 settings.audit_path,
-                session_id=settings.session_id,
+                session_id=settings.target_bot_id,
                 actor="system",
                 tool="heartbeat",
                 args={},
@@ -172,7 +172,7 @@ def make_poll_tick(
         except Exception as exc:
             append_audit_fn(
                 settings.audit_path,
-                session_id=settings.session_id,
+                session_id=settings.target_bot_id,
                 actor="system",
                 tool="poll_tick",
                 args={"channel_id": channel_id},
@@ -211,7 +211,7 @@ def make_auto_reply_tick(
             try:
                 append_audit_fn(
                     settings.audit_path,
-                    session_id=settings.session_id,
+                    session_id=settings.target_bot_id,
                     actor="system",
                     tool="auto_reply_tick",
                     args={"error_kind": kind},

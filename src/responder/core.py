@@ -1,17 +1,19 @@
 """V5 responder: FIFO worker for agent-owned MCP auto-reply.
 
-Flow: outbox (capture-only) -> FIFO worker -> daily native Thyca SID
+Flow: outbox (capture-only) -> FIFO worker -> target bot DM session
 (agent calls MCP ``send_message``) -> receipt + native Trace correlation
 -> controller ACK (safe processed prefix).
 
 This module never sends Discord replies itself (no bridge-owned SDK send)
 and never runs a scheduler. Scheduling is owned by the server via native
 ``discord.ext.tasks.Loop``; this worker only exposes ``tick``/``close``
-coroutines plus sync guards. Native sessions ARE created here, but only
-by the daily rotation gate (:mod:`responder.rotation`): one session per
-logical day, drain-gated (every delivery job safe-terminal first), lazy
-(a quiet day creates no empty session), and transient-deferring (a native
-blip retries next tick instead of halting). Old sessions are never
+coroutines plus sync guards. Every tick resolves the target bot's fixed
+DM session live (``GET /api/bots/<bot_id>/dm``) and adopts it when the
+serving SID trails: convergence is drain-gated (every delivery job
+safe-terminal or queued first) and transient-deferring (a native blip
+defers the whole tick instead of halting). A turn posted into the DM
+session runs as that bot, so the user reads auto-replies directly in the
+bot's DM chat with no manual delegate step. Old sessions are never
 deleted.
 
 Durability: all delivery mutations reload fresh from disk via
@@ -19,9 +21,11 @@ Durability: all delivery mutations reload fresh from disk via
 ``await``). Single-process / single-loop only. No threads, no new deps.
 
 No work happens on import: constructing :class:`Responder` validates the
-existing mapping + journal only (missing/corrupt FAILS, never auto-creates).
-Network happens only inside ``tick`` via the injected
-:class:`ThycaClient` (or a fake in tests).
+existing delivery journal + ledger only (missing/corrupt FAILS, never
+auto-creates). The serving SID starts as the delivery state's stored
+``native_session_id``; the DM converge happens on tick. Network happens
+only inside ``tick`` via the injected :class:`ThycaClient` (or a fake in
+tests).
 """
 
 from __future__ import annotations
@@ -31,18 +35,25 @@ import os
 import re
 import sys
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import delivery
+import participation
 from config import Settings
 from context import build_context_collector
 from identity import classify_actor
 from jev import JevAdapter
 from outbox import ack_entries, read_entries
 from participation import ParticipationLedger
-from sessions import default_session_day_provider, validate_day
-from source_messages import build_source_checker
-from thyca import ThycaClient
+from sessions import (
+    validate_day,
+    validate_native_sid,
+    validate_sessions_history,
+)
+from source_messages import SourceDeleted, build_source_checker
+from thyca import ThycaClient, ThycaClientError, ThycaPreconditionError
 
 from .input import (
     ResponderError,
@@ -54,13 +65,6 @@ from .input import (
     validate_entry,
 )
 from .recovery import _SAFE_TERMINAL, ResponderRecovery
-from .rotation import (  # noqa: F401 - _load_mapping kept as canonical re-export
-    RotationDeferred,
-    _load_mapping,
-    adopt_session_day,
-    load_session_registry,
-    rotate_to_today,
-)
 from .submit import (  # noqa: F401 - intentional canonical re-exports
     _VALID_PARTICIPATIONS,
     ResponderSubmitMixin,
@@ -88,8 +92,38 @@ _ROUTED_POST_PARTICIPATIONS = frozenset({"respond", "need_context"})
 # (imported above for internal use).
 
 
-# _load_mapping canonical in responder_rotation (imported above for
-# internal use + package re-export).
+def _ho_chi_minh_today() -> str:
+    """Current calendar day in Asia/Ho_Chi_Minh (adoption history key).
+
+    The day only keys the converged ``native_sessions`` history map; the
+    wall clock never gates adoption itself. Tests inject a fake day via
+    ``session_day_provider``."""
+    return datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Ho_Chi_Minh")).date().isoformat()
+
+
+def _is_transient_native_error(exc: ThycaClientError) -> bool:
+    """True for maybe-later native failures (timeout/disconnect/busy/5xx).
+
+    A single blip during the DM resolve must not stop the auto-reply loop:
+    the previous session stays valid, so the tick defers and retries next
+    tick. Definitive failures (malformed shapes, 400s, verify mismatch,
+    store refusals) fail closed instead."""
+    from thyca import ThycaBusyError, ThycaProtocolError, ThycaSubmissionUncertainError
+
+    if isinstance(exc, (ThycaSubmissionUncertainError, ThycaBusyError)):
+        return True
+    return isinstance(exc, ThycaProtocolError) and exc.reason in (
+        "timeout",
+        "disconnect",
+        "http_5xx",
+    )
+
+
+def _is_native_not_found(exc: ThycaClientError) -> bool:
+    """True only for a definitive native HTTP 404 (session verifiably gone)."""
+    return isinstance(exc, ThycaPreconditionError) and exc.status_code == 404
+
+
 # _SID_RE below mirrors the same verified native SID grammar.
 
 
@@ -189,16 +223,10 @@ class Responder(ResponderSubmitMixin):
         self._busy = False
         self._closed = False
         if session_day_provider is None:
-            # Production default: real-clock logical day from the configured
-            # timezone + rollover hour. Validated eagerly (Settings already
-            # constrains both); tests inject a fake day.
-            try:
-                self._session_day_provider: Callable[[], str] = default_session_day_provider(
-                    settings.session_day_timezone,
-                    settings.session_day_rollover_hour,
-                )
-            except ValueError:
-                raise ResponderError("invalid session day clock config") from None
+            # Production default: real-clock Ho Chi Minh day for the
+            # adoption history key. The clock never gates adoption itself;
+            # tests inject a fake day.
+            self._session_day_provider: Callable[[], str] = _ho_chi_minh_today
         else:
             if not callable(session_day_provider):
                 raise ResponderError("session_day_provider must be callable")
@@ -211,25 +239,20 @@ class Responder(ResponderSubmitMixin):
             if not callable(source_checker):
                 raise ResponderError("source_checker must be callable")
             self._source_checker = source_checker
-        mapping = load_session_registry(settings.thyca_session_mapping_path, settings.session_id)
-        self._mapping = {
-            key: mapping[key] for key in ("native_id", "title", "audit_label", "created_at", "path")
-        }
-        self._native_sid = mapping["native_id"]
-        # Daily rotation state: the sealed logical day this SID serves
-        # (None for legacy dateless mappings until the first tick adopts)
-        # plus the detached day -> SID history at load.
-        self._active_date = mapping["active_date"]
-        self._registry_sessions = dict(mapping["sessions"])
-        # Deferral note day: a transient rotation failure warns once per
-        # logical day (never 1 Hz spam); a new day re-arms automatically.
-        self._rotation_deferred_day: str | None = None
         try:
             state = delivery.load_delivery_state(settings.delivery_state_path)
         except delivery.DeliveryError:
             raise
-        if state.get("native_session_id") != self._native_sid:
-            raise ResponderError("delivery native_session_id mismatch")
+        # DM-only routing: the serving SID starts as the journal's stored
+        # session. No mapping file is read; the target DM converge happens
+        # on tick (transient blips defer, the SID trails until adopted).
+        stored_sid = state.get("native_session_id")
+        if not isinstance(stored_sid, str) or validate_native_sid(stored_sid) is None:
+            raise ResponderError("delivery native_session_id invalid")
+        self._native_sid = stored_sid
+        # Deferral note day: a transient DM-resolve failure warns once per
+        # logical day (never 1 Hz spam); a new day re-arms automatically.
+        self._target_deferred_day: str | None = None
         # T3 loss guard BEFORE any ledger auto-create (real path only; an
         # injected ledger owns its lifecycle and performs no auto-create): a
         # journal carrying a Jev ledger marker or Jev job proofs with a
@@ -250,7 +273,7 @@ class Responder(ResponderSubmitMixin):
             self._client = client
         # Jev routing dependencies (no opt-out, no legacy fallback): injected
         # fakes in tests, real path by default. Built LAST so existing
-        # mapping/delivery/client validations keep their error precedence.
+        # delivery/client/ledger validations keep their error precedence.
         if jev_adapter is None:
             key = settings.typesafe_api_key
             if key is None:
@@ -279,9 +302,9 @@ class Responder(ResponderSubmitMixin):
                 settings.jev_state_path,
                 native_sid=self._native_sid,
             )
-            # Owned ledger: rotation converges its file and swaps in a fresh
+            # Owned ledger: DM adoption converges its file and swaps in a fresh
             # instance bound to the new SID. An injected ledger (tests) owns
-            # its lifecycle: rotation skips the ledger file AND the swap.
+            # its lifecycle: adoption skips the ledger file AND the swap.
             self._participation_owned = True
         else:
             if not callable(getattr(participation_ledger, "classify", None)):
@@ -520,127 +543,157 @@ class Responder(ResponderSubmitMixin):
             ack_entries(self._settings.outbox_state_path, safe)
         return safe
 
-    async def _maybe_rotate_session(self) -> None:
-        """Adopt or rotate the daily native session (drain-gated, lazy).
+    async def _maybe_adopt_target_dm(self) -> dict[str, Any] | None:
+        """Resolve the target bot DM and adopt it; None = proceed tick.
 
-        No-op when rotation is disabled or the sealed day is current.
-        A legacy dateless mapping is ADOPTED (sealed to today, no native
-        calls). A stale sealed day rotates only when EVERY delivery job
-        is safe-terminal (queued/mid-flight/uncertain jobs keep serving
-        the old session; the gate retries next tick) AND unread outbox
-        work exists (a quiet day creates no empty native session).
-        Transient native failures (timeout/disconnect/busy/5xx) during
-        rotation DEFER (one stderr note per day; the old session keeps
-        serving and the next tick retries). Definitive failures
-        (malformed shapes, 400s, verify mismatch, store refusals) raise.
+        Every tick resolves ``GET /api/bots/<target>/dm`` BEFORE any
+        submit/reconcile work. When the DM SID trails the serving SID the
+        tick converges delivery + owned ledger onto it (drain-gated: every
+        delivery job must be safe-terminal or queued) and proceeds to
+        submit into the DM normally — so Discord messages auto-flow into
+        the target bot's DM every tick with no manual delegate step.
 
-        On rotation the delivery journal, the owned participation ledger,
-        and the mapping registry converge (in that order), then the
-        in-memory SID, recovery binding, and owned ledger instance swap
-        with no ``await`` between the swaps. Any definitive failure
-        raises :class:`ResponderError` (the auto-reply loop fails
-        closed); SIDs never reach logs (day + created/reused only).
+        Returns None when the serving SID already is the DM (proceed).
+        Returns a pending outcome (no job mutation, no submit) when the
+        resolve transiently fails or jobs block adoption; the next tick
+        retries. Raises :class:`ResponderError` on a definitive 404
+        (bad target bot config) or any state mismatch/corruption (fail
+        closed). SIDs never reach logs.
         """
-        if not self._settings.daily_session_rotation:
-            return
         try:
             today = self._session_day_provider()
         except Exception:
             raise ResponderError("session day provider failed") from None
         if validate_day(today) is None:
             raise ResponderError("session day provider returned invalid day")
-        if today == self._active_date:
-            return
-        registry = load_session_registry(
-            self._settings.thyca_session_mapping_path, self._settings.session_id
-        )
-        if registry["native_id"] != self._native_sid:
-            raise ResponderError("daily rotation mapping changed")
-        if self._active_date is None:
-            outcome = adopt_session_day(
-                mapping_path=self._settings.thyca_session_mapping_path,
-                expected_session_id=self._settings.session_id,
-                today=today,
-                registry=registry,
+        target = self._settings.target_bot_id
+        try:
+            dm = await self._client.get_bot_dm(target)
+        except ThycaClientError as exc:
+            if _is_native_not_found(exc):
+                raise ResponderError("target bot DM missing") from None
+            if _is_transient_native_error(exc):
+                return self._defer_target_dm(today, exc.kind)
+            raise ResponderError("target bot DM resolve failed") from None
+        if not isinstance(dm, dict):
+            raise ResponderError("target bot DM resolve failed")
+        dm_sid = dm.get("native_sid")
+        if validate_native_sid(dm_sid) is None:
+            raise ResponderError("target bot DM resolve failed")
+        if dm_sid == self._native_sid:
+            return None
+        if not await self._converge_target_dm(dm_sid, today):
+            return self._defer_target_dm(today, "jobs_blocked", reason="target_dm_blocked")
+        return None
+
+    def _defer_target_dm(
+        self, today: str, kind: str, *, reason: str = "target_dm_deferred"
+    ) -> dict[str, Any]:
+        """Pending whole-tick deferral with one stderr note per day.
+
+        Transient blips defer as ``target_dm_deferred``; jobs blocking
+        adoption defer as ``target_dm_blocked`` (the tick still runs one
+        reconcile-only pass for the head blocker before returning).
+        """
+        if self._target_deferred_day != today:
+            print(
+                f"thyca-discord-mcp: target DM adoption deferred for {today} ({kind})",
+                file=sys.stderr,
             )
-            self._active_date = outcome["day"]
-            if outcome["adopted"]:
-                self._registry_sessions = {outcome["day"]: outcome["native_sid"]}
-                print(
-                    f"thyca-discord-mcp: adopted daily session for {today}",
-                    file=sys.stderr,
-                )
-            else:
-                # Already sealed by a concurrent writer: sync the FULL
-                # recorded map, never a subset (dropping days would orphan
-                # ledger history and trip the guard below next rollover).
-                self._registry_sessions = dict(registry["sessions"])
-            return
-        if (
-            registry["active_date"] != self._active_date
-            or registry["sessions"] != self._registry_sessions
-        ):
-            raise ResponderError("daily rotation mapping changed")
+            self._target_deferred_day = today
+        return {"status": "pending", "reason": reason}
+
+    async def _converge_target_dm(self, dm_sid: str, today: str) -> bool:
+        """Converge delivery + owned ledger onto ``dm_sid``; True on success.
+
+        Returns False (no writes) when a delivery job is neither
+        safe-terminal nor queued — the caller defers with a reconcile-only
+        pass for the head blocker and retries adoption next tick.
+        Raises :class:`ResponderError` on any state mismatch, store
+        refusal, or durability uncertainty (fail closed).
+        On success swaps the in-memory SID, the recovery binding, and the
+        owned ledger instance with no ``await`` between the swaps (mirrors
+        the old rotation-era swap block). ``retired_sessions`` and unknown
+        keys are preserved untouched: the old session still exists,
+        retired-from-service only, so old ledger records stay valid.
+        """
+        old_sid = self._native_sid
         try:
             dstate = delivery.load_delivery_state(self._settings.delivery_state_path)
         except delivery.DeliveryDurabilityUncertain:
             raise ResponderError("delivery durability uncertain") from None
-        if dstate.get("native_session_id") != self._native_sid:
+        if dstate.get("native_session_id") != old_sid:
             raise ResponderError("delivery native_session_id mismatch")
         for job in dstate["jobs"].values():
-            if job.get("stage") not in _SAFE_TERMINAL:
-                return
-        peek = read_entries(
-            self._settings.outbox_path,
-            self._settings.outbox_state_path,
-            limit=1,
-            unread_only=True,
-        )
-        if not peek["entries"]:
-            return
+            if job.get("stage") not in _SAFE_TERMINAL and job.get("stage") != "queued":
+                return False
+        history = dict(dstate.get("native_sessions") or {})
+        history[today] = dm_sid
+        if validate_sessions_history(history) is None:
+            raise ResponderError("target DM adoption history invalid")
         try:
-            outcome = await rotate_to_today(
-                client=self._client,
-                mapping_path=self._settings.thyca_session_mapping_path,
-                delivery_path=self._settings.delivery_state_path,
-                ledger_path=self._settings.jev_state_path if self._participation_owned else None,
-                expected_session_id=self._settings.session_id,
-                today=today,
-                registry=registry,
+            delivery.adopt_native_session(
+                self._settings.delivery_state_path,
+                expected_current=old_sid,
+                new_sid=dm_sid,
+                day=today,
+                history=history,
             )
-        except RotationDeferred as exc:
-            # Transient native failure: keep serving the previous day and
-            # retry next tick. One stderr note per logical day (no spam);
-            # a successful rotation needs no reset (the gate goes quiet).
-            if self._rotation_deferred_day != today:
-                print(
-                    f"thyca-discord-mcp: rotation deferred for {today} ({exc.kind})",
-                    file=sys.stderr,
+        except delivery.DeliveryDurabilityUncertain:
+            raise ResponderError("delivery durability uncertain") from None
+        except delivery.DeliveryError as exc:
+            raise ResponderError(f"target DM adoption delivery refused: {exc}") from None
+        if self._participation_owned:
+            assert self._settings.jev_state_path is not None
+            try:
+                participation.adopt_native_session(
+                    self._settings.jev_state_path,
+                    expected_current=old_sid,
+                    new_sid=dm_sid,
+                    day=today,
+                    history=history,
                 )
-                self._rotation_deferred_day = today
-            return
-        self._native_sid = outcome["native_sid"]
-        self._active_date = outcome["day"]
-        self._registry_sessions = dict(outcome["history"])
-        sealed = outcome["registry"]
-        self._mapping = {
-            key: sealed[key] for key in ("native_id", "title", "audit_label", "created_at", "path")
-        }
-        self._recovery.rotate_native_sid(outcome["native_sid"])
+            except participation.ParticipationDurabilityUncertain:
+                raise ResponderError("participation durability uncertain") from None
+            except participation.ParticipationError as exc:
+                raise ResponderError(f"target DM adoption ledger refused: {exc}") from None
+        self._native_sid = dm_sid
+        self._recovery.adopt_native_sid(dm_sid)
         if self._participation_owned:
             assert self._settings.jev_state_path is not None
             self._participation_ledger = ParticipationLedger(
                 self._settings.jev_state_path,
-                native_sid=outcome["native_sid"],
+                native_sid=dm_sid,
             )
-        how = "reused" if outcome["reused"] else "created"
         print(
-            f"thyca-discord-mcp: rotated daily session for {today} ({how})",
+            f"thyca-discord-mcp: adopted target bot DM session for {today}",
             file=sys.stderr,
         )
+        return True
+
 
     async def _tick_once(self) -> dict[str, Any]:
-        await self._maybe_rotate_session()
+        # DM-only routing: resolve + adopt the target bot DM before any
+        # submit/reconcile work. A transient deferral holds the whole tick
+        # (no job mutation, no submit) and the next tick retries. A
+        # jobs-blocked deferral additionally runs ONE reconcile-only pass
+        # for the head blocker on the CURRENT (old) SID -- reconcile only,
+        # never a submit, never classify -- so an inflight/turn_submitting
+        # blocker can drain and adoption can converge next tick.
+        # Uncertain blockers stay operator-resolved (never auto-touched).
+        target_hold = await self._maybe_adopt_target_dm()
+        if target_hold is not None and target_hold.get("reason") != "target_dm_blocked":
+            data = read_entries(
+                self._settings.outbox_path,
+                self._settings.outbox_state_path,
+                limit=READ_LIMIT,
+                unread_only=True,
+            )
+            safe = self._ack_safe_prefix(data["entries"], data["acked"])
+            target_hold["safe_prefix"] = safe
+            target_hold["acked"] = safe
+            target_hold["latest"] = data["latest"]
+            return target_hold
         data = read_entries(
             self._settings.outbox_path,
             self._settings.outbox_state_path,
@@ -679,6 +732,26 @@ class Responder(ResponderSubmitMixin):
                 "latest": latest,
             }
         stage = candidate.get("stage")
+        if target_hold is not None:
+            # Jobs-blocked adoption deferral only (transient holds return
+            # above): one reconcile-only pass for the head blocker on the
+            # CURRENT (old) SID so it can drain toward safe-terminal and
+            # adoption can converge next tick. Never a submit, never
+            # classify: queued candidates are left queued, and uncertain
+            # blockers stay operator-resolved (never auto-touched).
+            if stage != "queued" and stage != "uncertain":
+                await self._reconcile_job(candidate)
+            fresh = read_entries(
+                self._settings.outbox_path,
+                self._settings.outbox_state_path,
+                limit=READ_LIMIT,
+                unread_only=True,
+            )
+            safe = self._ack_safe_prefix(fresh["entries"], fresh["acked"])
+            target_hold["safe_prefix"] = safe
+            target_hold["acked"] = safe
+            target_hold["latest"] = fresh["latest"]
+            return target_hold
         if stage == "queued":
             outcome = await self._submit_queued(candidate, entries)
         else:
@@ -944,6 +1017,44 @@ class Responder(ResponderSubmitMixin):
             return {"status": "uncertain", "reason": "send_evidence_present"}
         return {"status": "skipped", "reason": "source_deleted"}
 
+    def _skip_source_edited(self, channel_id: int, message_id: int) -> dict[str, Any]:
+        """Fresh guarded skip for a source edited after classification.
+
+        The live snapshot proves the source text changed after the paid
+        classification bound its fingerprint; answering the stale text
+        would be wrong and reclassification would rebill, so the stranded
+        job converges to this terminal instead of pending forever.
+        ``skip_job`` itself reloads fresh and refuses ANY send evidence
+        or a non-queued stage. When the skip is refused, a durable
+        source_deleted skip still wins and other terminals are respected;
+        otherwise hold uncertain (fail closed, never force the skip).
+        """
+        skipped = self._source_deleted_status(channel_id, message_id)
+        if skipped is not None:
+            return skipped
+        try:
+            delivery.skip_job(
+                self._settings.delivery_state_path,
+                channel_id,
+                message_id,
+                reason="source_edited_after_classify",
+            )
+        except delivery.DeliveryDurabilityUncertain:
+            raise ResponderError("delivery durability uncertain") from None
+        except delivery.DeliveryError:
+            skipped = self._source_deleted_status(channel_id, message_id)
+            if skipped is not None:
+                return skipped
+            try:
+                fresh = delivery.get_job(self._settings.delivery_state_path, channel_id, message_id)
+            except delivery.DeliveryDurabilityUncertain:
+                raise ResponderError("delivery durability uncertain") from None
+            if fresh is not None and fresh.get("stage") in _SAFE_TERMINAL:
+                return {"status": "idle", "reason": "already_terminal"}
+            self._mark_uncertain(channel_id, message_id, kind="transport_error")
+            return {"status": "uncertain", "reason": "edit_skip_refused"}
+        return {"status": "skipped", "reason": "source_edited_after_classify"}
+
     async def _reconcile_after_post(
         self,
         channel_id: int,
@@ -958,7 +1069,41 @@ class Responder(ResponderSubmitMixin):
         )
 
     async def _reconcile_job(self, job: dict[str, Any]) -> dict[str, Any]:
-        """Compat forward to the Recovery owner (preserves calls/order)."""
+        """Compat forward to the Recovery owner (preserves calls/order).
+
+        Proven-no-send gate for mid-flight zero-evidence jobs: when the
+        serving turn produced no send evidence yet and the source is now
+        verifiably gone, converge to the durable source_deleted skip here.
+        Recovery never consults the source itself and the MCP pre-send
+        gate only fires on send attempts, so without this check the job
+        would strand uncertain with the FIFO head blocked. Anything
+        unproven (or any send evidence) falls through to normal
+        reconcile unchanged.
+        """
+        channel_id = job.get("channel_id") if isinstance(job, dict) else None
+        message_id = job.get("message_id") if isinstance(job, dict) else None
+        if _is_strict_positive_int(channel_id) and _is_strict_positive_int(message_id):
+            try:
+                fresh = delivery.get_job(
+                    self._settings.delivery_state_path, channel_id, message_id
+                )
+            except delivery.DeliveryDurabilityUncertain:
+                raise ResponderError("delivery durability uncertain") from None
+            if (
+                fresh is not None
+                and fresh.get("stage") in ("turn_submitting", "inflight")
+                and not fresh.get("send_intents")
+                and not fresh.get("send_receipts")
+                and fresh.get("trace_refs") is None
+            ):
+                try:
+                    await self._source_checker(channel_id, message_id)
+                except asyncio.CancelledError:
+                    raise
+                except SourceDeleted:
+                    return self._skip_source_deleted(channel_id, message_id)
+                except Exception:
+                    pass
         return await self._recovery.reconcile_job(job)
 
     def _evidence_matches_job(self, job: dict[str, Any], evidence: dict[str, Any]) -> bool:

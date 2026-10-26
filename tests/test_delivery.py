@@ -1933,3 +1933,105 @@ def test_json_error_message_bounded_no_body(tmp_path):
     assert "invalid JSON" in str(exc.value)
     assert canary not in str(exc.value)
     assert exc.value.__cause__ is None
+
+
+# == adopt_native_session (DM-only routing, no mapping registry) ==
+
+NEW_SID = "2026-02-02T01-02-03_bbbb"
+ADOPT_DAY = "2026-02-02"
+
+
+def _adopt_tx(path, **overrides):
+    kwargs = dict(
+        expected_current=FAKE_SID,
+        new_sid=NEW_SID,
+        day=ADOPT_DAY,
+        history={ADOPT_DAY: NEW_SID},
+    )
+    kwargs.update(overrides)
+    return delivery_mod.adopt_native_session(path, **kwargs)
+
+
+def test_adopt_empty_journal_converges_sid_and_history(tmp_path):
+    path = _init(tmp_path)
+    snap = _adopt_tx(path)
+    assert snap["native_session_id"] == NEW_SID
+    assert snap["native_sessions"] == {ADOPT_DAY: NEW_SID}
+    reloaded = load_delivery_state(path)
+    assert reloaded["native_session_id"] == NEW_SID
+    # Old SID stays in provenance through the history values.
+    path2 = _init(tmp_path, name="d2.json")
+    snap2 = _adopt_tx(path2, history={"2026-01-01": FAKE_SID, ADOPT_DAY: NEW_SID})
+    assert snap2["native_sessions"] == {"2026-01-01": FAKE_SID, ADOPT_DAY: NEW_SID}
+
+
+def test_adopt_queued_jobs_carry_onto_dm(tmp_path):
+    path = _init(tmp_path)
+    enqueue_job(
+        path, channel_id=CHANNEL, message_id=11, author_uid=AUTHOR, actor_kind="owner", seq=1
+    )
+    snap = _adopt_tx(path)
+    assert snap["native_session_id"] == NEW_SID
+    assert get_job(path, CHANNEL, 11)["stage"] == "queued"
+
+
+def test_adopt_refuses_midflight_uncertain_and_mismatch(tmp_path):
+    path = _init(tmp_path)
+    enqueue_job(
+        path, channel_id=CHANNEL, message_id=12, author_uid=AUTHOR, actor_kind="owner", seq=2
+    )
+    mark_uncertain(path, CHANNEL, 12, kind="delivery_unknown")
+    with pytest.raises(DeliveryError, match="blocks adoption"):
+        _adopt_tx(path)
+    path2 = _init(tmp_path, name="d2.json")
+    enqueue_job(
+        path2, channel_id=CHANNEL, message_id=13, author_uid=AUTHOR, actor_kind="owner", seq=3
+    )
+    mark_turn_submitting(
+        path2, CHANNEL, 13, job_ref="ab12", pre_turn_index=None,
+        submitted_text_sha256=HASH_A, submitted_text_len=10,
+    )
+    with pytest.raises(DeliveryError, match="blocks adoption"):
+        _adopt_tx(path2)
+    with pytest.raises(DeliveryError, match="native session mismatch"):
+        _adopt_tx(path, expected_current="2026-03-03T03-03-03_cccc")
+    with pytest.raises(DeliveryError, match="history does not bind"):
+        _adopt_tx(path, history={ADOPT_DAY: "2026-03-03T03-03-03_cccc"})
+    state = load_delivery_state(path)
+    assert state["native_session_id"] == FAKE_SID  # refused: untouched
+
+
+def test_skip_edited_after_classify_guards(tmp_path):
+    """source_edited_after_classify: zero-evidence queued only.
+
+    Send evidence refuses (like source_deleted); non-queued stages refuse
+    (post-bind jobs carry POST evidence semantics); the idempotent repeat
+    with the same reason still succeeds; terminals stay terminal."""
+    path = _init(tmp_path)
+    enqueue_job(
+        path, channel_id=CHANNEL, message_id=100, author_uid=AUTHOR, actor_kind="owner", seq=1
+    )
+    job = skip_job(path, CHANNEL, 100, reason="source_edited_after_classify")
+    assert job["stage"] == "skipped" and job["skip_reason"] == "source_edited_after_classify"
+    same = skip_job(path, CHANNEL, 100, reason="source_edited_after_classify")
+    assert same == job
+    with pytest.raises(DeliveryError, match="skip reason mismatch"):
+        skip_job(path, CHANNEL, 100, reason="source_deleted")
+
+    enqueue_job(
+        path, channel_id=CHANNEL, message_id=101, author_uid=AUTHOR, actor_kind="owner", seq=2
+    )
+    mark_turn_submitting(path, CHANNEL, 101, job_ref="jobref-101", pre_turn_index=0)
+    mark_inflight(path, CHANNEL, 101, turn_index=0)
+    record_send_intent(path, CHANNEL, 101, send_ref="send-101", content_len=5, content_hash=HASH_A)
+    with pytest.raises(DeliveryError, match="send evidence"):
+        skip_job(path, CHANNEL, 101, reason="source_edited_after_classify")
+    assert get_job(path, CHANNEL, 101)["stage"] == "delivering"  # refused: untouched
+
+    enqueue_job(
+        path, channel_id=CHANNEL, message_id=102, author_uid=AUTHOR, actor_kind="owner", seq=3
+    )
+    mark_turn_submitting(path, CHANNEL, 102, job_ref="jobref-102", pre_turn_index=None)
+    with pytest.raises(DeliveryError, match="cannot skip as edited"):
+        skip_job(path, CHANNEL, 102, reason="source_edited_after_classify")
+    assert get_job(path, CHANNEL, 102)["stage"] == "turn_submitting"

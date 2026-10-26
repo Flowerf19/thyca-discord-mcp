@@ -7,12 +7,11 @@ case-insensitively, e.g. ``DISCORD_TOKEN``.
 
 import math
 import os
+import re
 from pathlib import Path
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-from sessions import parse_tz_name
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -37,31 +36,10 @@ class Settings(BaseSettings):
     owner_uid: int = Field(description="Discord user ID of the owner.")
     guild_id: int = Field(description="Guild (server) ID the bot is scoped to.")
     default_channel_id: int = Field(description="Channel used when a tool omits channel_id.")
-    session_id: str = Field(
-        default="discord-main",
-        description="Fixed memory session for Discord activity.",
-    )
-    daily_session_rotation: bool = Field(
-        default=True,
-        description="Rotate to a fresh native Thyca session once per logical "
-        "day (one session per day). Rotation is drain-gated: the worker "
-        "keeps serving the previous session until every delivery job is "
-        "safe-terminal, then adopts the new day session. Old sessions are "
-        "never deleted. Set false to pin the single mapped session forever.",
-    )
-    session_day_timezone: str = Field(
-        default="Asia/Ho_Chi_Minh",
-        description="IANA timezone for the rotation logical day. Must parse "
-        "via zoneinfo; validated eagerly at Settings construction.",
-    )
-    session_day_rollover_hour: int = Field(
-        default=4,
-        ge=0,
-        le=23,
-        description="Logical-day rollover hour (0..23) in session_day_timezone: "
-        "the day flips at this wall hour, not at midnight, so a late-night "
-        "conversation stays in one session. Env strings with clean ints "
-        "coerce; bools/floats are rejected.",
+    target_bot_id: str = Field(
+        default="march7th",
+        description="Target bot whose fixed DM session receives auto-reply turns. "
+        "Required-effective: empty or invalid values fail Settings construction.",
     )
     audit_path: Path = Field(default=PROJECT_ROOT / "audit.jsonl")
     outbox_path: Path = Field(
@@ -83,10 +61,6 @@ class Settings(BaseSettings):
     thyca_base_url: str = Field(
         default="http://127.0.0.1:8765",
         description="Thyca agent HTTP base URL (loopback). Validated by the native client.",
-    )
-    thyca_session_mapping_path: Path = Field(
-        default=Path.home() / ".thyca/discord_session.json",
-        description="Channel -> Thyca SID mapping file. Stored only; never read by Settings.",
     )
     delivery_state_path: Path = Field(
         default=PROJECT_ROOT / "delivery_state.json",
@@ -117,7 +91,7 @@ class Settings(BaseSettings):
         description="Jev participation ledger state. Defaults beside the configured "
         "delivery state (same parent, jev_state.json) so tmp delivery paths "
         "never leak ledger writes to the repo root. Must not collide with "
-        "delivery/outbox/audit/mapping paths.",
+        "delivery/outbox/audit paths.",
     )
     conversation_max_messages: int = Field(
         default=20,
@@ -162,21 +136,23 @@ class Settings(BaseSettings):
             raise ValueError("must be an int 1..20, not a bool or float")
         return value
 
-    @field_validator("session_day_rollover_hour", mode="before")
+    @field_validator("target_bot_id", mode="before")
     @classmethod
-    def _reject_bool_float_rollover(cls, value: object) -> object:
-        """Reject bools/floats before lax int coercion (env strings coerce)."""
-        if isinstance(value, bool) or isinstance(value, float):
-            raise ValueError("must be an int 0..23, not a bool or float")
-        return value
+    def _validate_target_bot_id(cls, value: object) -> object:
+        """Require an explicit target bot: empty/None is now an error.
 
-    @field_validator("session_day_timezone", mode="after")
-    @classmethod
-    def _validate_session_day_timezone(cls, value: str) -> str:
-        """Reject unknown timezones eagerly (rotation must never fail mid-tick)."""
-        if parse_tz_name(value) is None:
-            raise ValueError("must be a valid IANA timezone")
-        return value
+        Non-string values are invalid; surrounding whitespace is stripped;
+        an empty result fails (there is no legacy fallback). Anything else
+        must match the serve bot-id grammar (same shape the native routes
+        enforce)."""
+        if not isinstance(value, str):
+            raise ValueError("must be a bot id string")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must be a non-empty bot id")
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", stripped):
+            raise ValueError("must match the bot id grammar")
+        return stripped
 
     @model_validator(mode="after")
     def _default_watch_channels(self) -> "Settings":
@@ -194,7 +170,7 @@ class Settings(BaseSettings):
         ``jev_state.json`` so tmp delivery paths never leak ledger writes to
         the repo root. The pure-lexically-normalized path (``os.path.abspath``
         + ``os.path.normpath``, no filesystem access) must not equal delivery,
-        outbox, outbox-state, audit, or mapping paths by the same normalization.
+        "delivery/outbox/outbox-state/audit paths by the same normalization.
         Chosen values are preserved exactly; only canonical lexical identities
         are compared. Symlink/hardlink aliases remain the ledger store's
         fail-closed responsibility; this guard claims no physical alias detection.
@@ -208,7 +184,6 @@ class Settings(BaseSettings):
             "outbox_path",
             "outbox_state_path",
             "audit_path",
-            "thyca_session_mapping_path",
         ):
             if jev_key == _lexical_path_key(getattr(self, name)):
                 raise ValueError(f"jev_state_path collides with {name}")

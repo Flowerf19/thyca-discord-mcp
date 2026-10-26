@@ -68,11 +68,10 @@ def test_jev_state_explicit_kept(monkeypatch, tmp_path):
         "outbox_path",
         "outbox_state_path",
         "audit_path",
-        "thyca_session_mapping_path",
     ],
 )
 def test_jev_state_collisions_rejected(monkeypatch, tmp_path, field):
-    """The owned ledger path must not collide with delivery/outbox/audit/mapping."""
+    """The owned ledger path must not collide with delivery/outbox/audit."""
     _clear_jev_env(monkeypatch)
     victim = tmp_path / "victim.json"
     with pytest.raises(ValidationError, match="jev_state_path collides"):
@@ -141,7 +140,6 @@ def test_max_messages_env_string_coerces(monkeypatch):
         "outbox_path",
         "outbox_state_path",
         "audit_path",
-        "thyca_session_mapping_path",
     ],
 )
 def test_jev_state_dotdot_aliases_rejected(monkeypatch, tmp_path, field):
@@ -173,7 +171,6 @@ def test_jev_state_dotdot_aliases_rejected(monkeypatch, tmp_path, field):
         "outbox_path",
         "outbox_state_path",
         "audit_path",
-        "thyca_session_mapping_path",
     ],
 )
 def test_jev_state_dot_aliases_rejected(monkeypatch, tmp_path, field):
@@ -198,7 +195,6 @@ def test_jev_state_dot_aliases_rejected(monkeypatch, tmp_path, field):
         "outbox_path",
         "outbox_state_path",
         "audit_path",
-        "thyca_session_mapping_path",
     ],
 )
 def test_jev_state_absolute_relative_aliases_rejected(monkeypatch, tmp_path, field):
@@ -230,7 +226,6 @@ def test_jev_state_absolute_relative_aliases_rejected(monkeypatch, tmp_path, fie
         "outbox_path",
         "outbox_state_path",
         "audit_path",
-        "thyca_session_mapping_path",
     ],
 )
 def test_jev_state_default_derived_dotdot_collision_rejected(monkeypatch, tmp_path, field):
@@ -291,7 +286,6 @@ def test_jev_state_all_tmp_distinct_preserved_no_io(monkeypatch, tmp_path):
         outbox_path=tmp_path / "o" / "outbox.jsonl",
         outbox_state_path=tmp_path / "os" / "state.json",
         audit_path=tmp_path / "a" / "audit.jsonl",
-        thyca_session_mapping_path=tmp_path / "m" / "mapping.json",
         jev_state_path=tmp_path / "j" / "jev.json",
         typesafe_api_key=None,
     )
