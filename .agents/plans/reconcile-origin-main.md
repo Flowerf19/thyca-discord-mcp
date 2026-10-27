@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 created: 2026-10-27
 last_updated: 2026-10-27
 ---
@@ -12,9 +12,9 @@ The owner requested commit, push, then restart. Local commit `817c59c`
 succeeded; push was rejected as non-fast-forward. After inspecting the
 remote divergence, the owner selected review and then **plan reconciliation**.
 The owner approved the proposed reconciliation scope with "chốt" on
-2026-10-27. R0-R2 implementation and verification are authorized. Per R3,
-publication and restart require approval of the reviewed candidate. The
-restart remains pending.
+2026-10-27. R0-R2 implementation and verification were authorized.
+After review, the owner explicitly approved R3 with "Làm cả ba" (merge
+commit, push and restart). R3 completion evidence is recorded below.
 
 ## Verified baseline
 
@@ -229,5 +229,30 @@ no live-service actions are authorized in R0-R2.
   README test-count finding. Lead corrected current count 910 -> 913;
   historical counts were left intact. No runtime/security/data-safety
   findings remain.
-- R0-R2 are complete. R3 (merge commit, publication, live main update,
-  restart) awaits explicit owner approval of this reviewed candidate.
+- R0-R2 completed before the owner's explicit R3 approval.
+
+## R3 completion evidence (2026-10-27)
+
+- Created merge `6966440` with parents `817c59c` and `092c3b8` after
+  verifying neither baseline had moved. Promoted local main by fast-forward
+  and pushed normally to origin/main; no force or history rewrite.
+- Remote ref readback confirmed `6966440a2d4437421ac309407633dbf667e0fc3d`.
+- Before stopping, read-only DB inspection showed zero submitted/sent jobs.
+  Stopped with `thyca --serve --stop`, verified both old processes exited,
+  then started with `thyca --serve --daemon`. No reseed, state reset,
+  environment change or dependency upgrade.
+- Fresh post-start log (after line 395) records gateway connection,
+  `ready as Bé Bảy#2174`, and ListToolsRequest. New daemon/MCP PIDs were
+  574021/574023 at verification time.
+- Initial startup logged a protocol deferral. A subsequent live
+  `ThycaClient.get_bot_dm` read passed the strict protocol validation;
+  returned DM SID matched the stored serving SID, running was false,
+  and SQLite quick_check was ok. No new Discord message/paid-provider
+  smoke was performed; automatic reply success is not claimed from old
+  jobs or log lines.
+- GitHub reported nine dependency alerts during push (one critical,
+  three high, four moderate, one low). They have not been independently
+  triaged or remediated in this refactor; dependency changes remain a
+  separate task.
+- Source reconciliation, publication and requested restart are complete.
+  This final documentation update records the observed release state.
