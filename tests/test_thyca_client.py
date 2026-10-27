@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import http.client
 import http.server
 import json
@@ -82,60 +81,6 @@ def _session_detail(sid: str, title: str, running: bool, messages: list[dict]) -
         "ask_remember": False,
         "running": running,
     }
-
-
-def _trace_detail(
-    sid: str,
-    index: int,
-    status: str,
-    model: str | None,
-    error: dict | None,
-    messages: list[dict],
-) -> dict:
-    return {
-        "session_id": sid,
-        "turn_index": index,
-        "title": "t",
-        "started_at": "2026-10-05T12:00:00Z",
-        "ended_at": "2026-10-05T12:01:00Z",
-        "model": model,
-        "status": status,
-        "rounds": 1,
-        "requests": 1,
-        "prompt_tokens": None,
-        "cached_tokens": None,
-        "completion_tokens": None,
-        "total_tokens": None,
-        "cost_usd": None,
-        "latency_ms": None,
-        "error": error,
-        "messages": messages,
-    }
-
-
-def _send_call(
-    call_id: str,
-    channel: int,
-    source_mid: int,
-    job: str | None,
-    content: str = "hello",
-    extra_args: dict | None = None,
-) -> dict:
-    args: dict = {
-        "channel_id": channel,
-        "source_message_id": source_mid,
-        "content": content,
-    }
-    if job is not None:
-        args["job_ref"] = job
-    if extra_args:
-        args.update(extra_args)
-    return {"id": call_id, "name": "discord__send_message", "arguments": args}
-
-
-def _send_result(call_id: str, mid: int, channel: int, jump: str) -> dict:
-    body = json.dumps({"message_id": mid, "channel_id": channel, "jump_url": jump})
-    return _msg("tool", body, tool_call_id=call_id)
 
 
 class FakeTransport:
@@ -221,10 +166,6 @@ async def test_sid_validation_fails_before_http() -> None:
             await client.get_session_snapshot(sid)
         with pytest.raises(ThycaPreconditionError):
             await client.submit_turn(sid, "hi")
-        with pytest.raises(ThycaPreconditionError):
-            await client.get_trace_evidence(
-                sid, 0, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-            )
     assert transport.calls == []
 
 
@@ -311,22 +252,15 @@ async def test_no_create_or_sid_override_urls() -> None:
                 VALID_SID, "t", False, [_msg("user", "hi"), _msg("assistant", "ok")]
             )
             return 200, _json_bytes(detail)
-        if "/api/traces/" in url:
-            payload = _trace_detail(VALID_SID, 0, "completed", None, None, [])
-            return 200, _json_bytes(payload)
         raise AssertionError(f"unexpected {method} {url}")
 
     transport = FakeTransport(_handler)
     client = ThycaClient(BASE, transport=transport)
     await client.get_session_snapshot(VALID_SID)
     await client.submit_turn(VALID_SID, "hi")
-    await client.get_trace_evidence(
-        VALID_SID, 0, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
     assert urls == [
         f"GET {BASE}/api/sessions/{VALID_SID}",
         f"POST {BASE}/api/sessions/{VALID_SID}/turn",
-        f"GET {BASE}/api/traces/{VALID_SID}/0",
     ]
     for entry in urls:
         assert "/api/sessions HTTP" not in entry
@@ -487,341 +421,8 @@ async def test_snapshot_malformed_roles_fail_closed() -> None:
         await client.get_session_snapshot(VALID_SID)
 
 
-# ---- trace evidence ----
-
-
-def _good_trace_messages(job: str = JOB) -> list[dict]:
-    call = _send_call("call_1", CHANNEL, SOURCE_MID, job, content="reply-body")
-    result = _send_result("call_1", RESULT_MID, CHANNEL, _jump(GUILD, CHANNEL, RESULT_MID))
-    return [
-        _msg("user", f"please reply [{job}] now"),
-        _msg("assistant", None, tool_calls=[call]),
-        result,
-    ]
-
-
-async def _trace_client(payload: dict) -> ThycaClient:
-    async def _handler(method: str, url: str, body: bytes | None):  # noqa: ANN001, ANN202
-        assert method == "GET"
-        assert url == f"{BASE}/api/traces/{VALID_SID}/2"
-        return 200, _json_bytes(payload)
-
-    return ThycaClient(BASE, transport=FakeTransport(_handler))
-
-
-async def test_trace_correlated_send_confirmed() -> None:
-    payload = _trace_detail(VALID_SID, 2, "completed", "owner-model", None, _good_trace_messages())
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID,
-        2,
-        job_ref=JOB,
-        source_message_id=SOURCE_MID,
-        channel_id=CHANNEL,
-        guild_id=GUILD,
-    )
-    assert evidence["trace_session_match"] is True
-    assert evidence["turn_index_match"] is True
-    assert evidence["request_job_ref_match"] is True
-    assert evidence["send_call_count"] == 1
-    assert evidence["correlated_send_count"] == 1
-    assert evidence["legacy_uncorrelated_count"] == 0
-    assert evidence["all_sends_confirmed"] is True
-    send = evidence["sends"][0]
-    assert send["tool_call_id"] == "call_1"
-    assert send["channel_match"] is True
-    assert send["source_mid_match"] is True
-    assert send["job_ref_match"] is True
-    assert send["result_message_id"] == RESULT_MID
-    assert send["result_channel_match"] is True
-    assert send["jump_ids_match"] is True
-    assert send["result_ok"] is True
-    assert send["content_len"] == len("reply-body")
-    assert send["content_sha256"] == hashlib.sha256(b"reply-body").hexdigest()
-    assert "reply-body" not in json.dumps(evidence)
-
-
-async def test_trace_wrong_job_ref_source_channel_fails() -> None:
-    payload = _trace_detail(
-        VALID_SID, 2, "completed", None, None, _good_trace_messages(job="other-job")
-    )
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    assert evidence["request_job_ref_match"] is False
-    assert evidence["all_sends_confirmed"] is False
-    assert evidence["sends"][0]["job_ref_match"] is False
-    assert evidence["sends"][0]["result_ok"] is False
-
-
-async def test_trace_late_tool_missing_result() -> None:
-    call = _send_call("call_late", CHANNEL, SOURCE_MID, JOB)
-    payload = _trace_detail(
-        VALID_SID,
-        2,
-        "completed",
-        None,
-        None,
-        [_msg("user", f"hi [{JOB}]"), _msg("assistant", None, tool_calls=[call])],
-    )
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    assert evidence["sends"][0]["result_present"] is False
-    assert evidence["sends"][0]["result_ok"] is False
-    assert evidence["all_sends_confirmed"] is False
-
-
-async def test_trace_wrong_native_sid_no_false_pass() -> None:
-    payload = _trace_detail(OTHER_SID, 2, "completed", None, None, _good_trace_messages())
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    assert evidence["trace_session_match"] is False
-    assert evidence["all_sends_confirmed"] is False
-
-
-async def test_trace_mismatched_jump_and_channel_no_pass() -> None:
-    call = _send_call("call_1", CHANNEL, SOURCE_MID, JOB)
-    bad_jump = _jump(GUILD, CHANNEL, 999999)
-    payload = _trace_detail(
-        VALID_SID,
-        2,
-        "completed",
-        None,
-        None,
-        [
-            _msg("user", f"hi [{JOB}]"),
-            _msg("assistant", None, tool_calls=[call]),
-            _send_result("call_1", RESULT_MID, CHANNEL, bad_jump),
-        ],
-    )
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    assert evidence["sends"][0]["jump_ids_match"] is False
-    assert evidence["sends"][0]["result_ok"] is False
-    assert evidence["all_sends_confirmed"] is False
-
-    call_wrong = _send_call("call_2", 999000111222333444, SOURCE_MID, JOB)
-    payload2 = _trace_detail(
-        VALID_SID,
-        2,
-        "completed",
-        None,
-        None,
-        [
-            _msg("user", f"hi [{JOB}]"),
-            _msg("assistant", None, tool_calls=[call_wrong]),
-            _send_result("call_2", RESULT_MID, CHANNEL, _jump(GUILD, CHANNEL, RESULT_MID)),
-        ],
-    )
-    client2 = await _trace_client(payload2)
-    evidence2 = await client2.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    assert evidence2["sends"][0]["channel_match"] is False
-    assert evidence2["sends"][0]["result_ok"] is False
-
-
-async def test_trace_no_sends_is_not_confirmed() -> None:
-    payload = _trace_detail(
-        VALID_SID,
-        2,
-        "completed",
-        None,
-        None,
-        [_msg("user", f"hi [{JOB}]"), _msg("assistant", "PASS")],
-    )
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    assert evidence["send_call_count"] == 0
-    assert evidence["all_sends_confirmed"] is False
-    assert "PASS" not in json.dumps(evidence)
-
-
-async def test_trace_tool_error_json_no_false_pass() -> None:
-    call = _send_call("call_err", CHANNEL, SOURCE_MID, JOB)
-    err_body = json.dumps({"error": "forbidden"})
-    payload = _trace_detail(
-        VALID_SID,
-        2,
-        "failed",
-        None,
-        {"code": "llm_error", "message": "provider down"},
-        [
-            _msg("user", f"hi [{JOB}]"),
-            _msg("assistant", None, tool_calls=[call]),
-            _msg("tool", err_body, tool_call_id="call_err", meta={"is_error": True}),
-        ],
-    )
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    assert evidence["sends"][0]["result_ok"] is False
-    assert evidence["all_sends_confirmed"] is False
-    assert evidence["error_present"] is True
-    assert evidence["error_kind"] == "llm_error"
-    assert "forbidden" not in json.dumps(evidence)
-    assert "provider down" not in json.dumps(evidence)
-
-
-async def test_trace_legacy_uncorrelated_classified_separately() -> None:
-    legacy = _send_call("call_legacy", CHANNEL, SOURCE_MID, None)
-    correlated = _send_call("call_new", CHANNEL, SOURCE_MID, JOB)
-    payload = _trace_detail(
-        VALID_SID,
-        2,
-        "completed",
-        None,
-        None,
-        [
-            _msg("user", f"hi [{JOB}]"),
-            _msg("assistant", None, tool_calls=[legacy, correlated]),
-            _send_result(
-                "call_legacy",
-                555555555555555555,
-                CHANNEL,
-                _jump(GUILD, CHANNEL, 555555555555555555),
-            ),
-            _send_result("call_new", RESULT_MID, CHANNEL, _jump(GUILD, CHANNEL, RESULT_MID)),
-        ],
-    )
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    assert evidence["send_call_count"] == 2
-    assert evidence["correlated_send_count"] == 1
-    assert evidence["legacy_uncorrelated_count"] == 1
-    assert evidence["all_sends_confirmed"] is True
-
-
-async def test_trace_unknown_tool_names_not_leaked() -> None:
-    weird = {"id": "call_x", "name": CANARY_TOOL, "arguments": {"a": 1}}
-    payload = _trace_detail(
-        VALID_SID,
-        2,
-        "completed",
-        None,
-        None,
-        [
-            _msg("user", f"hi [{JOB}]"),
-            _msg("assistant", None, tool_calls=[weird]),
-        ],
-    )
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    assert evidence["other_tool_call_count"] == 1
-    assert evidence["other_tool_name_lens"] == [len(CANARY_TOOL)]
-    _assert_no_canary(evidence)
-
-
-async def test_trace_guild_mismatch_fails_jump() -> None:
-    payload = _trace_detail(VALID_SID, 2, "completed", None, None, _good_trace_messages())
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID,
-        2,
-        job_ref=JOB,
-        source_message_id=SOURCE_MID,
-        channel_id=CHANNEL,
-        guild_id=999888777666555444,
-    )
-    assert evidence["sends"][0]["jump_ids_match"] is False
-    assert evidence["all_sends_confirmed"] is False
-
-
-async def test_trace_bool_ids_rejected_before_http() -> None:
-    async def _handler(method: str, url: str, body: bytes | None):  # noqa: ANN001, ANN202
-        raise AssertionError("must not call HTTP")
-
-    transport = FakeTransport(_handler)
-    client = ThycaClient(BASE, transport=transport)
-    with pytest.raises(ThycaPreconditionError):
-        await client.get_trace_evidence(
-            VALID_SID,
-            0,
-            job_ref=JOB,
-            source_message_id=True,
-            channel_id=CHANNEL,  # type: ignore[arg-type]
-        )
-    with pytest.raises(ThycaPreconditionError):
-        await client.get_trace_evidence(
-            VALID_SID,
-            0,
-            job_ref=JOB,
-            source_message_id=SOURCE_MID,
-            channel_id=False,  # type: ignore[arg-type]
-        )
-    with pytest.raises(ThycaPreconditionError):
-        await client.get_trace_evidence(
-            VALID_SID,
-            True,
-            job_ref=JOB,
-            source_message_id=SOURCE_MID,
-            channel_id=CHANNEL,  # type: ignore[arg-type]
-        )
-    with pytest.raises(ThycaPreconditionError):
-        await client.get_trace_evidence(
-            VALID_SID, 0, job_ref="", source_message_id=SOURCE_MID, channel_id=CHANNEL
-        )
-    assert transport.calls == []
-
-
-async def test_trace_bool_result_mid_is_not_ok() -> None:
-    call = _send_call("call_bool", CHANNEL, SOURCE_MID, JOB)
-    body = json.dumps(
-        {"message_id": True, "channel_id": CHANNEL, "jump_url": _jump(GUILD, CHANNEL, 1)}
-    )
-    payload = _trace_detail(
-        VALID_SID,
-        2,
-        "completed",
-        None,
-        None,
-        [
-            _msg("user", f"hi [{JOB}]"),
-            _msg("assistant", None, tool_calls=[call]),
-            _msg("tool", body, tool_call_id="call_bool"),
-        ],
-    )
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    assert evidence["sends"][0]["result_message_id"] is None
-    assert evidence["sends"][0]["result_ok"] is False
-
-
 async def test_canary_never_in_any_metadata() -> None:
     user_text = f"hello {CANARY_CONTENT} [{JOB}]"
-    call = _send_call(
-        "call_c",
-        CHANNEL,
-        SOURCE_MID,
-        JOB,
-        content=CANARY_CONTENT,
-        extra_args={CANARY_KEY: CANARY_CONTENT, "profile": CANARY_PROFILE},
-    )
-    result = _send_result("call_c", RESULT_MID, CHANNEL, _jump(GUILD, CHANNEL, RESULT_MID))
-    trace_payload = _trace_detail(
-        VALID_SID,
-        0,
-        "completed",
-        CANARY_MODEL,
-        {"code": CANARY_KEY, "message": CANARY_ERROR, "extra": CANARY_PROFILE},
-        [_msg("user", user_text), _msg("assistant", None, tool_calls=[call]), result],
-    )
 
     async def _handler(method: str, url: str, body: bytes | None):  # noqa: ANN001, ANN202
         if url.endswith(f"/api/sessions/{VALID_SID}") and method == "GET":
@@ -841,7 +442,7 @@ async def test_canary_never_in_any_metadata() -> None:
             )
             detail["reply"] = CANARY_CONTENT
             return 200, _json_bytes(detail)
-        return 200, _json_bytes(trace_payload)
+        raise AssertionError(f"unexpected {method} {url}")
 
     transport = FakeTransport(_handler)
     client = ThycaClient(BASE, transport=transport)
@@ -849,12 +450,6 @@ async def test_canary_never_in_any_metadata() -> None:
     _assert_no_canary(snap)
     posted = await client.submit_turn(VALID_SID, user_text)
     _assert_no_canary(posted)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 0, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    _assert_no_canary(evidence)
-    assert evidence["error_kind"] == "unknown"
-    assert evidence["status"] == "completed"
 
 
 # ---- real socket behavior with local fake server (default transport) ----
@@ -1577,171 +1172,6 @@ async def test_default_transport_native_error_statuses_real_server() -> None:
 
 
 # ---- FIRST user input fingerprint metadata (Issue 4) ----
-
-
-async def test_trace_first_user_input_hash_len_exact_unicode() -> None:
-    user_text = f"grüße wörld ✓ please reply [{JOB}] now"
-    call = _send_call("call_1", CHANNEL, SOURCE_MID, JOB, content=CANARY_CONTENT)
-    result = _send_result("call_1", RESULT_MID, CHANNEL, _jump(GUILD, CHANNEL, RESULT_MID))
-    payload = _trace_detail(
-        VALID_SID,
-        2,
-        "completed",
-        None,
-        None,
-        [_msg("user", user_text), _msg("assistant", None, tool_calls=[call]), result],
-    )
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    digest = hashlib.sha256(user_text.encode("utf-8")).hexdigest()
-    assert evidence["request_input_sha256"] == digest
-    assert len(evidence["request_input_sha256"]) == 64  # valid SHA-256 hex
-    # Unicode code points (chars), not UTF-8 bytes.
-    assert evidence["request_input_len"] == len(user_text)
-    assert evidence["request_input_len"] != len(user_text.encode("utf-8"))
-    assert evidence["request_user_count"] == 1
-    _assert_no_canary(evidence)
-
-
-async def test_trace_quoted_job_ref_hint_not_full_proof() -> None:
-    # A different message merely quoting the job ref gets the SAME hint
-    # true, while its input fingerprint differs from the journaled request:
-    # the hint alone must never fake the worker's full-proof check.
-    quoted_text = f"an unrelated quotation that merely cites {JOB} as text"
-    submitted_text = "the actual journaled request body"
-    call = _send_call("call_1", CHANNEL, SOURCE_MID, JOB, content="x")
-    result = _send_result("call_1", RESULT_MID, CHANNEL, _jump(GUILD, CHANNEL, RESULT_MID))
-    payload = _trace_detail(
-        VALID_SID,
-        2,
-        "completed",
-        None,
-        None,
-        [_msg("user", quoted_text), _msg("assistant", None, tool_calls=[call]), result],
-    )
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    assert evidence["request_job_ref_match"] is True  # bounded hint only
-    submitted_sha = hashlib.sha256(submitted_text.encode("utf-8")).hexdigest()
-    assert evidence["request_input_sha256"] != submitted_sha
-    assert evidence["request_input_len"] != len(submitted_text)
-    assert quoted_text not in json.dumps(evidence)
-    # Even all_sends_confirmed cannot replace the fingerprint comparison.
-    assert evidence["all_sends_confirmed"] is True
-
-
-async def test_trace_zero_user_counts_hash_len_none_no_confirm() -> None:
-    call = _send_call("call_1", CHANNEL, SOURCE_MID, JOB, content="x")
-    result = _send_result("call_1", RESULT_MID, CHANNEL, _jump(GUILD, CHANNEL, RESULT_MID))
-    payload = _trace_detail(
-        VALID_SID,
-        2,
-        "completed",
-        None,
-        None,
-        [_msg("system", "sys"), _msg("assistant", None, tool_calls=[call]), result],
-    )
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    assert evidence["request_user_count"] == 0
-    assert evidence["request_input_sha256"] is None
-    assert evidence["request_input_len"] is None
-    assert evidence["request_job_ref_match"] is False
-    assert evidence["all_sends_confirmed"] is False
-
-
-async def test_trace_multi_user_shape_malformed() -> None:
-    # Native turn_slices yields EXACTLY one user frame per trace slice.
-    payload = _trace_detail(
-        VALID_SID,
-        2,
-        "completed",
-        None,
-        None,
-        [_msg("user", f"first [{JOB}]"), _msg("user", f"second [{JOB}]")],
-    )
-    client = await _trace_client(payload)
-    with pytest.raises(ThycaProtocolError) as excinfo:
-        await client.get_trace_evidence(
-            VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-        )
-    assert excinfo.value.reason == "malformed"
-
-
-async def test_trace_extra_messages_cannot_override_first_user_input() -> None:
-    user_text = f"the only user frame [{JOB}]"
-    call = _send_call("call_1", CHANNEL, SOURCE_MID, JOB, content=CANARY_CONTENT)
-    result = _send_result("call_1", RESULT_MID, CHANNEL, _jump(GUILD, CHANNEL, RESULT_MID))
-    payload = _trace_detail(
-        VALID_SID,
-        2,
-        "completed",
-        None,
-        None,
-        [
-            _msg("system", f"system text {CANARY_CONTENT} [{JOB}]"),
-            _msg("user", user_text),
-            _msg("assistant", f"assistant text {CANARY_CONTENT}"),
-            _msg("assistant", None, tool_calls=[call]),
-            result,
-        ],
-    )
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    assert evidence["request_user_count"] == 1
-    assert evidence["request_input_sha256"] == hashlib.sha256(user_text.encode("utf-8")).hexdigest()
-    assert evidence["request_input_len"] == len(user_text)
-    _assert_no_canary(evidence)
-
-
-async def test_trace_nested_unknown_keys_canary_never_raw() -> None:
-    user_text = f"request with {CANARY_CONTENT} [{JOB}]"
-    call = _send_call(
-        "call_1",
-        CHANNEL,
-        SOURCE_MID,
-        JOB,
-        content=CANARY_CONTENT,
-        extra_args={
-            CANARY_KEY: CANARY_CONTENT,
-            "profile": CANARY_PROFILE,
-            "nested": {"deep": [CANARY_CONTENT, {CANARY_MODEL: CANARY_TOOL}]},
-        },
-    )
-    result = _send_result("call_1", RESULT_MID, CHANNEL, _jump(GUILD, CHANNEL, RESULT_MID))
-    result["unknown_key"] = {"deep": CANARY_CONTENT}
-    user_msg = _msg("user", user_text)
-    user_msg["unknown_key"] = {"deep": CANARY_TOOL}
-    payload = _trace_detail(
-        VALID_SID,
-        2,
-        "completed",
-        CANARY_MODEL,
-        {
-            "code": CANARY_KEY,
-            "message": CANARY_ERROR,
-            "nested": {"deep": CANARY_CONTENT},
-            "unknown": [CANARY_PROFILE],
-        },
-        [user_msg, _msg("assistant", None, tool_calls=[call]), result],
-    )
-    client = await _trace_client(payload)
-    evidence = await client.get_trace_evidence(
-        VALID_SID, 2, job_ref=JOB, source_message_id=SOURCE_MID, channel_id=CHANNEL
-    )
-    _assert_no_canary(evidence)
-    # The fingerprint leaves the function; the raw input never does.
-    assert evidence["request_input_sha256"] == hashlib.sha256(user_text.encode("utf-8")).hexdigest()
-    assert user_text not in json.dumps(evidence)
-    assert evidence["error_kind"] == "unknown"
 
 
 # ---- constructor timeout validation (coarse, no value details) ----

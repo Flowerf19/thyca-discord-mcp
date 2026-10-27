@@ -13,8 +13,8 @@ from server import create_server
 
 
 def _acquire_startup_lock(settings: Settings):
-    """Take the single-writer lock beside the delivery state (held for life)."""
-    return acquire_service_lock(derive_lock_path(settings.delivery_state_path))
+    """Take the single-writer lock beside the SQLite store (held for life)."""
+    return acquire_service_lock(derive_lock_path(settings.db_path))
 
 
 def main() -> None:

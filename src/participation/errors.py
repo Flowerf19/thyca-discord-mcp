@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from enum import Enum
-from pathlib import Path
 
 
 class ParticipationError(ValueError):
-    """Corrupt ledger, invalid operation, or failed closed guard."""
+    """Corrupt store, invalid operation, or failed closed guard."""
 
 
 class ParticipationReason(str, Enum):
@@ -29,16 +28,3 @@ class ParticipationPending(ParticipationError):
             raise ParticipationError("participation pending needs a bounded reason")
         self.reason = reason
         super().__init__(f"participation pending: {reason.value}")
-
-
-class ParticipationDurabilityUncertain(ParticipationError):
-    """Post-commit dir fsync failed; file committed, durability unknown.
-
-    committed=True always. Never carries raw OSError text. Callers MUST
-    stop, never rollback/retry/delete the committed file.
-    """
-
-    def __init__(self, path: Path | str) -> None:
-        self.kind = "durability_uncertain"
-        self.committed = True
-        super().__init__(f"participation ledger {path}: commit ok but dir fsync failed")

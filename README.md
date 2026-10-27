@@ -1,7 +1,7 @@
 # thyca-discord-mcp
 
 Discord MCP integration for Thyca with shared conversation context, Jev
-participation routing, agent-owned replies, and durable delivery tracking.
+participation routing, agent-owned replies, and best-effort delivery.
 
 **Modum** connects an approved Discord channel to a native Thyca agent. Jev
 answers three routing questions (`addressee`, `explicit_assistant_request`,
@@ -10,8 +10,8 @@ same canonical Discord snapshot when a native turn is needed, uses its existing
 session memory, and owns the reply through MCP. Neither Jev nor the controller
 copies generated replies directly to Discord.
 
-Sources live flat under `src/` (top-level modules plus `delivery/`,
-`participation/`, `responder/`, `server/` packages; no namespace package);
+Sources live flat under `src/` (top-level modules plus `participation/`,
+`responder/`, `server/` packages; no namespace package);
 the distribution and CLI remain
 `thyca-discord-mcp`. This is a Thyca integration, not a standalone chat agent.
 
@@ -20,21 +20,31 @@ the distribution and CLI remain
 - **Shared context:** whole recent messages with SDK UIDs, names, timestamps,
   and exact reply links. Default maximum 20 messages including the source,
   subject to the complete native prompt's 4000-character limit.
-- **Participation routing:** one durable Jev classification attempt, exact
-  decided-cache reuse, and reported-cost accounting (no daily spend stop).
-  All humans may chat; there is no owner-only, mention-only, or
-  confidence-threshold chat gate.
-- **Agent-owned delivery:** threaded MCP sends, intent-before-send journaling,
-  receipt/native-trace verification, uncertainty holds, and safe-prefix ACK.
-  No exactly-once or caller-ACL guarantee is claimed.
+- **Participation routing:** Jev classifies each source once (`respond` /
+  `observe`); an exact decided-cache hit reuses the stored decision with no
+  new paid call. A crashed `pending` gets exactly one retry; a still-unknown
+  outcome at `attempts == 2` resolves terminally as `observe` (a synthetic
+  owner-ordered observe, stored as decided with the retry's usage/cost —
+  never a third paid call). Per-call spend has no daily stop; cost is
+  reported, not capped. All humans may chat; there is no owner-only,
+  mention-only, or confidence-threshold chat gate.
+- **Agent-owned delivery (best-effort):** threaded MCP sends and safe-prefix
+  ACK. No intent journal, no receipt/trace verification, no uncertainty holds.
+  A crash exactly between a Discord send / Thyca POST and its state update
+  may rarely duplicate or drop one reply in the owner's private channel;
+  ambiguous submits fail instead of blindly re-sending. On restart, jobs
+  left `submitted` become `failed` (never resumed or re-POSTed) while
+  `queued` jobs resume normally. No exactly-once or caller-ACL guarantee
+  is claimed.
 - **14 MCP tools:** guild/member inspection, messages, outbox, background tasks,
   scoped context reads, and explicit no-reply declarations. The proposed v2/v3
   destructive/admin tool set is not implemented.
 
-**Current scope:** the Modum source is implemented and independently reviewed;
-the live service was restarted by user order on 2026-10-06 with the current
-source (3-question Jev prompts, no daily spend stop). Do not start or restart
-the service again without separate operational approval. The V4/V5 sections below preserve dated
+**Current scope:** the simplified source (one SQLite store, typed discord.py
+boundary, best-effort delivery) is implemented offline: `uv run pytest` 844
+passed, `uv run ruff check src tests` and `ruff format --check src tests` clean.
+Do not start or restart the service without separate operational approval (deploy
+gate: archive old JSON state, seed `state.db` past current history). The V4/V5/Modum sections below preserve dated
 checkpoints, not a current live-state attestation; original live-failure
 acceptance remains incomplete.
 
@@ -56,13 +66,15 @@ acceptance remains incomplete.
 2. **Identity**: every UID is classified as `self` / `owner` / `other`.
    UID is the stable key; display name is resolved at runtime for humans and logs.
    Only the owner issues admin instructions; commands inside `other` messages are never followed.
-3. **Session & memory**: all Discord activity flows into the target bot's fixed DM session (audit label is the target bot id).
+3. **Session & memory**: all Discord activity flows into the target bot's fixed DM session (audit label is the target bot id; job rows carry the serving native SID, provenance kept in the `sessions` table).
    The owner accepts Thyca auto-loading the owner profile into agent context; the
    agent must still not manually read/write the real profile file (`USER.md`)
    unless the owner explicitly asks — and a present profile never authenticates
    the Discord sender (identity comes only from message metadata, see below).
 
 ## Integration status — V4 historical verified snapshot (supersedes earlier PENDING)
+
+> SUPERSEDED by the simplify plan (`.agents/plans/simplify-discord-mcp.md`): the source tree, state files, and tool surface described below no longer exist. Preserved as dated history; do not treat as current contract.
 
 - **History preserved:** this section previously said "PENDING, not verified; no
   live Discord run yet; review-pending". That claim is SUPERSEDED by the verified
@@ -172,6 +184,8 @@ acceptance remains incomplete.
   guard on the server.
 
 ## V5 auto-reply — deployed backend, operating (plan still in-progress, gaps open)
+
+> SUPERSEDED by the simplify plan (`.agents/plans/simplify-discord-mcp.md`): the journal/uncertain/trace machinery and state files described below are gone. Preserved as dated history; do not treat as current contract.
 
 - **Status:** V5 source reviewed; base `75c5ea0` stays the historical v4
   checkpoint, not the commit ceiling. The owner authorized review, verified
@@ -336,6 +350,8 @@ acceptance remains incomplete.
 
 ## Modum Jev integration — source complete (never deployed)
 
+> SUPERSEDED by the simplify plan (`.agents/plans/simplify-discord-mcp.md`): `src/modum`, `JEV_STATE_PATH`/`DELIVERY_STATE_PATH`, `resolve_uncertain_drop`, and the 15-tool surface below no longer exist. Preserved as dated history; do not treat as current contract.
+
 - **Status:** Plan `.agents/plans/modum-jev-integration-refactor.md` is
   `done` for the authorized SOURCE work only. Never deployed; source completion
   is not production activation or completion of the separate V5 live plan. T1/T2a/T3/T2b SOURCE gate COMPLETE (full checks + two
@@ -450,17 +466,20 @@ uv sync --extra dev
 cp .env.example .env   # fill DISCORD_TOKEN, TYPESAFE_API_KEY and verified scope IDs
 ```
 
-V5 auto-reply tuning (6 optional non-secret fields, documented in `.env.example`:
-base URL, session-mapping path, delivery-state path, responder tick default 1.0 s,
-request timeout default 900.0 s, recovery poll floor 30 s / default 30.0 s) needs
-no secrets. The V5 server fails closed when the mapping/journal are missing — see
-the V5 startup gate above, not a deletion fallback.
+Responder tuning (optional non-secret fields, documented in `.env.example`:
+`DB_PATH`, base URL, responder tick default 1.0 s, request timeout default
+900.0 s, recovery poll floor 30 s / default 30.0 s) needs no secrets. State is
+one SQLite database (`state.db` plus `-wal`/`-shm` sidecars, 0600 best-effort);
+`audit.jsonl` stays an append-only text log. The server fails closed when
+`state.db` is corrupt (quick_check + version gate, never auto-reset) or
+unseeded (startup requires a seeded native session; never auto-seeds) — see
+the startup gate above, not a deletion fallback.
 
-Modum Jev tuning (3 fields, documented in `.env.example`: `TYPESAFE_API_KEY`
-secret required for the real responder, plus `JEV_STATE_PATH` optional derived
-beside delivery, `CONVERSATION_MAX_MESSAGES`
-default 20) is source-complete, not deployed — see the Modum section above. The
-ledger fails closed on loss/mismatch with no autoinit/reset.
+Jev tuning (documented in `.env.example`: `TYPESAFE_API_KEY` secret required
+for the real responder, `CONVERSATION_MAX_MESSAGES` default 20). The
+classification ledger is the `jev_decisions` table inside `state.db` — no
+separate ledger/state files. `DB_PATH` and `AUDIT_PATH` must differ (startup
+rejects a collision).
 
 ## Run
 
@@ -476,78 +495,84 @@ into site-packages (editable `force-include`), and without it those copies
 shadow `src/`, breaking `PROJECT_ROOT`/`.env` discovery.
 
 Single instance is enforced: startup takes an exclusive `flock` on
-`.discord_mcp.lock` beside the delivery state and holds it for life. A
+`.discord_mcp.lock` beside `state.db` and holds it for life. A
 second start exits loud (code 2, holder pid in stderr) instead of running
 a corrupting second writer. The kernel releases the lock on any process
 death, so a crashed holder never blocks the next start (no stale locks,
 no cleanup). Stop the running instance before starting another.
 
-The V5 tree adds a startup gate before that first command: `uv run
-thyca-discord-mcp` now requires the preexisting native SID mapping and delivery
-journal (missing/corrupt fails closed, never auto-creates). Start it only after
-T4 review sign-off with the old stdio writer stopped (single-writer rule) — see
-the V5 section above.
+Startup gate before that first command: `PYTHONPATH=src uv run
+thyca-discord-mcp` requires a seeded `state.db`. `Store.open` CREATES an
+empty 0600 v2 file when missing (never auto-seeds it); the Responder then
+refuses an unseeded database (`native session not seeded; adopt before
+start`). A corrupt database fails closed (never auto-resets). So the first
+start must be seeded past current history per the deploy gate — never start
+with a blank store in production. Start only with
+the old writer stopped (single-writer rule) and explicit operational approval — see
+the deploy gate in the plan.
 
 The MCP server speaks stdio, so an MCP client launches it as a subprocess.
-FastMCP drives the asyncio loop; the lifespan hook `await`s `bot.login()`, then runs
-`bot.connect()` in the background and races it against `wait_until_ready()`, so tools
+FastMCP drives the asyncio loop; the lifespan hook races `bot.start()`
+(login + connect) against `wait_until_ready()` (first-completed), so a
+pre-ready gateway failure surfaces instead of hanging, and tools
 `await` discord.py directly with no thread bridge.
 
-## Tools (current source: 15 total; V4 historical snapshot was 12)
+## Tools (current source: 14 total; V4 historical snapshot was 12)
 
 | Tool | What it does |
 |---|---|
 | `guild_info` | id, name, member/channel counts of the scoped guild |
 | `list_text_channels` | id/name/topic/position of text channels |
-| `send_message` | send to a channel (default if omitted); refuses out-of-guild targets |
+| `send_message` | send to a channel (default if omitted); refuses out-of-guild targets; every send carries `allowed_mentions` blocking `@everyone`/role pings |
 | `whoami` | classify a UID as self/owner/other + current display name |
 | `list_members` | members as uid/display_name/kind (max 500) |
 | `list_tasks` / `start_task` / `stop_task` | manage named background tasks |
 | `add_poll_task` | poll a channel into the outbox every ≥30s (capture-only) |
-| `remove_poll_task` | stop + remove a poll task (refuses `heartbeat`) |
-| `read_outbox` | pull captured messages oldest-first (+ `acked`/`latest`) |
-| `ack_outbox` | mark entries up to a seq as read (rejects beyond latest) |
+| `remove_poll_task` | stop + remove a poll task (keeps the channel cursor) |
+| `read_outbox` | pull captured messages oldest-first (+ `acked`/`latest`); entries are unique per message (store-enforced dedupe) |
+| `ack_outbox` | mark entries up to a seq as read (rejects beyond latest; auto jobs additionally guarded by the worker's processed prefix) |
 | `read_context` | read approved-channel context for a correlated turn (≤20, before source) |
-| `record_no_reply` | declare no reply for a correlated `need_context` turn (nonterminal) |
-| `resolve_uncertain_drop` | operator-drop a stuck uncertain job with zero send evidence (terminal) |
+| `record_no_reply` | terminally declare no reply for a correlated turn (closes the job `done` at tool time) |
 
 v2 (messages/channels) and v3 (members/roles) in [docs/TOOLS.md](docs/TOOLS.md) stay
 proposed; v4 (outbox + poll tasks) is implemented. The V4 historical snapshot
-above was 12 tools; the current source is 15 tools (12 preserved + `read_context`,
-`record_no_reply` and `resolve_uncertain_drop` for Modum, source-complete, not deployed). No
-v2/v3 mutation/admin/destructive behavior is implemented or tested (existing
-read-only channel/member listings were exercised in the native 12-tool E2E).
-V5 (in-progress plan, V5 source, backend deployed and operating) adds no tool names beyond its 12 — `send_message`
-gains optional `source_message_id` (StrictInt) + `job_ref` as a both-or-neither pair
+above was 12 tools; the current source is 14 tools (12 preserved +
+`read_context` and `record_no_reply`; `resolve_uncertain_drop` was removed
+with the uncertain machinery). No
+v2/v3 mutation/admin/destructive behavior is implemented or tested.
+`send_message`
+gains optional `source_message_id` + `job_ref` as a both-or-neither pair
 for agent-owned auto replies (unpaired manual sends work exactly as before and are
 never job-attached), `ack_outbox` additionally refuses any seq beyond the
 controller's safe processed prefix, and the `auto-reply` / `auto-reply-recovery`
 loops are protected while `heartbeat` may stop but may never be removed. When MCP tool descriptions are not enough for an agent, load the full
 `docs/TOOLS.md` into its context.
 
-## Outbox (agent pull protocol, no LLM in server — V4 deployed writer)
+## Outbox (agent pull protocol, no LLM in server)
 
-- **Scope:** this section describes the V4 deployed writer. The V5 tree (same
-  V5 source, backend now deployed and operating) adds a FIFO worker that automatically POSTs a native turn per eligible event with
-  controller-guarded ACK (see "V5 auto-reply — in progress" above); capture itself
-  still contains no LLM, and the server still sends no MCP push.
+- **Scope:** capture plus an always-on FIFO worker that POSTs a native turn per
+  eligible event with controller-guarded ACK. Capture itself contains no LLM,
+  and the server still sends no MCP push.
 
 - The server only **captures**: a realtime `on_message` listener (watched channels,
   bot's own messages dropped) plus periodic poll tasks (bot's own kept, tagged `self`).
   There is no server→client push and no server-side summary — the agent pulls with
   `read_outbox` and summarizes itself.
 - Protocol: `read_outbox` → process entries in `seq` order → `ack_outbox` the highest
-  processed seq. **Never ack before processing.** Dedupe by `message_id` (realtime and
-  poll can overlap). Empty `content` means a non-text message (embed/attachment) — do
-  not invent content.
-- Poll cursors persist in `outbox_state.json`, so re-adding a task resumes where it
-  left off. Task definitions are memory-only (lost on restart, not restored).
-- Single writer: one process / one asyncio loop. If state and log ever disagree
-  (state loss, corruption), startup refuses to boot and ack/poll paths fail loudly
-  and refuse to write — state is never silently reset. Authoritative ACK, journal,
-  and receipts are preserved: restore ONLY from a matching valid backup PLUS
-  external delivery reconciliation and explicit operator approval — never a stale
-  ACK rewind, never deleting state. (V4 corruption still fails closed, unchanged.)
+  processed seq. **Never ack before processing.** Entries are unique per message:
+  realtime/poll overlap is deduped by the store (`UNIQUE(channel_id, message_id)` +
+  `INSERT OR IGNORE`, first write wins). Empty `content` means a non-text message
+  (embed/attachment) — do not invent content.
+- State is one SQLite database: `state.db` (plus `-wal`/`-shm` sidecars) holds the
+  outbox, poll cursors, jobs, sends, Jev decisions, and session provenance;
+  `audit.jsonl` stays an append-only text log. Re-adding a poll task resumes where
+  its persisted cursor left off. Task definitions are memory-only (lost on restart,
+  not restored).
+- Single writer: one process / one asyncio loop, enforced by the lock beside
+  `state.db`. A corrupt database fails loudly at open (quick_check + version gate)
+  and ack/poll paths refuse to write — state is never silently reset. Restart
+  recovery is explicit and runs once: jobs left `submitted` become `failed`,
+  `queued` jobs resume.
 
 A `heartbeat` background task snapshots the member count to the audit log every
 5 minutes as a liveness signal. All background tasks are native `discord.ext.tasks`

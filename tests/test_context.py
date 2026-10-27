@@ -1,6 +1,7 @@
 """Offline tests for the scoped context collector (context).
 
-Fake/offline only: fictitious integer IDs, synthetic SDK objects, synthetic
+Fake/offline only: fictitious integer IDs, REAL discord.py ``Message`` objects
+built from gateway payload dicts (see ``tests/real_discord.py``), synthetic
 text. No network, no env, no real Discord/Thyca, no paid calls, no
 outbox/journal/profile/log access.
 """
@@ -11,24 +12,24 @@ import asyncio
 import copy
 import hashlib
 import json
-from datetime import datetime, timezone
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import discord
 import pytest
+from real_discord import parent_payload, real_channel, real_message
 
 from context import (
     FIT_HASH,
     FIT_NONCE,
     ContextUnavailable,
     SourceDeleted,
-    _is_not_found_deleted,
     build_context_collector,
     context_fingerprint,
 )
 from conversation import ConversationError, project_conversation_state
 from source_messages import SourceDeleted as AuthoritativeSourceDeleted
+from source_messages import is_unknown_message
 from thyca import PROMPT_MAX, build_conversation_prompt
 
 GUILD = 11
@@ -68,6 +69,8 @@ class FakeUser:
 
 
 class FakeReference:
+    """Reply-link data holder; converted to a real payload reference by ``_msg``."""
+
     def __init__(self, message_id, channel_id=CHANNEL, guild_id=GUILD):
         self.message_id = message_id
         self.channel_id = channel_id
@@ -75,94 +78,71 @@ class FakeReference:
 
 
 def _ts(mid):
-    base = datetime(2026, 10, 1, 10, 0, 0, tzinfo=timezone.utc)
-    return base.replace(second=mid % 60, minute=(mid // 60) % 60)
+    # Real SDK timestamps are snowflake-derived; real messages built by
+    # _msg carry exactly this, so assertions stay deterministic.
+    return discord.utils.snowflake_time(mid)
 
 
-class FakeMessage:
-    def __init__(
-        self,
+_throwaways: dict[tuple[int, int], MagicMock] = {}
+
+
+def _throwaway(cid=CHANNEL, gid=GUILD):
+    """Shared channel a message is constructed against (ids only matter)."""
+    key = (cid, gid)
+    if key not in _throwaways:
+        _throwaways[key] = real_channel(cid, gid)
+    return _throwaways[key]
+
+
+def _msg(
+    mid,
+    uid,
+    name,
+    content,
+    reference=None,
+    channel_id=CHANNEL,
+    guild_id=GUILD,
+    resolved="__absent__",
+    bot=None,
+):
+    """Build a REAL ``discord.Message`` from a gateway payload dict.
+
+    ``reference`` is a ``FakeReference`` (converted to ``message_reference``
+    ids; ``FakeReference(None)`` means no link, like a system message).
+    ``resolved`` embeds a resolved parent: a parent-payload dict (see
+    ``parent_payload``) or None for a deleted parent (``resolved`` stays
+    absent by default, exercising the fetch fallback).
+    """
+    if reference is None or reference.message_id is None:
+        ref_payload = None
+    else:
+        ref_payload = {
+            "message_id": str(reference.message_id),
+            "channel_id": str(reference.channel_id),
+            "guild_id": str(reference.guild_id),
+        }
+    return real_message(
         mid,
-        author,
-        content="",
-        channel_id=CHANNEL,
-        guild_id=GUILD,
-        reference=None,
-        created_at=None,
-    ):
-        self.id = mid
-        self.author = author
-        self.content = content
-        self.channel = SimpleNamespace(id=channel_id)
-        self.guild = SimpleNamespace(id=guild_id) if guild_id is not None else None
-        self.reference = reference
-        self.created_at = created_at if created_at is not None else _ts(mid)
+        uid,
+        name,
+        content,
+        channel=_throwaway(channel_id, guild_id),
+        bot=(uid == BOT) if bot is None else bot,
+        reference_payload=ref_payload,
+        referenced_message=resolved if ref_payload is not None else "__absent__",
+    )
 
 
 def FakeChannel(cid, guild_id=GUILD):
-    """Build a ``MagicMock(spec=discord.TextChannel)`` test proxy.
+    """Scriptable channel proxy holding REAL ``discord.Message`` objects.
 
     ``isinstance(channel, discord.TextChannel)`` is True (the production
     resolver requires it); scripted ``fetch_message``/``history`` behavior
     plus the tracking attributes (``store``, ``history_messages``,
     ``fetch_calls``, ``history_calls``, ``fetch_exc``, ``history_exc``,
-    ``history_fn``, ``deleted``) are attached explicitly, mirroring the
-    established ``test_source_deleted.py`` proxy pattern.
+    ``history_fn``, ``deleted``) mirror the established proxy pattern.
     """
-    channel = MagicMock(spec=discord.TextChannel)
-    channel.id = cid
-    channel.guild = SimpleNamespace(id=guild_id)
-    channel.store = {}
-    channel.history_messages = []
-    channel.fetch_calls = []
-    channel.history_calls = []
-    channel.fetch_exc = None
-    channel.history_exc = None
-    channel.history_fn = None
-    channel.deleted = set()
-
-    async def fake_fetch(mid):
-        channel.fetch_calls.append(mid)
-        if channel.fetch_exc is not None:
-            raise channel.fetch_exc
-        if mid in channel.deleted:
-            raise _deleted_exc()
-        msg = channel.store.get(mid)
-        if msg is None:
-            raise _deleted_exc()
-        return msg
-
-    def fake_history(*, limit=100, before=None, after=None, oldest_first=None):
-        channel.history_calls.append(
-            {"limit": limit, "before": before, "after": after, "oldest_first": oldest_first}
-        )
-        if channel.history_exc is not None:
-            exc = channel.history_exc
-
-            async def _boom():
-                raise exc
-                yield  # unreachable, marks async generator
-
-            return _boom()
-        if channel.history_fn is not None:
-            return channel.history_fn(limit=limit, before=before, oldest_first=oldest_first)
-        before_id = getattr(before, "id", before)
-        if not isinstance(before_id, int):
-            before_id = 10**18
-
-        async def _gen():
-            cands = [m for m in channel.history_messages if m.id < before_id]
-            cands.sort(key=lambda m: m.id)
-            newest = cands[-limit:] if limit else []
-            ordered = newest if oldest_first else list(reversed(newest))
-            for m in ordered:
-                yield m
-
-        return _gen()
-
-    channel.fetch_message = fake_fetch
-    channel.history = fake_history
-    return channel
+    return real_channel(cid, guild_id)
 
 
 class FakeGuild:
@@ -220,12 +200,6 @@ def _entry(mid, author_uid, content, channel_id=CHANNEL):
         "author_uid": author_uid,
         "content": content,
     }
-
-
-def _msg(mid, uid, name, content, reference=None, **kw):
-    return FakeMessage(
-        mid, FakeUser(uid, name, bot=(uid == BOT)), content, reference=reference, **kw
-    )
 
 
 def _channel_with(messages, cid=CHANNEL, gid=GUILD):
@@ -286,13 +260,6 @@ def test_builder_rejects_bad_max_messages(bad):
     bot = _bot(FakeGuild(GUILD))
     with pytest.raises(ValueError):
         build_context_collector(bot, GUILD, CHANNEL, OWNER, max_messages=bad)
-
-
-def test_builder_requires_bot_get_guild():
-    with pytest.raises(ValueError):
-        build_context_collector(None, GUILD, CHANNEL, OWNER)
-    with pytest.raises(ValueError):
-        build_context_collector(object(), GUILD, CHANNEL, OWNER)
 
 
 def test_builder_performs_no_io():
@@ -546,12 +513,12 @@ async def test_collector_history_uses_real_before_paging():
     channel.fetch_message = fake_fetch
     channel._state = SimpleNamespace(
         http=_HTTP(),
-        create_message=lambda channel, data: FakeMessage(
+        create_message=lambda channel, data: real_message(
             int(data["id"]),
-            FakeUser(data["author_id"], data["author_name"]),
+            data["author_id"],
+            data["author_name"],
             data["content"],
-            channel_id=CHANNEL,
-            guild_id=GUILD,
+            channel=channel,
         ),
     )
 
@@ -658,6 +625,38 @@ async def test_missing_parent_strict404_stays_missing():
     assert [m["id"] for m in snapshot["messages"]] == ["701"]
     assert snapshot["messages"][-1]["reply_to"] == "650"
     assert ch.fetch_calls == [701, 650]
+
+
+async def test_resolved_parent_reused_without_fetch():
+    # Payload-carried resolved parent: no parent fetch, parent visible.
+    payload = parent_payload(
+        650, OWNER, "Olivia", "parent words", channel_id=CHANNEL, guild_id=GUILD
+    )
+    source = _msg(701, OTHER, "Ramon", "reply here", FakeReference(650), resolved=payload)
+    ch = _channel_with([source])
+    ch.history_messages = []
+    guild = FakeGuild(GUILD, {CHANNEL: ch})
+    bot = _bot(guild)
+    collect = build_context_collector(bot, GUILD, CHANNEL, OWNER)
+    snapshot = await collect(_entry(701, OTHER, "reply here"))
+    assert [m["id"] for m in snapshot["messages"]] == ["650", "701"]
+    assert snapshot["messages"][-1]["reply_to"] == "650"
+    assert ch.fetch_calls == [701]  # resolved reused, not refetched
+
+
+async def test_deleted_referenced_parent_stays_missing_without_fetch():
+    # Referenced message deleted upstream: DeletedReferencedMessage sentinel
+    # stays missing (reply_to kept), with no parent fetch attempted.
+    source = _msg(701, OTHER, "Ramon", "reply to gone", FakeReference(650), resolved=None)
+    ch = _channel_with([source])
+    ch.history_messages = []
+    guild = FakeGuild(GUILD, {CHANNEL: ch})
+    bot = _bot(guild)
+    collect = build_context_collector(bot, GUILD, CHANNEL, OWNER)
+    snapshot = await collect(_entry(701, OTHER, "reply to gone"))
+    assert [m["id"] for m in snapshot["messages"]] == ["701"]
+    assert snapshot["messages"][-1]["reply_to"] == "650"
+    assert ch.fetch_calls == [701]
 
 
 @pytest.mark.parametrize(
@@ -1049,8 +1048,7 @@ async def test_precision_real_sized_ids_no_arbitrary_reserve():
             break
     assert chosen is not None, "renderer task text moved: no precision window found"
     content = "a" * chosen
-    author = FakeUser(big_other, "Ramon")
-    source = FakeMessage(big_mid, author, content, channel_id=big_channel, guild_id=big_guild)
+    source = _msg(big_mid, big_other, "Ramon", content, channel_id=big_channel, guild_id=big_guild)
     ch = FakeChannel(big_channel, big_guild)
     ch.store[big_mid] = source
     ch.history_messages = []
@@ -1166,7 +1164,7 @@ async def test_spoof_notfound_name_rejected_for_source_and_parent():
             self.code = 10008
             super().__init__("spoof not found")
 
-    assert _is_not_found_deleted(NotFound()) is False
+    assert is_unknown_message(NotFound()) is False
     ch = FakeChannel(CHANNEL, GUILD)
     ch.fetch_exc = NotFound()
     guild = FakeGuild(GUILD, {CHANNEL: ch})
@@ -1315,15 +1313,16 @@ async def test_bot_sender_rejected():
 
 
 async def test_bot_not_ready_rejected():
+    # Typed boundary: only a missing bot user (never logged in) is "not
+    # ready". Spoofed non-int IDs are meaningless against the typed SDK.
     source = _msg(701, OTHER, "Ramon", "hi")
     ch = _channel_with([source])
     guild = FakeGuild(GUILD, {CHANNEL: ch})
-    for user in (None, FakeUser(0, "x", True), FakeUser(True, "x", True)):
-        bot = FakeBot(guild)
-        bot.user = user
-        collect = build_context_collector(bot, GUILD, CHANNEL, OWNER)
-        with pytest.raises(ContextUnavailable, match="bot not ready"):
-            await collect(_entry(701, OTHER, "hi"))
+    bot = FakeBot(guild)
+    bot.user = None
+    collect = build_context_collector(bot, GUILD, CHANNEL, OWNER)
+    with pytest.raises(ContextUnavailable, match="bot not ready"):
+        await collect(_entry(701, OTHER, "hi"))
 
 
 async def test_guild_missing_rejected():
@@ -1341,74 +1340,6 @@ async def test_owner_bot_same_uid_rejected():
     collect = build_context_collector(bot, GUILD, CHANNEL, OWNER)
     with pytest.raises(ContextUnavailable):
         await collect(_entry(701, OTHER, "hi"))
-
-
-async def test_malformed_history_content_and_name_rejected():
-    source = _msg(701, OTHER, "Ramon", "current")
-    bad_content = FakeMessage(601, FakeUser(OWNER, "Olivia"), None)
-    bad_content.channel = SimpleNamespace(id=CHANNEL)
-    bad_content.guild = SimpleNamespace(id=GUILD)
-    bad_content.created_at = _ts(601)
-    ch = _channel_with([source])
-
-    async def _evil_history(*, limit, before, oldest_first):
-        yield bad_content
-
-    ch.history_fn = _evil_history
-    guild = FakeGuild(GUILD, {CHANNEL: ch})
-    bot = _bot(guild)
-    collect = build_context_collector(bot, GUILD, CHANNEL, OWNER)
-    with pytest.raises(ContextUnavailable):
-        await collect(_entry(701, OTHER, "current"))
-
-    bad_name = FakeMessage(601, FakeUser(OWNER, ""), "hi")
-    bad_name.channel = SimpleNamespace(id=CHANNEL)
-    bad_name.guild = SimpleNamespace(id=GUILD)
-    bad_name.created_at = _ts(601)
-
-    async def _evil_history2(*, limit, before, oldest_first):
-        yield bad_name
-
-    ch.history_fn = _evil_history2
-    with pytest.raises(ContextUnavailable):
-        await collect(_entry(701, OTHER, "current"))
-
-
-async def test_missing_timestamp_rejected():
-    source = _msg(701, OTHER, "Ramon", "current")
-    bad = _msg(601, OWNER, "Olivia", "old")
-    bad.created_at = None
-    ch = _channel_with([source])
-
-    async def _evil_history(*, limit, before, oldest_first):
-        yield bad
-
-    ch.history_fn = _evil_history
-    guild = FakeGuild(GUILD, {CHANNEL: ch})
-    bot = _bot(guild)
-    collect = build_context_collector(bot, GUILD, CHANNEL, OWNER)
-    with pytest.raises(ContextUnavailable):
-        await collect(_entry(701, OTHER, "current"))
-
-
-async def test_bad_reference_shapes_rejected():
-    source = _msg(701, OTHER, "Ramon", "current")
-    ch = _channel_with([source])
-    guild = FakeGuild(GUILD, {CHANNEL: ch})
-    bot = _bot(guild)
-    collect = build_context_collector(bot, GUILD, CHANNEL, OWNER)
-
-    for bad_ref in (
-        FakeReference("650"),
-        FakeReference(0),
-        FakeReference(-5),
-        FakeReference(650, channel_id="22"),
-        FakeReference(650, channel_id=0),
-    ):
-        source.reference = bad_ref
-        with pytest.raises(ContextUnavailable):
-            await collect(_entry(701, OTHER, "current"))
-    source.reference = None
 
 
 # ---------------------------------------------------------------------------

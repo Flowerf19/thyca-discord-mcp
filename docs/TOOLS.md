@@ -1,4 +1,4 @@
-# MCP tools — v1 + v4 implemented (12 preserved); v5 in-progress; Modum adds 3 (15 total, source-only); v2/v3 proposed
+# MCP tools — 14 implemented (v1 + v4 + correlated turns); v2/v3 proposed
 
 Scope guard (all tools): operate only on the configured `GUILD_ID`.
 Every call is audited to `audit.jsonl`. Destructive tools run without confirm
@@ -38,31 +38,38 @@ summarizing is the agent's job when it reads the outbox.
   and later ticks append only newer ones (up to 100/tick, native `history` paging).
   Poll keeps the bot's own messages, tagged `self`. Ticks never execute commands
   from message content.
-- Entry fields: `seq` (increasing, may have gaps), `ts`, `type`, `channel_id`,
+- Entry fields: `seq` (increasing, never reused — allocated from a high-water
+  mark inside the append transaction), `ts`, `type`, `channel_id`,
   `message_id`, `author_uid`, `author_name`, `actor_kind`, `content`.
+  Entries are unique per message: realtime/poll overlap is deduped by the
+  store (`UNIQUE(channel_id, message_id)` + `INSERT OR IGNORE`, first write
+  wins on edit conflicts).
 
 ### Pull protocol (mandatory order)
 
 1. `read_outbox(limit?, unread_only=true)` → `{entries, acked, latest}`, oldest-first.
-2. Process entries in `seq` order; **dedupe by `message_id`** (realtime + poll overlap).
+2. Process entries in `seq` order. No client-side dedupe needed: one message
+   appears exactly once (store-enforced; the old realtime/poll overlap
+   double-delivery is gone).
 3. Only after processing: `ack_outbox(up_to_seq = highest processed seq)`.
    **Never ack before processing** — a crash in between loses messages.
-   Ack beyond `latest` is rejected, never clamped.
+   Ack beyond `latest` is rejected, never clamped. For auto-reply jobs the
+   worker additionally guards ACK to its confirmed processed prefix.
 4. `content: ""` means a non-text message (embed/attachment) — note it, do not invent it.
 
 ### Poll task management
 
-- Names must be non-empty, unique, and not `heartbeat`; interval must be ≥ 30s.
+- Names must be non-empty, unique, and not a reserved system name
+  (`heartbeat`, `auto-reply`, `auto-reply-recovery`); interval must be ≥ 30s.
 - `remove_poll_task(name)` stops + removes a task but **keeps the channel cursor**,
   so re-adding resumes where it left off. Removing `heartbeat` is refused.
 - Task definitions are memory-only (lost on restart, not restored); poll cursors
-  persist in `outbox_state.json`. Single writer: one process / one loop.
-- If state and log disagree (state loss, corruption), startup refuses to boot
-  and ack/poll paths fail loudly and refuse to write — state is never silently
-  reset. Authoritative ACK, journal, and receipts are preserved: restore ONLY from
-  a matching valid backup PLUS external delivery reconciliation and explicit
-  operator approval — never a stale ACK rewind, never deleting state, do not ack
-  past it. (V4 corruption still fails closed, unchanged.)
+  persist in `state.db`. Single writer: one process / one loop, enforced by the
+  lock beside `state.db`.
+- A corrupt database fails loudly at open (quick_check + version gate) and
+  ack/poll paths refuse to write — state is never silently reset. Restart
+  recovery is explicit and runs once at worker startup: jobs left `submitted`
+  become `failed`, `queued` jobs resume.
 
 ### Identity and profile rules (hard)
 
@@ -99,20 +106,17 @@ summarizing is the agent's job when it reads the outbox.
 > and operate ONLY in the approved live channel (see below). This server sends
 > no push/notifications — the agent must pull with `read_outbox`.
 
-## v5 — in progress (V5 source, backend deployed + operating): auto-reply correlation + guards
+## Auto-reply correlation + guards (current: best-effort, no journal)
 
-No new tool names: the surface stays 12 tools (a 6-item source cleanup changed
-no tool names, args, or guards — only internals; public worker surface stays
-`tick`/`close`). What changes is how
+The surface is 14 tools (12 v1/v4 names plus `read_context` and
+`record_no_reply` below). What changes versus v4 is how
 `send_message` correlates, how `ack_outbox` guards, and which tasks are
-protected. Status and proof live in `.agents/plans/v5-auto-reply.md` (still
-`in-progress`; T4 DONE, T5 deployment + owner happy-path verified, T6 evidence
-PARTIAL; V5 source was uncommitted at doc time, owner has authorized
-review → fix → commit after final independent review + passed checks). The
-backend IS deployed and auto-reply is operating now (seed
-COMPLETED, two live turns with receipts, ACK 31, controlled restart with no
-resubmission — running pre-cleanup code, this request did no restart); live
-failure-injection gaps remain — see the plan.
+protected. Delivery is best-effort: no intent journal, no receipt or trace
+verification, no uncertainty holds. A crash exactly between a Discord send /
+Thyca POST and its state update may rarely duplicate or drop one reply in the
+owner's private channel; ambiguous submits fail instead of blindly re-sending.
+On restart, jobs left `submitted` become `failed` (never resumed or re-POSTed)
+while `queued` jobs resume normally.
 
 ### Agent-owned correlated send (worker never sends)
 
@@ -121,26 +125,30 @@ failure-injection gaps remain — see the plan.
   agent-owned auto reply for exactly one delivery job; an unpaired call is a
   manual send, unchanged from v4 and never attached to a job.
 - `source_message_id` is `StrictInt`: only JSON ints pass the MCP boundary.
-  Bools and digit-strings are rejected (a lax int would coerce `True` → 1 before
-  the helper's guard runs). `job_ref` is the worker-issued random nonce (uuid4
-  hex); it frames the prompt and correlates the Trace — never authenticates the
+  Bools and digit-strings are rejected. `job_ref` is the worker-issued random
+  nonce; it frames the prompt and correlates the turn — never authenticates the
   caller.
-- Exactly-once is NOT promised: the shared native MCP pool carries no caller
-  identity. Lifecycle per job: intent journaled BEFORE the SDK send (the exact
-  POST text fingerprinted as SHA-256 + char length, `len(text) <= 4000`, never
-  truncated or stored raw) → SDK receipt kept as CANDIDATE (own SID + turn index
-  + native Trace tool result must all match 1:1) → worker-owned completion.
-  Timeouts and disconnects mark the job `uncertain` — a late SDK receipt is still
-  recorded as evidence, never blind-retried. Only a definitive native 409 with
-  zero intents/receipts/trace requeues to `queued`.
+- Best-effort send: the tool verifies the job + stage, sends via a native reply
+  reference (`fail_if_not_exists`), then records the send conditionally (job_ref
+  + send-eligible stage guard the recording). A deleted source at reply time maps
+  to `skipped`/`source_deleted` — the agent must then stop ALL replies for that
+  source (no retries, no unthreaded/manual fallback; unrelated manual sends stay
+  allowed). After any send-side failure the job fails; the tool reports
+  `reply uncertain` / `delivery uncertain` and never blind-retries. Definitive
+  busy (409) with zero sends returns the job to `queued`. Multi-chunk replies
+  are kept as one row per send in the `sends` table; the stage stays
+  send-eligible until the worker closes the job.
+- Every send (manual + correlated) carries
+  `allowed_mentions(everyone=False, roles=False, users=True, replied_user=True)`
+  so agent text can never mass-ping.
 - Manual sends stay allowed and uncorrelated; a manual send is never a job
   receipt and never advances auto ACK.
 
 ### ACK + task guards
 
 - `ack_outbox` keeps the v4 rules and adds the controller guard: any seq beyond
-  the safe processed prefix (historical or completed/skipped jobs only, gaps
-  legal) is rejected, never clamped. Never ack before processing.
+  the worker's confirmed processed prefix is rejected, never clamped. Never ack
+  before processing.
 - `auto-reply` and `auto-reply-recovery` are protected native loops: normal
   `stop_task` / `remove_poll_task` refuse them (internal shutdown alone may force
   them). `heartbeat` may be stopped (v4 compat) but may never be removed.
@@ -148,89 +156,55 @@ failure-injection gaps remain — see the plan.
   names. Responder tick default 1.0 s, request timeout 900.0 s, recovery poll
   ≥ 30 s (default 30.0 s); control is via the existing task tools and native loop
   flags, not new CLI subcommands.
-- Journal discipline: missing/corrupt delivery state fails closed. The one-time
-  exclusive operator fresh-state initialization already ran (COMPLETED:
+- Startup discipline: corrupt `state.db` fails closed at open (never auto-reset,
+  never auto-seed — the worker requires a seeded native session). Historical
+  one-time seed note (COMPLETED:
   historical MID index at baseline ACK 21 + exactly the two authorized SKIPs,
   seq 22 / `1556471434610483303` and seq 23 / `1556471963957067780`, ACK 23)
   — do NOT rerun it, and do NOT rerun the helper dry-run (it rejects when
   delivery state exists). Later arrivals must not be discarded, and there is no
-  autoreset, no journal-deletion fallback, and no blind ACK.
-- Session identity pin (in source; historical checkpoint — earlier 'still
-  pre-fix' superseded by external restart observed 2026-10-05 18:58+07, no
-  retroactive deploy approval): the worker gates
-  all three snapshot checks on `native_id_match` only. The native display title is
-  cosmetic and ignored; `expected_title` stays an optional diagnostic (`title_match`
-  metadata only, never an ACK or durable-write gate, never title-as-auth). The
-  internal audit label is the target bot id (`TARGET_BOT_ID`, default
-  `march7th`), separate from the native
-  UI title. The trailing 'no new-SID creation, rollover' clause above is SUPERSEDED
-  2026-10-07: the source now adopts the target bot's fixed DM session automatically
-  (drain-gated, reconcile pass on block, lazy, old sessions kept) — per-message/per-person sessions and
-  silent fallbacks stay forbidden.
+  autoreset, no state-deletion fallback, and no blind ACK.
+- Session binding: the worker serves the target bot's fixed DM session and
+  adopts it automatically (drain-gated, lazy; old sessions kept). The internal
+  audit label is the target bot id (`TARGET_BOT_ID`, default `march7th`);
+  the native display title is cosmetic and ignored. Job rows carry the serving
+  native SID.
 
-### Deleted source (no-reply) — source-only; rollout pending (historical V5 checkpoint; active current is `src/` flat with `delivery/`, `participation/`, `responder/`, `server/` packages)
+### Deleted source (no-reply) — pre-send proof, durable skip
 
-- Gates: existence is proven before the LLM POST (worker `_submit_queued` via
-  injected `source_checker`, default real-SDK `build_source_checker`) and again
-  before the correlated MCP send (tool pre-send read). Symbols:
-  `source_messages.py` (`build_source_checker`, `check_source_message`,
-  `_resolve_text_channel`; re-exported via the `server_helpers` alias),
-  `Responder(source_checker=...)`, `skip_job(..., reason="source_deleted")`.
+- Gates: existence is proven before the Thyca POST (worker holds the job
+  `queued` while the source is unproven). Symbols: `source_messages.py`
+  (`build_source_checker`, `check_source_message`), `Responder(source_checker=...)`.
+  `send_message` performs NO pre-send existence fetch: a deleted source
+  surfaces when the reply send itself raises NotFound via the
+  `fail_if_not_exists` reference (mapped to `skipped`/`source_deleted` with
+  zero sends, job failure otherwise). Only `record_no_reply` keeps a
+  pre-declaration existence GET.
 - Proof (strict): exact `fetch_message` GET bound to the approved
   guild/channel/MID raising native NotFound status 404 + code 10008; on GET
   success the returned MID/channel/guild must match. All else —
   `SourceUnavailable`, permission/403, other 404 codes (e.g. 10003), timeouts,
-  5xx, scope mismatch — holds `queued`/`pending` (pre-POST, no nonce) or a
-  bounded MCP error (pre-intent, no SDK send). Single GET read: no history
-  scan or content processing; needs ViewChannel + ReadMessageHistory.
-  Cancellation propagates.
-- Skip: `source_deleted` is durable zero-evidence (no delivered MID) and wins
-  over late native POST/result/snapshot/trace outcomes. Refused on ANY
-  intent/receipt/trace or `uncertain`/`completed` stage — partial sends hold
-  `uncertain` (receipts kept, further chunks withheld); after any SDK call ALL
-  errors stay `uncertain`. If the agent never calls MCP send after a
-  mid-generation deletion, the controller can hold `uncertain` (no
-  always-unblocks-FIFO claim). Tool `skipped`/`source_deleted` means the agent
-  stops ALL replies for that source (no retries, no unthreaded/manual
-  fallback); unrelated manual sends stay allowed.
-- Kept: storage v1 + new skip enum (aliases/unknown fields preserved); reply
-  `MessageReference(fail_if_not_exists=True)`. Reply policy only — no
-  AI-history/message-body deletion; owner/clone/shared-memory design tabled.
-- Status, dated 2026-10-05: FINAL 503 PASS in 12.78 s (464 baseline + 39
-  source-deleted: 36 + 3 guard), Ruff check clean, 33 formatted, diff check
-  clean. Both hardenings DONE and checked (fresh post-GET latch +
-  correlated_job guard both paths; `source_deleted`-only tombstone
-  contradiction rejection, legacy unchanged; INERT schema mirrored, not wired;
-  3 new regressions failed pre-patch, pass fixed). 500 stays a dated
-  initial-feature historical marker; 464/455 stay historical. Initial review
-  `0ca0d96d-8efe-46c` stays historical; final review `0887b525-8634-4c6`
-  complete: no findings, APPROVE of source handling after fixes only. Reviewer
-  reran 39 feature tests + 3 guard regressions, lint/format/diff checks and cold
-  imports; no deploy/live acceptance implied.
-  Source-only; rollout pending. T5/T6 gaps open (see plan).
+  5xx, scope mismatch — holds `queued` pre-POST or returns a bounded MCP
+  error pre-send (no SDK send). Single GET read: no history scan or content
+  processing; needs ViewChannel + ReadMessageHistory. Cancellation propagates.
+- Skip: a source proven deleted with zero sends takes the durable
+  `skipped`/`source_deleted` path (no delivered MID). Tool
+  `skipped`/`source_deleted` means the agent stops ALL replies for that source
+  (no retries, no unthreaded/manual fallback); unrelated manual sends stay
+  allowed. Existing send evidence refuses a no-reply declaration; a delete
+  discovered after sends fails the job (best-effort, never a blind retry).
+- Reply policy only: replies use `MessageReference(fail_if_not_exists=True)`.
+  No AI-history/message-body deletion.
 
-## Modum — source complete (never deployed): `read_context` + `record_no_reply` + `resolve_uncertain_drop` (15 total)
+## Correlated-turn tools: `read_context` + `record_no_reply` (14 total)
 
-Current source surface is 15 tools: the 12 v1+v4 names above are preserved
-with the v5 correlation/guards, plus 3 new Modum tools below.
+Current source surface is 14 tools: the 12 v1/v4 names above are preserved
+with the correlation/guards, plus the 2 correlated-turn tools below.
 Both are verified in `src/server/core.py` (`create_server` scope) with
-`StrictInt` IDs, `responder.correlated_job` gating, and delivery guards; this
-section states actual function contracts, not guesses. Sources live flat under
-`src/` (no package namespace); external distribution/CLI stays `thyca-discord-mcp`. Plan
-`.agents/plans/modum-jev-integration-refactor.md` is `done` for authorized
-SOURCE work only; the separate V5 live plan remains partial. Whole integration
-SOURCE reviews COMPLETE (two approvals); T4 DONE
-(checked + reviewed); T5 migration COMPLETE (old dir absent, 28 `modum`
-files); T6 audit COMPLETE (no additional genuine removal justified);
-T7 package/routing/privacy approved with no findings. Recovery review found
-one Minor late-skip tick-status gap (durable skip/ACK already safe); parent
-reproduced and fixed it with eight portable cases. Full offline checks now
-1243 pass; independent core fix and whole guidance/package follow-ups approved
-with no open findings. Bound recovery checks the durable
-source-deleted skip after trace success/error, before interpreting the result;
-no extra trace fetch on that skip, cancellation still propagates.
-Source authorization is not production activation; no merge/live/paid/deploy/
-restart/commit.
+`StrictInt` IDs and `responder.correlated_job` gating over the single store;
+this section states actual function contracts, not guesses.
+(`resolve_uncertain_drop` was removed with the uncertain machinery: restart
+auto-fails `submitted` jobs, so the operator-drop tool has no purpose.)
 
 For snapshot selection, prompt-size limits, native session memory, freshness,
 and privacy boundaries, see [Conversation context and memory](CONTEXT.md).
@@ -254,75 +228,48 @@ replace the frozen Jev snapshot or automatically trigger another classification.
   chronological. Only the scoped guild/channel; no other channel, DM, or
   profile fetch. Thyca-only additional context — never auto-forwarded to the
   classifier. Profiles/`USER.md`/native private context stay forbidden.
-- Per-message validation: MID strict positive and `< bound` (future rejected),
-  channel/guild IDs must match scope, author UID strict positive, author name
-  str, content str `<=4000`, reply ref optional strict positive, timestamp via
-  native `isoformat()` or non-empty str. Any violation is a bounded
-  `validation_error` with no body echo beyond the validated payload.
+- Per-message reads are typed SDK attributes (`m.id`, `m.author.id`,
+  `m.content`, `m.created_at.isoformat()`), not re-validated inputs: only
+  selection-policy refusals apply (future message `>= bound`,
+  channel/guild mismatch), each a bounded `validation_error`.
 - Returns: `{source_message_id, job_ref, channel_id, messages, count}` where
   each message is `{message_id, author_uid, author_name, content,
   reply_to_message_id, timestamp}` with whole bodies (never truncated).
-- Audit metadata only: pre-acceptance unvalidated correlation metadata, then
-  exact IDs + `before`/`limit` after correlation, plus `returned_count` and
-  `message_ids`; bodies never enter the audit, only IDs/counts.
+- Audit is the fixed allowlist: `channel_id` + `source_message_id` only
+  (message bodies never touch the audit log); failures add `error_kind`.
+  Rejections ARE audited with these fixed fields — never raw content, never
+  `job_ref`, never hashes.
 - Errors (bounded `ValueError`, audited `error_kind`): `validation_error`,
-  auto controller not running, correlation rejected, delivery uncertain
-  (`send_blocked`), channel unavailable, history unavailable, future message,
-  channel/guild mismatch, invalid author/content/reply/timestamp. Read-only:
-  no mutation, no ACK, no send, no profile export.
+  correlation rejected, channel unavailable, history unavailable, future message,
+  channel/guild mismatch. Read-only: no mutation, no ACK, no send, no profile
+  export.
 
-### `record_no_reply` — explicit no-reply declaration (journaled, nonterminal)
+### `record_no_reply` — explicit no-reply declaration (terminal at tool time)
 
 - Signature (actual): `record_no_reply(source_message_id: StrictInt, job_ref: str,`
   `reason: str, channel_id: int | None = None)`. `reason` is exactly
   `no_reply_needed`|`missing_context`. Default channel when omitted.
 - Gates: channel must equal default; source strict positive; `job_ref`
-  non-empty; responder running; `correlated_job` accepts; delivery `get_job`
-  exists with matching `job_ref`; zero send evidence (no intents/receipts/
-  trace). Source freshness is a last pre-declaration GET: proven deleted with
-  zero evidence takes durable `skipped`/`source_deleted` (no declaration);
-  unproven existence (`SourceUnavailable`, 403, other 404 codes, timeouts, 5xx)
-  is a bounded `source unavailable` hold with no mutation. Post-await latch +
-  nonce guard, then `delivery.record_no_reply` (midflight bound `need_context` +
-  exact nonce + KNOWN stored first-user fingerprint + zero evidence + reason
-  enum). A present declaration forbids any new send intent.
-- Status is `declared` (journaled `{job_ref, reason, ts}`, immutable idempotent),
-  NEVER terminal and NEVER an ACK at tool time; the worker completes via native
-  Trace proof (`complete_observation` with bound index + nonempty unique traced
-  tool IDs) to `observed` ACK. `0 receipts` alone never proves `observe`; proof
-  is the bound Jev decision or the exact Thyca declaration + whole trace.
-- Returns: `{status: declared, channel_id, source_message_id, job_ref, reason}`
-  or `{status: skipped, reason: source_deleted, channel_id, source_message_id}`
+  non-empty; responder running; `correlated_job` accepts; the job exists with
+  matching `job_ref` and zero sends. Source freshness is a last pre-declaration
+  GET: proven deleted with zero sends takes durable `skipped`/`source_deleted`
+  (no declaration); unproven existence (`SourceUnavailable`, 403, other 404
+  codes, timeouts, 5xx) is a bounded `source unavailable` hold with no mutation.
+- Terminal: the store closes the job `done` with outcome `no_reply` AT TOOL
+  TIME (no worker proof pass, no ACK wait). A declaration with send evidence
+  present is rejected.
+- Returns: `{status: no_reply, channel_id, source_message_id, job_ref, reason}`
+  (the job is `done` with outcome `no_reply` in the store) or
+  `{status: skipped, reason: source_deleted, channel_id, source_message_id}`
   when the source is proven deleted. Agent must then stop ALL replies for that
   source (no retries, no unthreaded/manual fallback); unrelated manual sends
   stay allowed.
-- Audit: pre-acceptance length/hash metadata until correlation accepts, then
-  exact IDs + reason; failures audit `error_kind` with no raw-body echo.
-- Errors: `validation_error`, correlation rejected, delivery uncertain, send
-  evidence present, channel unavailable, source unavailable, skip/declaration
-  rejected. Declaration load requires NON-NULL fingerprint for new fields;
-  old jobs missing optional new fields stay preserved with no legacy-null
-  contradiction. Correlation nonce is NOT caller ACL; no exactly-once claim.
-
-### `resolve_uncertain_drop` — operator drop for a stuck uncertain job
-
-- Signature (actual): `resolve_uncertain_drop(source_message_id: StrictInt,
-  channel_id: int | None = None)`. Default channel when omitted. No `job_ref`:
-  the caller names the stuck job; delivery enforces the preconditions.
-- Gates: channel must equal default; source strict positive int; job exists and
-  is `uncertain`; send intents, receipts, trace refs, observation, and no-reply
-  declaration are ALL empty (any evidence refuses -- a partly delivered job
-  must never drop as no-send). Exists because a responded turn can end with
-  zero verifiable sends, leaving reconcile with no forward transition and the
-  FIFO head-blocked behind it.
-- Effect: `uncertain` -> `skipped` with reason `operator_approved_drop` plus a
-  matching `authorized_skips` record (seq/author/actor/reason tuple the schema
-  validates); `job_ref`, fingerprints, aliases, and Jev proof preserved,
-  `error` cleared. Repeat on an already-dropped job returns the stored copy
-  only while the authorized record still matches exactly (never silent repair).
-- Returns: `{status: skipped, reason: operator_approved_drop, channel_id,
-  source_message_id, seq}`.
-- Audit: failures audit `error_kind` with no raw-body echo; success audits ok.
+- Audit is the fixed allowlist: `channel_id` + `source_message_id` + `reason`
+  (enum value only); failures add `error_kind`. No content, no `job_ref`, no
+  hashes — in the audit args or anywhere else.
+- Errors: `validation_error`, correlation rejected, delivery error (send
+  evidence present), channel unavailable, source unavailable. The correlation
+  nonce is NOT caller ACL; no exactly-once claim.
 
 ## v2 — proposed: messages & channels
 
@@ -363,18 +310,11 @@ replace the frozen Jev snapshot or automatically trigger another classification.
 - Live scope stays strict: guild `1067690340359880724` / channel `1395103735725821982`
   only — no other channel, even in the same guild. Every call enforces the guild scope
   guard on the server.
-- No autonomous watcher-to-LLM bridge in the V4 deployed writer: capturing (realtime
-  + poll) itself never launches LLM turns — capture contains no LLM. The consumer pulls
-  with `read_outbox`, processes in seq order, dedupes by `message_id`, then acks.
-  (The V5 source adds a worker that automatically POSTs a native turn per
-  eligible event; see the v5 section above.) This server sends no MCP push/notifications.
-- v2 (messages/channels) and v3 (members/roles) remain PROPOSED drafts; the V4
-  historical snapshot was the 12 v1+v4 tools only — v2/v3 mutation/admin/
-  destructive operations remain proposed and untested; existing read-only
-  channel/member listings were exercised in the native 12-tool E2E. V5
-  correlation/guards add no tool names beyond its 12; the plan stays
-  in-progress with T6 evidence PARTIAL (see above). Current source is 15 tools
-  (12 preserved + Modum `read_context` + `record_no_reply` + `resolve_uncertain_drop`, source-only
-  complete, integration SOURCE reviews complete, T4 DONE checked/reviewed;
-  T5 COMPLETE, T6 audit complete without additional source deletion;
-  T7 final reviews complete, Minor fixed and independently approved).
+- Capture (realtime + poll) itself never launches LLM turns — capture contains
+  no LLM. The consumer pulls with `read_outbox`, processes in seq order (each
+  message appears exactly once, store-deduped), then acks. An always-on worker
+  automatically POSTs a native turn per eligible event; see the correlation
+  section above. This server sends no MCP push/notifications.
+- v2 (messages/channels) and v3 (members/roles) remain PROPOSED drafts —
+  v2/v3 mutation/admin/destructive operations remain proposed and untested.
+  Current source is 14 tools (12 v1/v4 + `read_context` + `record_no_reply`).

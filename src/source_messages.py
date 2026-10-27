@@ -18,10 +18,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import Any
 
 import discord
-from discord.ext import commands
 
 from bot import get_scoped_guild
 
@@ -39,8 +37,25 @@ class SourceUnavailable(ValueError):
     """Existence could not be proven (no send may be inferred from this)."""
 
 
+def is_unknown_message(exc: BaseException) -> bool:
+    """Strict native deletion check: real ``discord.NotFound`` 404/10008 only.
+
+    True only for an actual ``discord.NotFound`` instance with int status 404
+    and int code 10008. Same-named spoof classes are rejected; bool
+    status/code never count (``type(x) is int``).
+    """
+    if not isinstance(exc, discord.NotFound):
+        return False
+    return (
+        type(exc.status) is int
+        and exc.status == _NOT_FOUND_STATUS
+        and type(exc.code) is int
+        and exc.code == _UNKNOWN_MESSAGE_CODE
+    )
+
+
 async def _resolve_text_channel(
-    bot: commands.Bot, guild: discord.Guild, cid: int
+    bot: discord.Client, guild: discord.Guild, cid: int
 ) -> discord.TextChannel:
     """Cache-first channel lookup guarded to text channels of the scoped guild.
 
@@ -55,14 +70,15 @@ async def _resolve_text_channel(
     return channel
 
 
-async def check_source_message(channel: Any, source_message_id: int) -> None:
+async def check_source_message(channel: discord.TextChannel, source_message_id: int) -> None:
     """Prove the exact source message exists in the resolved channel scope.
 
-    Returns None when the fetched message ID and its channel/guild scope
-    match the resolved channel exactly. Raises :class:`SourceDeleted` ONLY
+    Returns None when the fetch succeeds. Raises :class:`SourceDeleted` ONLY
     on a strict ``discord.NotFound`` with int status 404 and code 10008
     from that exact fetch; raises :class:`SourceUnavailable` for every
-    other failure or mismatch. Never stores, prints, or returns content.
+    other failure or mismatch. The fetch itself is scoped: the SDK can only
+    return this channel's message, so no post-fetch ID/scope re-validation
+    is performed. Never stores, prints, or returns content.
     """
     if (
         not isinstance(source_message_id, int)
@@ -71,16 +87,11 @@ async def check_source_message(channel: Any, source_message_id: int) -> None:
     ):
         raise SourceUnavailable("source message unavailable")
     try:
-        message = await channel.fetch_message(source_message_id)
+        await channel.fetch_message(source_message_id)
     except asyncio.CancelledError:
         raise
     except discord.NotFound as exc:
-        if (
-            type(exc.status) is int
-            and exc.status == _NOT_FOUND_STATUS
-            and type(exc.code) is int
-            and exc.code == _UNKNOWN_MESSAGE_CODE
-        ):
+        if is_unknown_message(exc):
             raise SourceDeleted("source message deleted") from None
         raise SourceUnavailable("source message unavailable") from None
     except Exception:
@@ -88,19 +99,11 @@ async def check_source_message(channel: Any, source_message_id: int) -> None:
         # any unexpected read failure: existence unproven, never deletion.
         # (CancelledError is BaseException and propagates above.)
         raise SourceUnavailable("source message unavailable") from None
-    try:
-        got_mid = message.id
-        got_cid = message.channel.id
-        got_gid = message.guild.id
-        want_cid = channel.id
-        want_gid = channel.guild.id
-    except Exception:
-        raise SourceUnavailable("source message unavailable") from None
-    if got_mid != source_message_id or got_cid != want_cid or got_gid != want_gid:
-        raise SourceUnavailable("source message unavailable") from None
 
 
-def build_source_checker(bot: Any, guild_id: int) -> Callable[[int, int], Awaitable[None]]:
+def build_source_checker(
+    bot: discord.Client, guild_id: int
+) -> Callable[[int, int], Awaitable[None]]:
     """Build the production bot-backed existence checker (live SDK reads).
 
     Resolves the exact approved guild/channel per call (retaining the scope

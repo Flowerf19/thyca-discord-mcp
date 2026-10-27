@@ -1,20 +1,28 @@
-"""Pre-POST submit pipeline mixin (extracted verbatim from responder).
+"""Pre-POST submit pipeline mixin (Phase 2b+3: store-backed, no trace proof).
 
-Owns the seven submit-path methods moved verbatim from
-:mod:`responder`: the after-await freshness guard, the routing
+Owns the submit-path methods: the after-await freshness guard, the routing
 snapshot and ledger decision validators, the participation-hold mapper,
 the zero-send observe terminal, the queued submit driver, and the
 definitive-409 busy requeue. Also canonical owner of
-``_VALID_PARTICIPATIONS`` and ``_sha256_hex`` (``responder``
-re-exports both so existing imports keep working with identical object
-identity).
+``_VALID_PARTICIPATIONS`` and ``_sha256_hex`` (``responder`` re-exports
+both so existing imports keep working with identical object identity).
+
+The Jev paid decision resolves inside the ledger (conditional
+pending->decided/failed over the store); the job side needs no separate
+bind write -- the Jev row IS the binding, and a bound ``observe``
+terminalizes the queued job directly. The submit marker
+(:meth:`Store.mark_submitted`) carries only ``job_ref``, ``native_sid``,
+and the pre-turn index (expected-index derivation only): no submitted-
+text fingerprint and no turn binding are stored. Completion after the POST
+is owned by the orchestrator (``_reconcile_after_post``/``_reconcile_job``)
+with the snapshot-poll fallback -- no trace evidence, no recovery module.
 
 Import rule: leaf modules only, never ``responder`` (the
 orchestrator imports this mixin, not the reverse). ``self`` attributes
 (``_settings``, ``_client``, ``_native_sid``, ``_source_checker``,
 ``_context_collector``, ``_participation_ledger``, ``_bot_uid``,
-``_mark_uncertain``, ``_source_deleted_status``, ``_skip_source_deleted``,
-``_fresh_source_deleted_skip``, ``_enforce_ledger_binding``,
+``_open_store``, ``_mark_failed``, ``_source_deleted_status``,
+``_skip_source_deleted``, ``_fresh_source_deleted_skip``,
 ``_reconcile_after_post``) resolve via inheritance at runtime.
 """
 
@@ -26,7 +34,6 @@ import hashlib
 import uuid
 from typing import Any
 
-import delivery
 from context import (
     FIT_HASH,
     FIT_NONCE,
@@ -35,11 +42,11 @@ from context import (
 )
 from conversation import ConversationError, project_conversation_state
 from participation import (
-    ParticipationDurabilityUncertain,
     ParticipationPending,
     ParticipationReason,
 )
 from source_messages import SourceDeleted, SourceUnavailable
+from store import StoreError
 from thyca import (
     CONTENT_MAX,
     PROMPT_MAX,
@@ -52,10 +59,11 @@ from thyca import (
 )
 
 from .input import ResponderError, _is_strict_int, _validate_id_string
-from .recovery import _SAFE_TERMINAL
 
 # Canonical Jev participation set (observe never POSTs: durable zero-send
-# terminal instead). Re-exported by responder.
+# terminal instead). Re-exported by responder. ``need_context`` never comes
+# from the provider (its criteria are respond|observe) but stays valid:
+# seeded flows and the agent contract reference the turn shape.
 _VALID_PARTICIPATIONS = frozenset({"respond", "observe", "need_context"})
 
 
@@ -92,34 +100,30 @@ class ResponderSubmitMixin:
         Every await in :meth:`_submit_queued` (source/snapshot/collector/
         ledger) may interleave with the MCP pre-send gate. Reloads fresh: a
         durable zero-evidence source_deleted skip wins (``skipped``); other
-        safe terminals report ``idle``; a fresh queued job with zero evidence
-        returns None (proceed). Mid-flight/uncertain/contradictory states
-        return a held status -- never proceed to a paid call or POST on a
-        stale frame. Corrupt loads fail closed (propagate);
-        durability-uncertain raises :class:`ResponderError`.
+        terminals report ``idle``; a fresh queued job with zero evidence
+        and no submit marker returns None (proceed). Mid-flight jobs are
+        reconciled, never submitted here. A queued job already carrying a
+        ref or send evidence is a writer bug: fail it (never proceed to a
+        paid call or POST on a stale frame). Corrupt loads fail closed.
         """
         skipped = self._source_deleted_status(channel_id, message_id)
         if skipped is not None:
             return skipped
         try:
-            fresh = delivery.get_job(self._settings.delivery_state_path, channel_id, message_id)
-        except delivery.DeliveryDurabilityUncertain:
-            raise ResponderError("delivery durability uncertain") from None
+            with self._open_store() as _store:
+                fresh = _store.get_job(channel_id, message_id)
+        except StoreError as exc:
+            raise ResponderError(f"responder store unavailable: {exc}") from None
         if fresh is None:
             raise ResponderError("job missing for routing guard")
         stage = fresh.get("stage")
-        if stage in _SAFE_TERMINAL:
+        if stage in ("done", "skipped", "failed"):
             return {"status": "idle", "reason": "already_terminal"}
-        if stage == "uncertain":
-            return {"status": "uncertain", "reason": "already_uncertain"}
         if stage != "queued":
             return {"status": "pending", "reason": "not_queued"}
-        if fresh.get("job_ref") is not None:
-            self._mark_uncertain(channel_id, message_id, kind="delivery_unknown")
-            return {"status": "uncertain", "reason": "routing_conflict"}
-        if fresh.get("send_intents") or fresh.get("send_receipts") or fresh.get("trace_refs"):
-            self._mark_uncertain(channel_id, message_id, kind="delivery_unknown")
-            return {"status": "uncertain", "reason": "routing_conflict"}
+        if fresh.get("job_ref") is not None or fresh.get("send_count", 0) > 0:
+            self._mark_failed(channel_id, message_id, kind="transport_error")
+            return {"status": "failed", "reason": "routing_conflict"}
         return None
 
     def _validate_routing_snapshot(
@@ -130,8 +134,8 @@ class ResponderSubmitMixin:
         Returns ``(projected, submit_entry)`` on success, else a status
         dict to return (the caller must not proceed). Projection/count/fit
         failures are collector bugs or necessary-pairs overflow:
-        ``uncertain`` with zero paid call (never truncate bodies). A
-        binding mismatch against the frozen entry is held ``pending``
+        ``failed`` with zero paid call (never truncate bodies). A binding
+        mismatch against the frozen entry is held ``pending``
         (edit/race; not reclassified now) -- except the sole-text
         live-frame rebind below. Classifier sender/addressee answers are
         diagnostic only and are never consulted here; only SDK entry
@@ -143,8 +147,8 @@ class ResponderSubmitMixin:
             skipped = self._source_deleted_status(channel_id, message_id)
             if skipped is not None:
                 return skipped
-            self._mark_uncertain(channel_id, message_id, kind="delivery_unknown")
-            return {"status": "uncertain", "reason": "context_invalid"}
+            self._mark_failed(channel_id, message_id, kind="transport_error")
+            return {"status": "failed", "reason": "context_invalid"}
         author_uid = entry.get("author_uid")
         content = entry.get("content")
         try:
@@ -177,12 +181,12 @@ class ResponderSubmitMixin:
             skipped = self._source_deleted_status(channel_id, message_id)
             if skipped is not None:
                 return skipped
-            self._mark_uncertain(channel_id, message_id, kind="delivery_unknown")
-            return {"status": "uncertain", "reason": "context_invalid"}
+            self._mark_failed(channel_id, message_id, kind="transport_error")
+            return {"status": "failed", "reason": "context_invalid"}
         # Fit gate on the ACTUAL final renderer for BOTH participations
         # (canonical fixed 32-char nonce + 64-char hash placeholders, same
         # lengths as production values -- never a guessed reserve). A
-        # snapshot failing either route holds with zero paid call; raw
+        # snapshot failing either route fails with zero paid call; raw
         # bodies are never shortened to fit.
         bot_uid = self._bot_uid()
         for participation in ("respond", "need_context"):
@@ -201,8 +205,8 @@ class ResponderSubmitMixin:
                 skipped = self._source_deleted_status(channel_id, message_id)
                 if skipped is not None:
                     return skipped
-                self._mark_uncertain(channel_id, message_id, kind="delivery_unknown")
-                return {"status": "uncertain", "reason": "snapshot_oversize"}
+                self._mark_failed(channel_id, message_id, kind="transport_error")
+                return {"status": "failed", "reason": "snapshot_oversize"}
         return projected, submit_entry
 
     def _rebind_live_frame(
@@ -221,10 +225,7 @@ class ResponderSubmitMixin:
         outbox is never mutated); returns None when any other field
         mismatches, so those keep pending exactly as today. The live
         text must be a non-empty string within the renderer bound --
-        anything else also keeps pending. Downstream proofs need no
-        weakening: the ledger fingerprint already binds the exact live
-        snapshot, and the prompt renderer re-validates entry-vs-snapshot
-        binding on the rebound copy.
+        anything else also keeps pending.
         """
         if new_message is None:
             return None
@@ -237,11 +238,7 @@ class ResponderSubmitMixin:
         if projected.get("assistant_uid") != str(self._bot_uid()):
             return None
         live_text = new_message.get("text")
-        if (
-            not isinstance(live_text, str)
-            or not live_text
-            or len(live_text) > CONTENT_MAX
-        ):
+        if not isinstance(live_text, str) or not live_text or len(live_text) > CONTENT_MAX:
             return None
         rebound = dict(entry)
         rebound["content"] = live_text
@@ -291,20 +288,16 @@ class ResponderSubmitMixin:
     ) -> bool:
         """True only when the ledger-bound text provably differs live.
 
-        The ledger already holds a started/decided record whose
-        fingerprint no longer matches the current snapshot. Rebuild the
-        classification-bound candidate by reverting the live source text
-        to the newest captured frame text and fingerprint it: equality
-        with the record's stored fingerprint proves the record was
-        classified on the captured text and the live text is a
-        post-classify edit. Anything else -- drift the record never saw,
-        a record already bound to the live text (E2 rebind), unparsable
-        shapes, a missing record -- keeps pending. In particular a bare
-        live-text != frame-text comparison is NOT enough on its own, so
-        an E2 rebind followed by pure context drift can never skip here
-        (the forbidden silent lost reply). The stored frame is never
-        mutated. Sender/owner/assistant binding is inherent in the
-        fingerprint equality itself.
+        The ledger already holds a decided record whose fingerprint no
+        longer matches the current snapshot. Rebuild the classification-
+        bound candidate by reverting the live source text to the newest
+        captured frame text and fingerprint it: equality with the record's
+        stored fingerprint proves the record was classified on the
+        captured text and the live text is a post-classify edit. Anything
+        else -- drift the record never saw, a record already bound to the
+        live text, unparsable shapes, a missing record -- keeps pending.
+        The stored frame is never mutated. Sender/owner/assistant binding
+        is inherent in the fingerprint equality itself.
         """
         if not isinstance(captured_text, str) or not captured_text:
             return False
@@ -318,14 +311,10 @@ class ResponderSubmitMixin:
         now_text = now.get("text")
         if not isinstance(now_text, str) or now_text == captured_text:
             return False
-        get_record = getattr(self._participation_ledger, "get", None)
-        if not callable(get_record):
-            # Ledger without record lookup (test stubs): unprovable.
-            return False
-        record = get_record(channel_id, message_id)
+        record = self._participation_ledger.get(channel_id, message_id)
         if not isinstance(record, dict):
             return False
-        stored_fp = record.get("fingerprint")
+        stored_fp = record.get("context_sha256")
         if not isinstance(stored_fp, str) or len(stored_fp) != 64:
             return False
         candidate = copy.deepcopy(projected_now)
@@ -340,42 +329,38 @@ class ResponderSubmitMixin:
 
     def _validate_decision_record(
         self, channel_id: int, message_id: int, record: Any
-    ) -> tuple[str, str, str, str] | dict[str, Any]:
-        """Validate a ledger classification record (post-paid, pre-bind).
+    ) -> tuple[str, str, str] | dict[str, Any]:
+        """Validate a ledger classification record (post-paid).
 
-        Reads the authoritative ``fingerprint`` key (copied to the delivery
-        ``context_sha256`` bind param) and returns ``(participation,
-        context_sha256, attempt_id, model)`` on success, else a status dict
-        to return. Malformed records are ledger bugs with possibly-unknown
-        billing: ``uncertain``, never a blind retry or rebind. The ledger
-        ``attempt_id`` format is writer-owned (parent standardized 32-hex
-        UUID hex to match delivery); this validator accepts the ID shape
-        and delivery enforces the exact form at bind.
+        Reads the authoritative ``context_sha256`` key and returns
+        ``(participation, context_sha256, attempt_id)`` on success, else a
+        status dict to return. The model pin is enforced inside the ledger
+        before the resolve commits, so cache hits are pinned by
+        construction. Malformed records fail the job (never a blind retry
+        or rebind).
         """
-        fingerprint = record.get("fingerprint") if isinstance(record, dict) else None
+        fingerprint = record.get("context_sha256") if isinstance(record, dict) else None
         valid = (
             isinstance(record, dict)
-            and record.get("status") in ("decided", "cached")
+            and record.get("status") == "decided"
             and record.get("participation") in _VALID_PARTICIPATIONS
             and isinstance(fingerprint, str)
             and len(fingerprint) == 64
             and all(ch in "0123456789abcdefABCDEF" for ch in fingerprint)
             and _validate_id_string(record.get("attempt_id")) is not None
-            and _validate_id_string(record.get("model")) is not None
         )
         if not valid:
             skipped = self._source_deleted_status(channel_id, message_id)
             if skipped is not None:
                 return skipped
-            self._mark_uncertain(channel_id, message_id, kind="transport_error")
-            return {"status": "uncertain", "reason": "decision_invalid"}
+            self._mark_failed(channel_id, message_id, kind="transport_error")
+            return {"status": "failed", "reason": "decision_invalid"}
         assert isinstance(record, dict)
         assert isinstance(fingerprint, str)
         return (
             record["participation"],
             fingerprint,
             record["attempt_id"],
-            record["model"],
         )
 
     def _handle_participation_pending(
@@ -387,11 +372,11 @@ class ResponderSubmitMixin:
         snapshot: Any = None,
         captured_text: Any = None,
     ) -> dict[str, Any]:
-        """Map a ledger participation hold to a pending/uncertain status.
+        """Map a ledger participation hold to a pending/failed status.
 
         Exact ``ParticipationReason`` values (prompt holds stay ``pending``
-        with the job queued, unmarked, and reusable from cache with no
-        rebill and no immediate reclassify):
+        with the job queued, reusable from cache with no rebill and no
+        immediate reclassify):
 
         - ``context_mismatch`` / ``in_progress`` ->
           pending (retryable; mismatch/transient).
@@ -399,21 +384,21 @@ class ResponderSubmitMixin:
           attempted) -> pending ``unknown_blocked``: innocent jobs are
           preserved queued (never terminalized for another job's failure)
           while the FIFO visibly halts for operator resolution.
-        - ``already_started`` (durable started record, outcome unknown) /
-          ``already_failed_unknown`` -> ``uncertain``
-          ``classification_unknown`` (durable unknown, never retry).
-        - ``already_failed_known`` -> ``uncertain``
+        - ``already_started`` / ``already_failed_unknown`` ->
+          ``failed`` ``classification_unknown`` (durable unknown, never
+          retry; the retry-once rule already ran inside the ledger).
+        - ``already_failed_known`` -> ``failed``
           ``classification_failed`` (durable failure, never retry).
         - A hold whose reason is not a verified ``ParticipationReason``
-          member fails closed as ``uncertain`` without echoing the object.
+          member fails closed without echoing the object.
         """
         reason = exc.reason
         if not isinstance(reason, ParticipationReason):
             skipped = self._source_deleted_status(channel_id, message_id)
             if skipped is not None:
                 return skipped
-            self._mark_uncertain(channel_id, message_id, kind="transport_error")
-            return {"status": "uncertain", "reason": "classification_failed"}
+            self._mark_failed(channel_id, message_id, kind="transport_error")
+            return {"status": "failed", "reason": "classification_failed"}
         if reason is ParticipationReason.CONTEXT_MISMATCH:
             # Owner policy: a source edited after classification started
             # is skipped, never answered on stale text and never
@@ -423,9 +408,7 @@ class ResponderSubmitMixin:
             # A bare live-text != frame-text comparison is NOT enough (an
             # E2 rebind binds the live text, so later pure drift would
             # falsely skip); any unproven drift keeps pending as today.
-            if self._proven_edit_since_capture(
-                channel_id, message_id, snapshot, captured_text
-            ):
+            if self._proven_edit_since_capture(channel_id, message_id, snapshot, captured_text):
                 return self._skip_source_edited(channel_id, message_id)
             return {"status": "pending", "reason": "context_mismatch"}
         if reason is ParticipationReason.IN_PROGRESS:
@@ -435,36 +418,35 @@ class ResponderSubmitMixin:
         skipped = self._source_deleted_status(channel_id, message_id)
         if skipped is not None:
             return skipped
-        self._mark_uncertain(channel_id, message_id, kind="transport_error")
+        self._mark_failed(channel_id, message_id, kind="transport_error")
         if reason in (
             ParticipationReason.ALREADY_STARTED,
             ParticipationReason.ALREADY_FAILED_UNKNOWN,
         ):
-            return {"status": "uncertain", "reason": "classification_unknown"}
-        return {"status": "uncertain", "reason": "classification_failed"}
+            return {"status": "failed", "reason": "classification_unknown"}
+        return {"status": "failed", "reason": "classification_failed"}
 
     def _observe_bound(self, channel_id: int, message_id: int) -> dict[str, Any]:
         """Terminalize a bound observe decision with zero native POST.
 
-        Calls the delivery ``observe_job`` transition (fresh queued + bound
-        observe + zero evidence -> ``observed``). No snapshot, prompt, or
-        Thyca call happens on this path. Terminals are respected; any other
-        conflict is a bug/contract mismatch (no await runs between bind and
-        observe), so it fails closed instead of forcing the transition.
+        Calls the ``observed`` completion (fresh queued only; the Jev row
+        IS the binding). No snapshot, prompt, or Thyca call happens on
+        this path. Terminals are respected; any other conflict fails
+        closed instead of forcing the transition.
         """
         try:
-            delivery.observe_job(self._settings.delivery_state_path, channel_id, message_id)
-        except delivery.DeliveryDurabilityUncertain:
-            raise ResponderError("delivery durability uncertain") from None
-        except delivery.DeliveryError:
+            with self._open_store() as _store:
+                _store.complete_job(channel_id, message_id, outcome="observed")
+        except StoreError:
             skipped = self._source_deleted_status(channel_id, message_id)
             if skipped is not None:
                 return skipped
             try:
-                fresh = delivery.get_job(self._settings.delivery_state_path, channel_id, message_id)
-            except delivery.DeliveryDurabilityUncertain:
-                raise ResponderError("delivery durability uncertain") from None
-            if fresh is not None and fresh.get("stage") in _SAFE_TERMINAL:
+                with self._open_store() as _store:
+                    fresh = _store.get_job(channel_id, message_id)
+            except StoreError as exc:
+                raise ResponderError(f"responder store unavailable: {exc}") from None
+            if fresh is not None and fresh.get("stage") in ("done", "skipped", "failed"):
                 return {"status": "idle", "reason": "already_terminal"}
             raise ResponderError("jev observe conflict") from None
         return {"status": "observed"}
@@ -481,14 +463,14 @@ class ResponderSubmitMixin:
         ]
         if not matches:
             return {"status": "pending", "reason": "entry_not_found"}
-        # Latest frame wins: a message edited after capture redelivers under
-        # a new seq (aliased to the same job), while the context snapshot is
-        # built from live Discord state. Binding against the stale first
-        # frame would pend on context_mismatch forever; the newest captured
-        # frame is the frame the live snapshot can match. All guards below
-        # stay: the snapshot must still exactly match this frame and live
-        # SDK state, and an edit newer than the latest captured frame still
-        # pends until its frame arrives.
+        # Latest frame wins: a message edited after capture redelivers
+        # under a new seq, while the context snapshot is built from live
+        # Discord state. Binding against the stale first frame would pend
+        # on context_mismatch forever; the newest captured frame is the
+        # frame the live snapshot can match. All guards below stay: the
+        # snapshot must still exactly match this frame and live SDK state,
+        # and an edit newer than the latest captured frame still pends
+        # until its frame arrives.
         entry = max(matches, key=lambda e: e.get("seq", 0))
         # Proven-no-send gate BEFORE any paid work (Jev classification or
         # native POST): a confirmed-deleted source skips with zero work; an
@@ -548,6 +530,18 @@ class ResponderSubmitMixin:
         guard = self._fresh_queued_guard(channel_id, message_id)
         if guard is not None:
             return guard
+        # Legacy frames without author_is_bot: resolve the ACTUAL bot flag
+        # BEFORE the paid call (never assumed False). A bot source skips;
+        # an unresolvable UID holds pending with zero paid work (retried
+        # next tick); only a proven human proceeds.
+        if "author_is_bot" not in entry:
+            resolved = await self._resolve_bot_flag(entry["author_uid"])
+            if resolved is True:
+                return self._skip_bot_legacy(channel_id, message_id)
+            if resolved is None:
+                return {"status": "pending", "reason": "bot_flag_unresolved"}
+            if entry.get("actor_kind") not in ("owner", "other"):
+                raise ResponderError("outbox entry actor mismatch")
         # Canonical snapshot collection (no paid call yet). The
         # authoritative SourceDeleted (also raised by the collector for an
         # exact current 404) skips; ContextUnavailable (including an edited
@@ -571,16 +565,11 @@ class ResponderSubmitMixin:
         guard = self._fresh_queued_guard(channel_id, message_id)
         if guard is not None:
             return guard
-        # Activation re-check synchronously BEFORE the paid call: a ledger or
-        # journal replaced/deleted while this process is alive must stop here
-        # with zero new provider work (no await runs between this guard and
-        # the ledger's started persist). Failures propagate; never rebind,
-        # reset, or terminalize the job here.
-        self._enforce_ledger_binding()
-        # Ledger classification (the PAID call): cached same-context never
-        # calls the provider. Cancellation propagates after the ledger
-        # persists its started/unknown hold (which blocks retry); the job
-        # stays queued and the next tick observes the hold.
+        # Ledger classification (the PAID call): cached decided never calls
+        # the provider; a crashed pending gets exactly one retry; a
+        # still-unknown outcome at attempts == 2 resolves as observe.
+        # Cancellation propagates after the ledger persists its unknown
+        # hold; the job stays queued and the next tick observes the hold.
         try:
             record = await self._participation_ledger.classify(
                 self._jev_adapter,
@@ -595,18 +584,23 @@ class ResponderSubmitMixin:
             return self._handle_participation_pending(
                 channel_id, message_id, exc, snapshot=snapshot, captured_text=stored_text
             )
-        except ParticipationDurabilityUncertain:
-            raise ResponderError("participation durability uncertain") from None
         except Exception:
             skipped = self._source_deleted_status(channel_id, message_id)
             if skipped is not None:
                 return skipped
-            self._mark_uncertain(channel_id, message_id, kind="transport_error")
-            return {"status": "uncertain", "reason": "classification_failed"}
+            self._mark_failed(channel_id, message_id, kind="transport_error")
+            return {"status": "failed", "reason": "classification_failed"}
         decision = self._validate_decision_record(channel_id, message_id, record)
         if isinstance(decision, dict):
             return decision
-        participation, context_sha256, attempt_id, model = decision
+        participation, context_sha256, attempt_id = decision
+        if participation == "observe" and record.get("answers_json") is None:
+            # Crash-path synthetic observe (D5): no paid call ran this tick
+            # and the outcome is unknown, so the ledger already closed the
+            # job done/observed in the same transaction. Post-paid guards
+            # would misfire on the pre-closed job and on fingerprint drift
+            # -- this path is terminal regardless of drift.
+            return self._observe_bound(channel_id, message_id)
         # Recheck the ACTUAL source after the paid call, BEFORE observe or
         # native POST. The classification spend is sunk; zero native work
         # follows for a deleted/unproven source (cached decision reused).
@@ -676,35 +670,9 @@ class ResponderSubmitMixin:
         guard = self._fresh_queued_guard(channel_id, message_id)
         if guard is not None:
             return guard
-        # Atomic bind of the paid decision (delivery owns the transition).
-        # Idempotent for the same record (409-requeue retry rebinds the
-        # cached decision without rebill). Terminals are respected; any
-        # other conflict is a bug/contract mismatch (no await runs between
-        # the guard above and this bind), so it fails closed and preserves
-        # the queued job instead of terminalizing it.
-        try:
-            delivery.bind_jev_decision(
-                self._settings.delivery_state_path,
-                channel_id,
-                message_id,
-                context_sha256=context_sha256,
-                attempt_id=attempt_id,
-                model=model,
-                participation=participation,
-            )
-        except delivery.DeliveryDurabilityUncertain:
-            raise ResponderError("delivery durability uncertain") from None
-        except delivery.DeliveryError:
-            skipped = self._source_deleted_status(channel_id, message_id)
-            if skipped is not None:
-                return skipped
-            try:
-                fresh = delivery.get_job(self._settings.delivery_state_path, channel_id, message_id)
-            except delivery.DeliveryDurabilityUncertain:
-                raise ResponderError("delivery durability uncertain") from None
-            if fresh is not None and fresh.get("stage") in _SAFE_TERMINAL:
-                return {"status": "idle", "reason": "already_terminal"}
-            raise ResponderError("jev bind conflict") from None
+        # The Jev row IS the paid-decision binding (resolved inside the
+        # ledger before the POST): no separate bind write. Terminals are
+        # respected via the guard above.
         if participation == "observe":
             # Durable zero-send terminal: no snapshot, no prompt, no POST.
             return self._observe_bound(channel_id, message_id)
@@ -739,11 +707,11 @@ class ResponderSubmitMixin:
         if guard is not None:
             return guard
         # Fresh bound nonce at NEW submission only (uuid4 hex, no predictable
-        # separators). Not a caller auth/permission token: frame + trace
-        # correlation only. Never regenerated while inflight/reconciling.
+        # separators). Not a caller auth/permission token: frame correlation
+        # only. Never regenerated while submitted/reconciling.
         # The POST renders the FROZEN classified snapshot with the actual
         # job_ref + ledger hash (same lengths as the fit-gate placeholders,
-        # so fit is guaranteed); the same canonical bytes feed Jev and Thyca.
+        # so fit is guaranteed).
         job_ref = uuid.uuid4().hex
         try:
             prompt = build_conversation_prompt(
@@ -760,73 +728,67 @@ class ResponderSubmitMixin:
             skipped = self._source_deleted_status(channel_id, message_id)
             if skipped is not None:
                 return skipped
-            self._mark_uncertain(channel_id, message_id, kind="delivery_unknown")
-            return {"status": "uncertain", "reason": "prompt_oversize"}
+            self._mark_failed(channel_id, message_id, kind="transport_error")
+            return {"status": "failed", "reason": "prompt_oversize"}
         cleaned = prompt.strip()
         if not cleaned or len(cleaned) > PROMPT_MAX:
             skipped = self._source_deleted_status(channel_id, message_id)
             if skipped is not None:
                 return skipped
-            self._mark_uncertain(channel_id, message_id, kind="delivery_unknown")
-            return {"status": "uncertain", "reason": "prompt_oversize"}
-        fingerprint_sha = _sha256_hex(cleaned)
-        fingerprint_len = len(cleaned)
-        # Durable fingerprint BEFORE the POST: exact strip-clean native text
-        # (SHA-256 64-hex + character length, never raw).
+            self._mark_failed(channel_id, message_id, kind="transport_error")
+            return {"status": "failed", "reason": "prompt_oversize"}
+        # Durable submit marker BEFORE the POST: exact nonce + serving SID
+        # + pre-turn index. No text hash, no turn binding is stored.
+        # No await runs between the guard above and this mark, so a
+        # conflict is a writer bug: terminals are respected, anything else
+        # fails closed (never force the mark, never blind retry).
         try:
-            delivery.mark_turn_submitting(
-                self._settings.delivery_state_path,
-                channel_id,
-                message_id,
-                job_ref=job_ref,
-                pre_turn_index=pre_max,
-                submitted_text_sha256=fingerprint_sha,
-                submitted_text_len=fingerprint_len,
-            )
-        except delivery.DeliveryDurabilityUncertain:
-            raise ResponderError("delivery durability uncertain") from None
-        except delivery.DeliveryError:
-            # No await runs between the guard above and this mark, so a
-            # conflict means the bind contract moved the stage (writer
-            # mismatch) or a terminal landed: respect terminals, else fail
-            # closed (never force the mark, never blind retry).
+            with self._open_store() as _store:
+                _store.mark_submitted(
+                    channel_id,
+                    message_id,
+                    job_ref=job_ref,
+                    native_sid=self._native_sid,
+                    pre_turn_index=pre_max,
+                )
+        except StoreError:
             skipped = self._source_deleted_status(channel_id, message_id)
             if skipped is not None:
                 return skipped
             try:
-                fresh = delivery.get_job(self._settings.delivery_state_path, channel_id, message_id)
-            except delivery.DeliveryDurabilityUncertain:
-                raise ResponderError("delivery durability uncertain") from None
-            if fresh is not None and fresh.get("stage") in _SAFE_TERMINAL:
+                with self._open_store() as _store:
+                    fresh = _store.get_job(channel_id, message_id)
+            except StoreError as exc:
+                raise ResponderError(f"responder store unavailable: {exc}") from None
+            if fresh is not None and fresh.get("stage") in ("done", "skipped", "failed"):
                 return {"status": "idle", "reason": "already_terminal"}
-            raise ResponderError("jev bind conflict") from None
+            raise ResponderError("submit conflict") from None
         try:
             result = await self._client.submit_turn(self._native_sid, cleaned)
         except ThycaBusyError as exc:
             return await self._handle_busy_race(channel_id, message_id, exc)
         except ThycaSubmissionUncertainError as exc:
-            # Timeout/disconnect: NOT a cancel; native may still run and late
-            # SDK callbacks may still land. Durable unknown, no blind retry.
-            # A durable source_deleted skip that landed first still wins.
+            # Timeout/disconnect: NOT a cancel; native may still run. The
+            # outcome is ambiguous: fail (never blind retry). A durable
+            # source_deleted skip that landed first still wins.
             skipped = self._source_deleted_status(channel_id, message_id)
             if skipped is not None:
                 return skipped
             kind = "timeout" if exc.reason == "timeout" else "transport_error"
-            self._mark_uncertain(channel_id, message_id, kind=kind)
+            self._mark_failed(channel_id, message_id, kind=kind)
             return {
-                "status": "uncertain",
+                "status": "failed",
                 "reason": "submission_uncertain",
                 "error_kind": exc.kind,
                 "error_status": exc.status_code,
             }
         except asyncio.CancelledError:
-            # Cancellation stops only our wait; the HTTP thread / native turn
-            # may continue and late receipts may still record against this
-            # ref (Core keeps those while UNCERTAIN). Persist the durable
-            # unknown (fresh, idempotent) and propagate the cancellation.
-            # A durable source_deleted skip is preserved, never clobbered.
+            # Cancellation stops only our wait; the native turn may
+            # continue. Fail the job (ambiguous, never blind retry) and
+            # propagate the cancellation. A durable source_deleted skip is
+            # preserved, never clobbered.
             if self._fresh_source_deleted_skip(channel_id, message_id) is None:
-                self._mark_uncertain(channel_id, message_id, kind="delivery_unknown")
+                self._mark_failed(channel_id, message_id, kind="transport_error")
             raise
         except ThycaClientError as exc:
             # Coarse kind/status only; never raw bodies or str(exc).
@@ -834,13 +796,13 @@ class ResponderSubmitMixin:
             if skipped is not None:
                 return skipped
             if exc.status_code is not None:
-                self._mark_uncertain(
+                self._mark_failed(
                     channel_id, message_id, kind="http_error", http_status=exc.status_code
                 )
             else:
-                self._mark_uncertain(channel_id, message_id, kind="transport_error")
+                self._mark_failed(channel_id, message_id, kind="transport_error")
             return {
-                "status": "uncertain",
+                "status": "failed",
                 "reason": "post_failed",
                 "error_kind": exc.kind,
                 "error_status": exc.status_code,
@@ -849,46 +811,63 @@ class ResponderSubmitMixin:
             skipped = self._source_deleted_status(channel_id, message_id)
             if skipped is not None:
                 return skipped
-            self._mark_uncertain(channel_id, message_id, kind="delivery_unknown")
-            return {"status": "uncertain", "reason": "post_cancelled"}
+            self._mark_failed(channel_id, message_id, kind="post_cancelled")
+            return {"status": "failed", "reason": "post_cancelled"}
         if not result.get("native_id_match"):
             skipped = self._source_deleted_status(channel_id, message_id)
             if skipped is not None:
                 return skipped
-            self._mark_uncertain(channel_id, message_id, kind="trace_unverified")
-            return {"status": "uncertain", "reason": "post_sid_mismatch"}
-        return await self._reconcile_after_post(
-            channel_id, message_id, pre_max, fingerprint_sha, fingerprint_len
-        )
+            self._mark_failed(channel_id, message_id, kind="snapshot_mismatch")
+            return {"status": "failed", "reason": "post_sid_mismatch"}
+        return await self._reconcile_after_post(channel_id, message_id, pre_max, result)
+
+    def _skip_bot_legacy(self, channel_id: int, message_id: int) -> dict[str, Any]:
+        """Skip a legacy frame whose bot flag resolved True (proven bot)."""
+        try:
+            with self._open_store() as _store:
+                _store.skip_job(channel_id, message_id, reason="bot_filtered")
+        except StoreError:
+            skipped = self._source_deleted_status(channel_id, message_id)
+            if skipped is not None:
+                return skipped
+            try:
+                with self._open_store() as _store:
+                    fresh = _store.get_job(channel_id, message_id)
+            except StoreError as exc:
+                raise ResponderError(f"responder store unavailable: {exc}") from None
+            if fresh is not None and fresh.get("stage") in ("done", "skipped", "failed"):
+                return {"status": "idle", "reason": "already_terminal"}
+            raise ResponderError("bot skip conflict") from None
+        return {"status": "skipped", "reason": "bot_filtered"}
 
     async def _handle_busy_race(
         self, channel_id: int, message_id: int, exc: ThycaBusyError
     ) -> dict[str, Any]:
         # A durable source_deleted skip (e.g. via the MCP pre-send gate
-        # during the POST await) must never be requeued or held uncertain.
+        # during the POST await) must never be requeued or failed.
         skipped = self._source_deleted_status(channel_id, message_id)
         if skipped is not None:
             return skipped
         try:
-            fresh = delivery.get_job(self._settings.delivery_state_path, channel_id, message_id)
-        except delivery.DeliveryDurabilityUncertain:
-            raise ResponderError("delivery durability uncertain") from None
+            with self._open_store() as _store:
+                fresh = _store.get_job(channel_id, message_id)
+        except StoreError as exc2:
+            raise ResponderError(f"responder store unavailable: {exc2}") from None
         if fresh is None:
             raise ResponderError("job missing after busy")
-        if fresh.get("send_intents") or fresh.get("send_receipts") or fresh.get("trace_refs"):
-            self._mark_uncertain(channel_id, message_id, kind="busy", http_status=409)
-            return {"status": "uncertain", "reason": "busy_with_intents"}
-        if fresh.get("stage") not in ("turn_submitting", "inflight"):
-            self._mark_uncertain(channel_id, message_id, kind="busy", http_status=409)
-            return {"status": "uncertain", "reason": "busy_wrong_stage"}
+        if fresh.get("send_count", 0) > 0:
+            self._mark_failed(channel_id, message_id, kind="busy", http_status=409)
+            return {"status": "failed", "reason": "busy_with_sends"}
+        if fresh.get("stage") != "submitted":
+            self._mark_failed(channel_id, message_id, kind="busy", http_status=409)
+            return {"status": "failed", "reason": "busy_wrong_stage"}
         try:
-            # Definitive 409 only, zero SDK activity -> queued with ref and
-            # fingerprint cleared; the NEXT attempt gets a fresh nonce.
-            delivery.requeue_definitive_busy(
-                self._settings.delivery_state_path, channel_id, message_id, http_status=409
-            )
-        except delivery.DeliveryDurabilityUncertain:
-            raise ResponderError("delivery durability uncertain") from None
+            # Definitive 409 only, zero SDK activity -> queued with ref
+            # cleared; the NEXT attempt mints a fresh nonce.
+            with self._open_store() as _store:
+                _store.requeue(channel_id, message_id)
+        except StoreError as exc2:
+            raise ResponderError(f"responder store unavailable: {exc2}") from None
         return {
             "status": "pending",
             "reason": "busy_requeued",

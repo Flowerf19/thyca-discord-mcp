@@ -4,28 +4,20 @@ FastMCP.run() drives an asyncio loop; the lifespan hook starts the bot in
 that same loop, so tools can await discord.py coroutines directly with no
 thread bridge. Every tool call is audited; failures are audited then re-raised.
 
-v4 adds a capture-only outbox: a realtime on_message listener plus periodic
-poll tasks append Discord messages to outbox.jsonl; the agent pulls them with
-read_outbox/ack_outbox and summarizes itself (this server has no LLM, no push).
-
-v5 adds an always-on auto-reply worker (see responder.py): the lifespan builds
-a Responder over the existing delivery journal + participation ledger, then starts
-two protected native loops (auto-reply tick + recovery poll) once Discord is
-ready. The agent owns the reply send via MCP send_message with exact
-source_message_id/job_ref correlation; the worker never sends itself, and the
-controller owns ACK (safe processed prefix only). Correlation never
-authenticates the MCP caller: the shared native MCP pool carries no caller
-identity, so only the hard guild/channel scope is enforced.
+Capture is outbox-only (realtime listener + poll ticks); the agent pulls with
+read_outbox/ack_outbox. An always-on worker drives agent-owned MCP sends:
+the agent calls send_message with the exact source_message_id/job_ref from
+its task, plus record_no_reply and read_context for correlated turns. Shared
+MCP correlation selects the job but never authenticates the caller: only the
+hard guild/channel scope is enforced.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import math
 import sys
-import uuid
 from contextlib import asynccontextmanager, suppress
 from typing import Any, NoReturn
 
@@ -36,59 +28,79 @@ from pydantic import StrictInt
 from audit import append_audit
 from bot import build_bot, get_scoped_guild, resolve_display_name
 from config import Settings
-from delivery import (
-    DeliveryDurabilityUncertain,
-    get_job,
-    mark_uncertain,
-    record_send_intent,
-    record_send_receipt,
-    skip_job,
-)
-
-# Aliased: the MCP tool below defines a local ``record_no_reply`` inside the
-# ``create_server`` scope, so the delivery function needs a distinct name.
-from delivery import record_no_reply as _delivery_record_no_reply
-
-# Aliased: the MCP tool below is named ``resolve_uncertain_drop``, so the
-# delivery function needs a distinct name (same pattern as record_no_reply).
-from delivery import resolve_uncertain_drop as _delivery_resolve_uncertain_drop
-from identity import classify_actor
-from outbox import (
-    ack_entries,
-    append_entry,
-    build_message_entry,
-    read_entries,
-)
+from identity import ActorKind, classify_actor
 from responder import Responder
-from server_helpers import (
-    _check_outbox_consistent,
-    _coarse_error_kind,
-    _jump_url_ids_match,
-    _resolve_text_channel,
-    _send_meta_args,
-    _unvalidated_correlation_args,
+from server_helpers import _coarse_error_kind, _resolve_text_channel
+from server_ticks import ErrorFn, make_auto_reply_tick, make_heartbeat_tick, make_poll_tick
+from source_messages import (
+    SourceDeleted,
+    SourceUnavailable,
+    check_source_message,
+    is_unknown_message,
 )
-from server_ticks import make_auto_reply_tick, make_heartbeat_tick, make_poll_tick
-from source_messages import SourceDeleted, SourceUnavailable, check_source_message
+from store import Store, StoreError
 from tasks import AUTO_RECOVERY_TASK_NAME, AUTO_REPLY_TASK_NAME, TaskRegistry, TickFn
 
 MIN_POLL_SECONDS = 30.0
 
 
+def build_message_entry(
+    scope_guild_id: int | None,
+    guild_id: int | None,
+    channel_id: int,
+    message_id: int,
+    author_uid: int,
+    author_name: str,
+    content: str | None,
+    bot_uid: int,
+    owner_uid: int,
+    watch_channel_ids: list[int],
+    author_is_bot: bool | None = None,
+    reply_to_message_id: int | None = None,
+) -> dict[str, Any] | None:
+    """Build a realtime entry's fields, or None when the message must not be captured.
+
+    Pure function (no discord imports): drops out-of-scope guilds (including DMs),
+    the bot's own messages, and unwatched channels. Owner/other messages are kept
+    even with empty content. Poll entries (which keep ``self`` messages) are built
+    separately by the poll tick using :func:`classify_actor` directly.
+
+    v5 capture metadata (optional, backward compatible): when ``author_is_bot``
+    is provided (native ``message.author.bot``), both ``author_is_bot`` and
+    ``reply_to_message_id`` (native ``message.reference.message_id`` or None)
+    are persisted. Legacy callers omitting ``author_is_bot`` get entries
+    without either key; absence means unknown, never assumed human.
+    """
+    if guild_id != scope_guild_id:
+        return None
+    actor = classify_actor(author_uid, author_name, bot_uid=bot_uid, owner_uid=owner_uid)
+    if actor.kind is ActorKind.SELF:
+        return None
+    if channel_id not in watch_channel_ids:
+        return None
+    entry: dict[str, Any] = {
+        "type": "message",
+        "channel_id": channel_id,
+        "message_id": message_id,
+        "author_uid": author_uid,
+        "author_name": author_name,
+        "actor_kind": actor.kind.value,
+        "content": content if content else "",
+    }
+    if author_is_bot is not None:
+        entry["author_is_bot"] = author_is_bot
+        entry["reply_to_message_id"] = reply_to_message_id
+    return entry
+
+
 def create_server(settings: Settings) -> FastMCP:
     registry = TaskRegistry()
     state: dict[str, Any] = {"bot": None, "responder": None}
-    # Failure fencing (NOT caller authentication): process-lifetime
-    # no-new-send latch for correlated sends whose uncertain hold could
-    # not be persisted. Keyed by (channel_id, source_message_id). Set
-    # inside _preserve_uncertain BEFORE any journal read/write, so it
-    # fences ALL ambiguous holds (SDK/cancel/receipt-mismatch/read/write
-    # failures) even when the disk itself is unwritable. Checked in
-    # _correlated_send after correlation accepts but before any
-    # intent/SDK work. Manual uncorrelated sends bypass it unchanged.
-    # Crash loses this memory: with an unwritable disk exactly-once
-    # cannot be promised; startup worker reconciliation still never
-    # blind-POSTs.
+    # Best-effort delivery (NOT caller authentication): correlated sends
+    # verify job + stage, send via the native reply reference, then record
+    # the send conditionally (job_ref + send-eligible stage guard the
+    # recording). Ambiguous failures fail the job -- never a blind retry
+    # or resend. Manual uncorrelated sends bypass correlation unchanged.
 
     def audit(tool: str, args: dict[str, Any], ok: bool = True, error: str | None = None) -> None:
         append_audit(
@@ -131,9 +143,16 @@ def create_server(settings: Settings) -> FastMCP:
         """Capture-only poll tick (authoritative body in server_ticks)."""
         return make_poll_tick(settings, channel_id, _bot, _audit_sink)
 
-    def _make_auto_reply_tick(responder: Responder) -> tuple[TickFn, dict[str, Any]]:
+    def _make_auto_reply_tick(responder: Responder) -> tuple[TickFn, ErrorFn]:
         """FIFO worker step (authoritative body in server_ticks)."""
         return make_auto_reply_tick(settings, responder, _audit_sink)
+
+    # Mention guard for every send (Phase 1 deliberate behavior fix): agent
+    # text must never mass-ping. users/replied_user stay on (owner-confirmed
+    # choice); the !help command vanished with commands.Bot (noted at gate).
+    _ALLOWED_MENTIONS = discord.AllowedMentions(
+        everyone=False, roles=False, users=True, replied_user=True
+    )
 
     async def _discord_send(
         channel: discord.TextChannel,
@@ -144,101 +163,153 @@ def create_server(settings: Settings) -> FastMCP:
 
         This MCP tool is the ONLY auto outbound path: the worker tick and the
         Thyca POST body never send. Correlated calls pass a native reply
-        reference; manual calls send plain content exactly as v4 did.
+        reference; manual calls send plain content exactly as v4 did. Both
+        paths carry the mention guard.
         """
         if reference is None:
-            return await channel.send(content)
-        return await channel.send(content, reference=reference)
+            return await channel.send(content, allowed_mentions=_ALLOWED_MENTIONS)
+        return await channel.send(content, reference=reference, allowed_mentions=_ALLOWED_MENTIONS)
 
-    send_blocked: set[tuple[int, int]] = set()
+    def _fail_job(channel_id: int, source_message_id: int, *, kind: str) -> None:
+        """Best-effort fail after a send-side failure (never raises).
 
-    def _preserve_uncertain(channel_id: int, source_message_id: int, *, kind: str) -> None:
-        """Best-effort fresh-state uncertain after a send-side failure.
-
-        Reloads the job fresh and never clobbers terminal completed/skipped/
-        uncertain stages or a late success that landed first (races resolve by
-        keeping the durable outcome). Committed intents/receipts are PRESERVED
-        (never rewound or deleted); the uncertain stage only closes the job to
-        NEW sends, so retries correlation-reject instead of duplicating.
-        The process-lifetime send_blocked latch is set FIRST (before any
-        journal read/write), so even when the hold itself cannot be
-        persisted the retry still fences instead of duplicate-sending.
-        Never raises: the caller's bounded error (or CancelledError) stays the
-        visible failure.
+        The Discord send already side-effected (or ambiguous): the job
+        fails with a coarse kind and the worker moves on -- never a blind
+        retry or resend. Terminal jobs keep their recorded state (completed
+        wins over a failed close). Never raises: the caller's bounded
+        error (or CancelledError) stays the visible failure.
         """
-        # Latch FIRST: fence this server lifetime even if the journal
-        # read/hold write below fails (e.g. disk unwritable). Never raises.
-        send_blocked.add((channel_id, source_message_id))
         try:
-            job = get_job(settings.delivery_state_path, channel_id, source_message_id)
+            with Store.open(settings.db_path) as _store:
+                fresh = _store.get_job(channel_id, source_message_id)
+                if fresh is None or fresh.get("stage") in ("done", "skipped", "failed"):
+                    return
+                _store.mark_failed(channel_id, source_message_id, kind=kind)
         except Exception:
             return
-        if job is None or job.get("stage") in ("completed", "skipped", "uncertain"):
-            return
+
+    # Fixed audit allowlist for the three correlated tools (send_message
+    # correlated branch, record_no_reply, read_context): channel_id,
+    # source_message_id, content_len (correlated sends only), reason
+    # (record_no_reply only, enum values) plus error_kind on failures.
+    # job_ref NEVER appears -- accepted or rejected. Rejected untrusted
+    # inputs leave no audit trace at all on rejection -- not raw, not even a hash.
+    def _correlated_base_args(
+        cid: int,
+        source_mid: Any,
+        job_ref: Any,
+        *,
+        content: Any = None,
+        reason: Any = None,
+    ) -> dict[str, Any]:
+        """Pre-acceptance audit args: metadata only for untrusted inputs."""
+        args: dict[str, Any] = {"channel_id": cid}
+        if isinstance(content, str):
+            args["content_len"] = len(content)
+        if isinstance(source_mid, int) and not isinstance(source_mid, bool) and source_mid > 0:
+            args["source_message_id"] = source_mid
+        # Rejected untrusted inputs leave no audit trace at all (never raw,
+        # never a hash); non-string non-None shapes keep a boolean flag only.
+        if not isinstance(job_ref, str) and job_ref is not None:
+            args["job_ref_invalid"] = True
+        if not isinstance(reason, str) and reason is not None:
+            args["reason_invalid"] = True
+        return args
+
+    def _correlated_deny(tool: str, args: dict[str, Any], kind: str, public: str) -> NoReturn:
+        """Bounded correlated failure: fixed-kind audit, sanitized raise."""
+        audit(
+            tool,
+            {**args, "error_kind": kind},
+            ok=False,
+            error=f"{tool} failed kind={kind}",
+        )
+        raise ValueError(public) from None
+
+    def _require_correlated(
+        tool: str,
+        cid: int,
+        source_mid: Any,
+        job_ref: Any,
+        base_args: dict[str, Any],
+        *,
+        scope_public: str,
+    ) -> dict[str, Any]:
+        """Shared preamble for the three correlated tools.
+
+        Covers: default-channel scope, source/job_ref shape, controller
+        presence, correlated_job accept/reject, bounded error mapping via
+        _coarse_error_kind, and audit emission. No send_blocked latch
+        remains (that machinery died in Phase 3), so no extra state is
+        checked here. Returns the accepted allowlist args (channel_id +
+        source_message_id, never job_ref); callers add content_len/reason.
+        """
+        if cid != settings.default_channel_id:
+            _correlated_deny(tool, base_args, "validation_error", scope_public)
+        if not isinstance(source_mid, int) or isinstance(source_mid, bool) or source_mid <= 0:
+            _correlated_deny(
+                tool, base_args, "validation_error", f"{tool}: invalid source_message_id"
+            )
+        if not isinstance(job_ref, str) or not job_ref:
+            _correlated_deny(tool, base_args, "validation_error", f"{tool}: invalid job_ref")
+        responder = state.get("responder")
+        if responder is None:
+            _correlated_deny(
+                tool,
+                base_args,
+                "validation_error",
+                f"{tool}: auto controller not running",
+            )
         try:
-            mark_uncertain(settings.delivery_state_path, channel_id, source_message_id, kind=kind)
-        except Exception:
-            return
+            responder.correlated_job(source_mid, job_ref, cid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _correlated_deny(
+                tool,
+                base_args,
+                _coarse_error_kind(exc),
+                f"{tool}: correlation rejected",
+            )
+        return {"channel_id": cid, "source_message_id": source_mid}
 
     async def _correlated_send(content: str, cid: int, source_mid: Any, job_ref: Any) -> str:
-        """Agent-owned auto reply: correlate, then intent -> SDK -> receipt.
+        """Agent-owned auto reply: correlate, then SDK send, then record.
 
-        Correlation (source_message_id + job_ref) selects the exact active job;
-        it never authenticates the MCP caller (the shared pool carries no caller
-        identity). The intent is journaled BEFORE the SDK side effect; the SDK
-        receipt is journaled as a CANDIDATE only -- the worker owns completion
-        via native Trace proof. Correlation inputs are audited raw ONLY after
-        correlated_job accepts them (pre-acceptance audits use length/hash
-        metadata for job_ref). All failures are bounded metadata-only (coarse
-        audit kind + sanitized raise from None); CancelledError journals then
-        propagates; durability-uncertain commits take an uncertain/no-new-send
-        hold preserving all committed evidence, then never retry or resend.
+        Correlation selects the exact active job; it never authenticates
+        the MCP caller. The job + send-eligible stage is verified, the
+        reply is sent with an explicit reference
+        (``fail_if_not_exists=True``), then ONE store update records the
+        send. A deleted source skips durably (zero sends only); any other
+        send failure fails the job (never a blind retry or resend).
+        CancelledError propagates untouched.
         """
-        # Pre-acceptance audit args: correlation inputs are UNTRUSTED here, so
-        # job_ref stays length/hash metadata (never raw) until accepted below.
-        args = _send_meta_args(cid, content)
-        args.update(_unvalidated_correlation_args(source_mid, job_ref))
+        # Pre-acceptance audit args: correlation inputs are UNTRUSTED here.
+        args = _correlated_base_args(cid, source_mid, job_ref, content=content)
 
         def _bounded(kind: str, public: str) -> NoReturn:
-            audit(
-                "send_message",
-                {**args, "error_kind": kind},
-                ok=False,
-                error=f"send_message failed kind={kind}",
-            )
-            raise ValueError(public) from None
+            _correlated_deny("send_message", args, kind, public)
 
         if (source_mid is None) != (job_ref is None):
             _bounded(
                 "validation_error",
                 "send_message: source_message_id and job_ref must be paired",
             )
-        responder = state.get("responder")
-        if responder is None:
-            _bounded("validation_error", "send_message: auto controller not running")
-        if not isinstance(source_mid, int) or isinstance(source_mid, bool) or source_mid <= 0:
-            _bounded("validation_error", "send_message: invalid source_message_id")
-        if not isinstance(job_ref, str) or not job_ref:
-            _bounded("validation_error", "send_message: invalid job_ref")
-        try:
-            responder.correlated_job(source_mid, job_ref, cid)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _bounded(_coarse_error_kind(exc), "send_message: correlation rejected")
-        # Correlation ACCEPTED: both IDs are known-valid correlation
-        # identifiers from here on, so later failure audits and the success
-        # audit may carry them raw.
-        args = _send_meta_args(cid, content, source_mid, job_ref)
-        # Failure fence (NOT authentication): a prior ambiguous hold for
-        # this (channel, source MID) blocks new correlated sends for this
-        # server lifetime, even when the journal hold could not be
-        # persisted (stage still delivering/sent). Placed after
-        # correlation accepts (so a persisted uncertain still
-        # correlation-rejects first, preserving existing audits) but
-        # before ANY content/channel/intent/SDK work. Manual sends bypass.
-        if (cid, source_mid) in send_blocked:
-            _bounded("delivery_error", "send_message: delivery uncertain")
+        accepted = _require_correlated(
+            "send_message",
+            cid,
+            source_mid,
+            job_ref,
+            args,
+            # No explicit scope gate existed here: scope rejects via
+            # correlated_job, so the public string stays identical.
+            scope_public="send_message: correlation rejected",
+        )
+        # Correlation ACCEPTED: the allowlist carries channel_id +
+        # source_message_id (+ content_len); job_ref never appears.
+        args = dict(accepted)
+        if isinstance(content, str):
+            args["content_len"] = len(content)
         if not isinstance(content, str) or not content or len(content) > 2000:
             _bounded("validation_error", "send_message: auto content must be 1..2000 chars")
         try:
@@ -249,112 +320,11 @@ def create_server(settings: Settings) -> FastMCP:
             raise
         except Exception as exc:
             _bounded(_coarse_error_kind(exc), "send_message: channel unavailable")
-        # Proven-no-send gate (last pre-send GET): the source may have been
-        # deleted while the native turn was generating. A confirmed deletion
-        # with zero send evidence skips durably with NO intent/SDK send and
-        # NO plain fallback. ANY send evidence keeps the conservative
-        # uncertain hold instead of a skip. Unproven existence (timeouts,
-        # permissions, 5xx) never sends and never mutates: the worker keeps
-        # reconciling from native Trace proof. Cancellation propagates.
-        try:
-            await check_source_message(channel, source_mid)
-            source_gone = False
-        except asyncio.CancelledError:
-            raise
-        except SourceUnavailable:
-            _bounded("discord_error", "send_message: source unavailable")
-        except SourceDeleted:
-            source_gone = True
-        # The existence read awaited: re-check the live no-new-send latch
-        # plus exact correlation on BOTH branches BEFORE any intent or skip,
-        # so a stale latch/authorization/nonce/stage cannot slip through.
-        # No new await runs between this guard and the intent/skip below.
-        if (cid, source_mid) in send_blocked:
-            _bounded("delivery_error", "send_message: delivery uncertain")
-        try:
-            responder.correlated_job(source_mid, job_ref, cid)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _bounded(_coarse_error_kind(exc), "send_message: correlation rejected")
-        if source_gone:
-            try:
-                fresh = get_job(settings.delivery_state_path, cid, source_mid)
-            except Exception:
-                _preserve_uncertain(cid, source_mid, kind="delivery_unknown")
-                _bounded("delivery_error", "send_message: delivery uncertain")
-            if (
-                fresh is None
-                or fresh.get("channel_id") != cid
-                or fresh.get("message_id") != source_mid
-                or fresh.get("job_ref") != job_ref
-                or fresh.get("stage") in ("completed", "skipped", "uncertain")
-            ):
-                _bounded("delivery_error", "send_message: delivery uncertain")
-            if (
-                fresh.get("send_intents")
-                or fresh.get("send_receipts")
-                or fresh.get("trace_refs") is not None
-            ):
-                # Source deleted after a partial send (e.g. before chunk 2):
-                # withhold further SDK sends, preserve prior evidence and
-                # the conservative uncertain hold -- never a skip.
-                _preserve_uncertain(cid, source_mid, kind="transport_error")
-                _bounded("delivery_error", "send_message: delivery uncertain")
-            try:
-                skip_job(settings.delivery_state_path, cid, source_mid, reason="source_deleted")
-            except DeliveryDurabilityUncertain:
-                _preserve_uncertain(cid, source_mid, kind="delivery_unknown")
-                audit(
-                    "send_message",
-                    {**args, "error_kind": "delivery_error"},
-                    ok=False,
-                    error="send_message failed kind=delivery_error",
-                )
-                raise ValueError("send_message: delivery uncertain") from None
-            except Exception as exc:
-                _bounded(_coarse_error_kind(exc), "send_message: skip rejected")
-            # Successful metadata-only skip: the agent must stop ALL replies
-            # for this source (instruction is also in the tool description).
-            return _ok(
-                "send_message",
-                args,
-                {
-                    "status": "skipped",
-                    "reason": "source_deleted",
-                    "channel_id": cid,
-                    "source_message_id": source_mid,
-                },
-            )
-        send_ref = uuid.uuid4().hex
-        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        try:
-            record_send_intent(
-                settings.delivery_state_path,
-                cid,
-                source_mid,
-                send_ref=send_ref,
-                content_len=len(content),
-                content_hash=content_hash,
-            )
-        except asyncio.CancelledError:
-            raise
-        except DeliveryDurabilityUncertain:
-            # Committed intent, namespace durability unknown: place the job on
-            # an uncertain/no-new-send hold PRESERVING the committed intent
-            # (never rewind/delete it), so a retry correlation-rejects instead
-            # of recording a fresh intent and SDK-sending. NEVER SDK-send now.
-            # Operator reconciles from the preserved journal.
-            _preserve_uncertain(cid, source_mid, kind="delivery_unknown")
-            audit(
-                "send_message",
-                {**args, "error_kind": "delivery_error"},
-                ok=False,
-                error="send_message failed kind=delivery_error",
-            )
-            raise ValueError("send_message: delivery uncertain") from None
-        except Exception as exc:
-            _bounded(_coarse_error_kind(exc), "send_message: send intent rejected")
+        # Best-effort send: verify job + stage, send with an explicit reply
+        # reference (fail_if_not_exists reports a deleted source), then ONE
+        # conditional store update recording the send. No pre-flight fetch,
+        # no intent/receipt journal, no latches. The reference send above is
+        # the only SDK side effect; cancellation propagates untouched.
         try:
             reference = discord.MessageReference(
                 message_id=source_mid,
@@ -364,88 +334,75 @@ def create_server(settings: Settings) -> FastMCP:
             )
             message = await _discord_send(channel, content, reference=reference)
         except asyncio.CancelledError:
-            _preserve_uncertain(cid, source_mid, kind="delivery_unknown")
-            audit(
-                "send_message",
-                {**args, "error_kind": "unknown"},
-                ok=False,
-                error="send_message failed kind=unknown",
-            )
             raise
+        except discord.NotFound as exc:
+            # The reply reference reports a deleted source. With zero sends
+            # recorded the job skips durably (the agent must stop ALL replies
+            # for this source); after a partial send (e.g. before chunk 2)
+            # further sends are withheld and the job fails instead -- never
+            # a skip over send evidence, never a plain fallback send.
+            if not is_unknown_message(exc):
+                _fail_job(cid, source_mid, kind="transport_error")
+                _bounded("discord_error", "send_message: reply uncertain")
+            try:
+                with Store.open(settings.db_path) as _store:
+                    fresh = _store.get_job(cid, source_mid)
+                    if fresh is not None and fresh.get("send_count", 0) == 0:
+                        _store.skip_job(cid, source_mid, reason="source_deleted")
+                        skipped = True
+                    else:
+                        skipped = False
+            except StoreError:
+                _fail_job(cid, source_mid, kind="transport_error")
+                _bounded("delivery_error", "send_message: delivery uncertain")
+            if skipped:
+                return _ok(
+                    "send_message",
+                    args,
+                    {
+                        "status": "skipped",
+                        "reason": "source_deleted",
+                        "channel_id": cid,
+                        "source_message_id": source_mid,
+                    },
+                )
+            _fail_job(cid, source_mid, kind="transport_error")
+            _bounded("delivery_error", "send_message: delivery uncertain")
         except Exception as exc:
-            # No unthreaded fallback: a deleted source / invalid reply goes
-            # UNCERTAIN, never a plain duplicate send.
-            _preserve_uncertain(cid, source_mid, kind="transport_error")
+            # No unthreaded fallback: Forbidden/5xx/ambiguous failures fail
+            # the job -- never a blind retry, never a duplicate send.
+            _fail_job(cid, source_mid, kind="transport_error")
             _bounded(_coarse_error_kind(exc), "send_message: reply uncertain")
-        # Validate the ACTUAL SDK receipt before journaling anything: scoped
-        # native reference fields plus exact jump-URL IDs (guild/channel/message
-        # segments must equal the delivered scope).
-        sent_mid: Any = getattr(message, "id", None)
-        delivered_cid: Any = getattr(getattr(message, "channel", None), "id", None)
-        jump_url: Any = getattr(message, "jump_url", None)
-        reply_to: Any = None
-        ref_channel: Any = None
-        ref_guild: Any = None
-        ref = getattr(message, "reference", None)
-        if ref is not None:
-            reply_to = getattr(ref, "message_id", None)
-            ref_channel = getattr(ref, "channel_id", None)
-            ref_guild = getattr(ref, "guild_id", None)
-
-        def _strict_pos(value: Any) -> bool:
-            return isinstance(value, int) and not isinstance(value, bool) and value > 0
-
-        if (
-            not _strict_pos(sent_mid)
-            or not _strict_pos(delivered_cid)
-            or delivered_cid != cid
-            or reply_to != source_mid
-            or ref_channel != cid
-            or ref_guild != settings.guild_id
-            or not _jump_url_ids_match(jump_url, settings.guild_id, cid, sent_mid)
-        ):
-            # SDK already side-effected: mark uncertain, never repeat.
-            _preserve_uncertain(cid, source_mid, kind="delivery_unknown")
-            _bounded("discord_error", "send_message: reply receipt mismatch")
+        # The transaction guards the recording only: concurrent multi-chunk
+        # sends interleave at the await above (accepted under best-effort).
+        # A terminal job (or stale nonce) records nothing and raises instead
+        # of duplicating; a stray success against a terminal job still
+        # returns the posted receipt (the send DID happen).
+        stale_terminal = False
         try:
-            record_send_receipt(
-                settings.delivery_state_path,
-                cid,
-                source_mid,
-                send_ref=send_ref,
-                sent_message_id=sent_mid,
-                delivered_channel_id=delivered_cid,
-                jump_url=jump_url,
-                reply_to_message_id=reply_to,
-            )
-        except asyncio.CancelledError:
-            raise
-        except DeliveryDurabilityUncertain:
-            # Committed receipt, namespace durability unknown: place the job on
-            # an uncertain/no-new-send hold PRESERVING the committed intent +
-            # receipt (never rewind/delete them), so a retry correlation-rejects
-            # instead of SDK-sending a duplicate. Never resend; the worker
-            # reconciles from the preserved journal.
-            _preserve_uncertain(cid, source_mid, kind="delivery_unknown")
-            audit(
-                "send_message",
-                {**args, "error_kind": "delivery_error"},
-                ok=False,
-                error="send_message failed kind=delivery_error",
-            )
-            raise ValueError("send_message: delivery uncertain") from None
-        except Exception as exc:
-            _preserve_uncertain(cid, source_mid, kind="delivery_unknown")
-            _bounded(_coarse_error_kind(exc), "send_message: receipt uncertain")
+            with Store.open(settings.db_path) as _store:
+                _store.record_send(cid, source_mid, job_ref=job_ref, sent_message_id=message.id)
+        except StoreError:
+            try:
+                with Store.open(settings.db_path) as _store:
+                    fresh = _store.get_job(cid, source_mid)
+                    if fresh is not None and fresh.get("stage") in ("done", "skipped"):
+                        stale_terminal = True
+                    else:
+                        _store.mark_failed(cid, source_mid, kind="transport_error")
+            except StoreError:
+                pass
+            if not stale_terminal:
+                _bounded("delivery_error", "send_message: delivery uncertain")
         return _ok(
             "send_message",
             args,
             {
-                "message_id": sent_mid,
-                "channel_id": delivered_cid,
-                "jump_url": jump_url,
+                "message_id": message.id,
+                "channel_id": message.channel.id,
+                "jump_url": message.jump_url,
                 "source_message_id": source_mid,
-                "reply_to_message_id": reply_to,
+                "reply_to_message_id": source_mid,
             },
         )
 
@@ -455,7 +412,7 @@ def create_server(settings: Settings) -> FastMCP:
         state["bot"] = bot
         responder: Responder | None = None
 
-        async def _on_message_realtime(message: discord.Message) -> None:
+        async def on_message(message: discord.Message) -> None:
             """Capture watched messages into the outbox; never interpret content."""
             try:
                 assert bot.user is not None
@@ -478,7 +435,10 @@ def create_server(settings: Settings) -> FastMCP:
                 )
                 if fields is None:
                     return
-                append_entry(settings.outbox_path, settings.outbox_state_path, **fields)
+                # Synchronous store append (never across an await): INSERT OR
+                # IGNORE dedupes a realtime/poll overlap on (channel, message).
+                with Store.open(settings.db_path) as _store:
+                    _store.append_entry(**fields)
             except Exception as exc:
                 try:
                     err_args: dict[str, Any] = {
@@ -497,25 +457,27 @@ def create_server(settings: Settings) -> FastMCP:
                     error=repr(exc),
                 )
 
-        # Extra listener (not an on_message override): command processing is untouched,
-        # and no commands are executed from message content — capture only.
+        # discord.Client has no add_listener: register realtime capture via
+        # bot.event (the handler must literally be named on_message). There
+        # is no command processing on a bare Client -- capture only, and no
+        # commands are executed from message content.
         # One try/finally covers responder init + registration + login + readiness +
-        # serve: a journal failure, login failure, readiness error, or init
-        # cancellation must still settle loops, close the worker, remove the
-        # listener, close the HTTP bot, and settle both gateway tasks.
-        connect_task: asyncio.Task[None] | None = None
+        # serve: a store failure, login failure, readiness error, or init
+        # cancellation must still settle loops, close the worker, close the
+        # HTTP bot, and settle both gateway tasks.
+        start_task: asyncio.Task[None] | None = None
         ready_task: asyncio.Task[None] | None = None
         try:
-            # Single-writer precondition (accepted core contract): state must agree
-            # with the log before any capture path runs. Realtime appends are O(1)
-            # by design and never scan the log, so without this check a restart
-            # with state behind the log would append duplicate seqs from on_message
-            # before the first tool read; corruption must fail here, not capture.
-            _check_outbox_consistent(settings)
-            # Always-on v5 worker: constructor validates the existing journal +
-            # journal only (no network, owner UID not required); missing/corrupt/
-            # outside-SID state FAILS here, before any capture path runs. No
-            # auto-create, reset, native session creation, or prune.
+            # Startup gate: Store.open runs PRAGMA quick_check + the
+            # user_version gate and fails loudly on corruption (never
+            # auto-reset/delete) before any capture path runs.
+            with Store.open(settings.db_path):
+                pass
+            # Always-on v5 worker: constructor opens the store, runs the
+            # restart sweep once, and loads the serving SID (no network, owner
+            # UID not required); missing/corrupt/unseeded state FAILS here,
+            # before any capture path runs. No auto-create, reset, native
+            # session creation, or prune.
             responder = Responder(settings, bot)
             state["responder"] = responder
             print(
@@ -523,31 +485,42 @@ def create_server(settings: Settings) -> FastMCP:
                 "correlation is job-trace based, hard guild/channel scope only",
                 file=sys.stderr,
             )
-            bot.add_listener(_on_message_realtime, "on_message")
-            # Split start() into login + background connect: wait_until_ready()
-            # needs login() to have run first (it raises otherwise).
-            await bot.login(settings.discord_token.get_secret_value())
-            connect_task = asyncio.create_task(bot.connect(), name="discord-gateway")
+            bot.event(on_message)
+            # bot.start() is login + connect. Both start() and
+            # wait_until_ready() run as tasks raced FIRST_COMPLETED: a bare
+            # await wait_until_ready() raises RuntimeError before login()
+            # creates _ready, and a pre-ready gateway failure would hang
+            # instead of surfacing. Task FIFO ordering lets start() run
+            # _async_setup_hook (creating _ready) before the ready-task body
+            # runs, so the race is deadlock-free.
+            start_task = asyncio.create_task(
+                bot.start(settings.discord_token.get_secret_value()), name="discord-gateway"
+            )
             ready_task = asyncio.create_task(bot.wait_until_ready(), name="discord-ready")
             done, _pending = await asyncio.wait(
-                {connect_task, ready_task}, return_when=asyncio.FIRST_COMPLETED
+                {start_task, ready_task}, return_when=asyncio.FIRST_COMPLETED
             )
             if ready_task not in done:
                 # Gateway died before ready (bad token, missing privileged
                 # intents, ...): surface the real cause instead of hanging.
                 # Cleanup runs in the finally below (shared with all paths).
-                exc = connect_task.exception()
+                exc = start_task.exception()
                 raise RuntimeError(f"discord gateway failed before ready: {exc!r}") from exc
             await ready_task  # propagate ready-wait errors, if any
             registry.start("heartbeat")
             # Native protected loops start ONLY after Discord is ready.
-            auto_tick, auto_holder = _make_auto_reply_tick(responder)
-            auto_holder["loop"] = registry.register(
+            auto_tick, auto_error = _make_auto_reply_tick(responder)
+            auto_loop = registry.register(
                 AUTO_REPLY_TASK_NAME,
                 auto_tick,
                 seconds=settings.responder_check_seconds,
                 protected=True,
             )
+            # Fail-closed wiring: the OSError-family retry set must NOT
+            # swallow tick failures (backoff + retry forever); every failure
+            # reaches the error handler and ends the task failed instead.
+            auto_loop.error(auto_error)
+            auto_loop.clear_exception_types()
             registry.register(
                 AUTO_RECOVERY_TASK_NAME,
                 _make_poll_tick(settings.default_channel_id),
@@ -561,10 +534,11 @@ def create_server(settings: Settings) -> FastMCP:
             # Ordered internal cleanup (ONLY here may force protected tasks; the
             # MCP stop tool keeps allow_protected=False): worker loop first, then
             # recovery, then heartbeat/user polls. EVERY teardown step is
-            # independently protected (stops, worker close, listener removal,
-            # bot close, gateway settle): one step's failure never skips the
-            # rest, and both state entries clear unconditionally. Cleanup
-            # failures are collected: on a clean exit the first one raises,
+            # independently protected (stops, worker close, bot close, gateway
+            # settle): one step's failure never skips the rest, and both state
+            # entries clear unconditionally (the bot object is discarded, so no
+            # listener removal is needed). Cleanup failures are collected: on a
+            # clean exit the first one raises,
             # but a propagating startup/cancellation error stays the PRIMARY
             # outcome with cleanup failures retained as secondary evidence on
             # it (never raised, never replacing; a cancelled shutdown still
@@ -591,19 +565,15 @@ def create_server(settings: Settings) -> FastMCP:
             finally:
                 try:
                     try:
-                        bot.remove_listener(_on_message_realtime, "on_message")
-                    except Exception as exc:
-                        errors.append(exc)
-                    try:
                         if not bot.is_closed():
                             await bot.close()
                     except Exception as exc:
                         errors.append(exc)
                     try:
-                        for task in (connect_task, ready_task):
+                        for task in (start_task, ready_task):
                             if task is not None and not task.done():
                                 task.cancel()
-                        started = [t for t in (connect_task, ready_task) if t is not None]
+                        started = [t for t in (start_task, ready_task) if t is not None]
                         if started:
                             await asyncio.gather(*started, return_exceptions=True)
                     except Exception as exc:
@@ -700,7 +670,9 @@ def create_server(settings: Settings) -> FastMCP:
         """
         cid = channel_id if channel_id is not None else settings.default_channel_id
         if source_message_id is None and job_ref is None:
-            args = _send_meta_args(cid, content)
+            args = {"channel_id": cid}
+            if isinstance(content, str):
+                args["content_len"] = len(content)
             try:
                 bot = _bot()
                 guild = get_scoped_guild(bot, settings.guild_id)
@@ -717,13 +689,13 @@ def create_server(settings: Settings) -> FastMCP:
 
     @mcp.tool(
         description=(
-            "Declare NO reply for a correlated need_context turn; defaults to the "
+            "Terminally declare NO reply for a correlated turn; defaults to the "
             "configured channel. Call with the exact source_message_id/job_ref from "
-            "the task plus reason no_reply_needed|missing_context. The declaration "
-            "is journaled only -- NEVER terminal and NEVER an ACK at tool time; the "
-            "worker completes via native Trace proof. If this tool returns status "
-            "skipped with reason source_deleted, the source was deleted: stop ALL "
-            "replies for that source -- no fallback and no retries. "
+            "the task plus reason no_reply_needed|missing_context. Only a correlated "
+            "mid-flight job with zero sends may declare; the job closes done "
+            "(no_reply) AT TOOL TIME. If this tool returns status skipped with "
+            "reason source_deleted, the source was deleted: stop ALL replies "
+            "for that source -- no fallback and no retries. "
             f"{identity_policy}"
         )
     )
@@ -735,72 +707,44 @@ def create_server(settings: Settings) -> FastMCP:
     ) -> str:
         """Declare no reply. (Agent-facing text is the decorator description above.)
 
-        Only a correlated eligible mid-flight job with zero send evidence may
-        declare; delivery enforces the bound-need_context eligibility. Shared
-        MCP correlation selects the job but never authenticates the caller.
+        Only an eligible mid-flight job with zero sends may declare; the
+        store enforces the guards and closes the job done (no_reply) at
+        tool time. Shared MCP correlation selects the job but never
+        authenticates the caller.
         """
         cid = channel_id if channel_id is not None else settings.default_channel_id
-        # Pre-acceptance audit args: UNTRUSTED correlation inputs stay
-        # length/hash metadata until correlated below.
-        args: dict[str, Any] = {"channel_id": cid}
-        args.update(_unvalidated_correlation_args(source_message_id, job_ref))
-        if isinstance(reason, str):
-            args["reason_len"] = len(reason)
-            args["reason_sha256"] = hashlib.sha256(reason.encode("utf-8")).hexdigest()
-        else:
-            args["reason_invalid"] = True
+        # Pre-acceptance audit args: UNTRUSTED correlation inputs leave
+        # no audit trace until the helper accepts them below.
+        args: dict[str, Any] = _correlated_base_args(cid, source_message_id, job_ref, reason=reason)
 
         def _bounded_no_reply(kind: str, public: str) -> NoReturn:
-            audit(
-                "record_no_reply",
-                {**args, "error_kind": kind},
-                ok=False,
-                error=f"record_no_reply failed kind={kind}",
-            )
-            raise ValueError(public) from None
+            _correlated_deny("record_no_reply", args, kind, public)
 
-        if cid != settings.default_channel_id:
-            _bounded_no_reply("validation_error", "record_no_reply: channel out of scope")
-        if (
-            not isinstance(source_message_id, int)
-            or isinstance(source_message_id, bool)
-            or source_message_id <= 0
-        ):
-            _bounded_no_reply("validation_error", "record_no_reply: invalid source_message_id")
-        if not isinstance(job_ref, str) or not job_ref:
-            _bounded_no_reply("validation_error", "record_no_reply: invalid job_ref")
         if reason not in ("no_reply_needed", "missing_context"):
             _bounded_no_reply("validation_error", "record_no_reply: invalid reason")
+        accepted = _require_correlated(
+            "record_no_reply",
+            cid,
+            source_message_id,
+            job_ref,
+            args,
+            scope_public="record_no_reply: channel out of scope",
+        )
+        # Correlation ACCEPTED: the allowlist carries channel_id +
+        # source_message_id + the enum reason; job_ref never appears.
+        args = {**accepted, "reason": reason}
         responder = state.get("responder")
-        if responder is None:
-            _bounded_no_reply("validation_error", "record_no_reply: auto controller not running")
         try:
-            responder.correlated_job(source_message_id, job_ref, cid)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _bounded_no_reply(_coarse_error_kind(exc), "record_no_reply: correlation rejected")
-        # Correlation ACCEPTED: exact IDs may be audited raw from here on.
-        args = {
-            "channel_id": cid,
-            "source_message_id": source_message_id,
-            "job_ref": job_ref,
-            "reason": reason,
-        }
-        if (cid, source_message_id) in send_blocked:
-            _bounded_no_reply("delivery_error", "record_no_reply: delivery uncertain")
-        try:
-            pre = get_job(settings.delivery_state_path, cid, source_message_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
+            with Store.open(settings.db_path) as _store:
+                pre = _store.get_job(cid, source_message_id)
+        except StoreError as exc:
             _bounded_no_reply(_coarse_error_kind(exc), "record_no_reply: delivery uncertain")
         if pre is None or pre.get("job_ref") != job_ref:
             _bounded_no_reply("delivery_error", "record_no_reply: correlation rejected")
-        if pre.get("send_intents") or pre.get("send_receipts") or pre.get("trace_refs"):
+        if pre.get("send_count", 0) > 0:
             _bounded_no_reply("delivery_error", "record_no_reply: send evidence present")
         # Source freshness (last pre-declaration GET): a deleted source with
-        # zero evidence skips durably instead of declaring; unproven
+        # zero sends skips durably instead of declaring; unproven
         # existence never declares and never mutates.
         try:
             bot = _bot()
@@ -819,52 +763,31 @@ def create_server(settings: Settings) -> FastMCP:
             _bounded_no_reply("discord_error", "record_no_reply: source unavailable")
         except SourceDeleted:
             source_gone = True
-        # Post-await latch + nonce guard (same as correlated sends): no new
-        # await runs between this guard and the declare/skip below.
-        if (cid, source_message_id) in send_blocked:
-            _bounded_no_reply("delivery_error", "record_no_reply: delivery uncertain")
+        # Post-await re-validation: a send may have landed during the source
+        # check (stage submitted -> sent is still eligible, but any send
+        # evidence refuses the declaration). No new await runs between this
+        # guard and the declare/skip below.
         try:
             responder.correlated_job(source_message_id, job_ref, cid)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             _bounded_no_reply(_coarse_error_kind(exc), "record_no_reply: correlation rejected")
+        try:
+            with Store.open(settings.db_path) as _store:
+                fresh = _store.get_job(cid, source_message_id)
+        except StoreError as exc:
+            _bounded_no_reply(_coarse_error_kind(exc), "record_no_reply: delivery uncertain")
+        if fresh is None or fresh.get("job_ref") != job_ref:
+            _bounded_no_reply("delivery_error", "record_no_reply: correlation rejected")
+        if fresh.get("send_count", 0) > 0:
+            _bounded_no_reply("delivery_error", "record_no_reply: send evidence present")
         if source_gone:
             # Mirror the send gate: proven-no-send skip, no declaration.
             try:
-                fresh = get_job(settings.delivery_state_path, cid, source_message_id)
-            except Exception:
-                _preserve_uncertain(cid, source_message_id, kind="delivery_unknown")
-                _bounded_no_reply("delivery_error", "record_no_reply: delivery uncertain")
-            if (
-                fresh is None
-                or fresh.get("channel_id") != cid
-                or fresh.get("message_id") != source_message_id
-                or fresh.get("job_ref") != job_ref
-                or fresh.get("stage") in ("completed", "skipped", "uncertain")
-            ):
-                _bounded_no_reply("delivery_error", "record_no_reply: delivery uncertain")
-            if (
-                fresh.get("send_intents")
-                or fresh.get("send_receipts")
-                or fresh.get("trace_refs") is not None
-            ):
-                _preserve_uncertain(cid, source_message_id, kind="transport_error")
-                _bounded_no_reply("delivery_error", "record_no_reply: delivery uncertain")
-            try:
-                skip_job(
-                    settings.delivery_state_path, cid, source_message_id, reason="source_deleted"
-                )
-            except DeliveryDurabilityUncertain:
-                _preserve_uncertain(cid, source_message_id, kind="delivery_unknown")
-                audit(
-                    "record_no_reply",
-                    {**args, "error_kind": "delivery_error"},
-                    ok=False,
-                    error="record_no_reply failed kind=delivery_error",
-                )
-                raise ValueError("record_no_reply: delivery uncertain") from None
-            except Exception as exc:
+                with Store.open(settings.db_path) as _store:
+                    _store.skip_job(cid, source_message_id, reason="source_deleted")
+            except StoreError as exc:
                 _bounded_no_reply(_coarse_error_kind(exc), "record_no_reply: skip rejected")
             return _ok(
                 "record_no_reply",
@@ -876,109 +799,23 @@ def create_server(settings: Settings) -> FastMCP:
                     "source_message_id": source_message_id,
                 },
             )
-        # Journal the declaration (delivery enforces midflight bound
-        # need_context + zero evidence + reason enum). NEVER terminal and
-        # NEVER an ACK here; the worker completes via Trace proof.
+        # Terminal at tool time: the store enforces correlated mid-flight
+        # (submitted/sent) + zero sends; the worker treats done/no_reply as
+        # the turn's outcome, never re-POSTing or re-sending for this job.
         try:
-            _delivery_record_no_reply(
-                settings.delivery_state_path,
-                cid,
-                source_message_id,
-                job_ref=job_ref,
-                reason=reason,
-            )
-        except asyncio.CancelledError:
-            raise
-        except DeliveryDurabilityUncertain:
-            _preserve_uncertain(cid, source_message_id, kind="delivery_unknown")
-            audit(
-                "record_no_reply",
-                {**args, "error_kind": "delivery_error"},
-                ok=False,
-                error="record_no_reply failed kind=delivery_error",
-            )
-            raise ValueError("record_no_reply: delivery uncertain") from None
-        except Exception as exc:
+            with Store.open(settings.db_path) as _store:
+                _store.complete_job(cid, source_message_id, outcome="no_reply")
+        except StoreError as exc:
             _bounded_no_reply(_coarse_error_kind(exc), "record_no_reply: declaration rejected")
         return _ok(
             "record_no_reply",
             args,
             {
-                "status": "declared",
+                "status": "no_reply",
                 "channel_id": cid,
                 "source_message_id": source_message_id,
                 "job_ref": job_ref,
                 "reason": reason,
-            },
-        )
-
-    @mcp.tool(
-        description=(
-            "Operator-drop a stuck uncertain job with zero send evidence; "
-            "defaults to the configured channel. Call with the exact "
-            "source_message_id of an uncertain job whose native turn is final "
-            "and produced nothing verifiable (no intents, receipts, trace, "
-            "observation, or declaration). The job moves to skipped with "
-            "reason operator_approved_drop plus a matching authorized-skips "
-            "record, unblocking the FIFO head; proof fields (job_ref, "
-            "fingerprints, Jev decision) are preserved. Refuses anything with "
-            "send evidence and any non-uncertain stage. "
-            f"{identity_policy}"
-        )
-    )
-    async def resolve_uncertain_drop(
-        source_message_id: StrictInt,
-        channel_id: int | None = None,
-    ) -> str:
-        """Drop a stuck uncertain job. (Agent-facing text is above.)
-
-        Targeted by channel + source message only (no job_ref: the caller
-        names the stuck job, delivery enforces uncertain-stage plus
-        zero-evidence preconditions). Shared MCP correlation selects the job
-        but never authenticates the caller.
-        """
-        cid = channel_id if channel_id is not None else settings.default_channel_id
-        args: dict[str, Any] = {
-            "channel_id": cid,
-            "source_message_id": source_message_id if isinstance(source_message_id, int) else None,
-        }
-
-        def _bounded_drop(kind: str, public: str) -> NoReturn:
-            audit(
-                "resolve_uncertain_drop",
-                {**args, "error_kind": kind},
-                ok=False,
-                error=f"resolve_uncertain_drop failed kind={kind}",
-            )
-            raise ValueError(public) from None
-
-        if cid != settings.default_channel_id:
-            _bounded_drop("validation_error", "resolve_uncertain_drop: channel out of scope")
-        if (
-            not isinstance(source_message_id, int)
-            or isinstance(source_message_id, bool)
-            or source_message_id <= 0
-        ):
-            _bounded_drop("validation_error", "resolve_uncertain_drop: invalid source_message_id")
-        try:
-            dropped = _delivery_resolve_uncertain_drop(
-                settings.delivery_state_path, cid, source_message_id
-            )
-        except asyncio.CancelledError:
-            raise
-        except DeliveryDurabilityUncertain:
-            _bounded_drop("delivery_error", "resolve_uncertain_drop: delivery uncertain")
-        except Exception as exc:
-            _bounded_drop(_coarse_error_kind(exc), "resolve_uncertain_drop: drop rejected")
-        return _ok(
-            "resolve_uncertain_drop",
-            args,
-            {
-                "status": dropped["stage"],
-                "reason": dropped["skip_reason"],
-                "channel_id": cid,
-                "source_message_id": source_message_id,
-                "seq": dropped["seq"],
             },
         )
 
@@ -1006,36 +843,11 @@ def create_server(settings: Settings) -> FastMCP:
         correlation selects the job but never authenticates the caller.
         """
         cid = channel_id if channel_id is not None else settings.default_channel_id
-        args: dict[str, Any] = {"channel_id": cid}
-        args.update(_unvalidated_correlation_args(source_message_id, job_ref))
-        if isinstance(before_message_id, int) and not isinstance(before_message_id, bool):
-            args["before_message_id"] = before_message_id
-        elif before_message_id is not None:
-            args["before_message_id_invalid"] = True
-        if isinstance(limit, int) and not isinstance(limit, bool):
-            args["limit"] = limit
-        else:
-            args["limit_invalid"] = True
+        args: dict[str, Any] = _correlated_base_args(cid, source_message_id, job_ref)
 
         def _bounded_ctx(kind: str, public: str) -> NoReturn:
-            audit(
-                "read_context",
-                {**args, "error_kind": kind},
-                ok=False,
-                error=f"read_context failed kind={kind}",
-            )
-            raise ValueError(public) from None
+            _correlated_deny("read_context", args, kind, public)
 
-        if cid != settings.default_channel_id:
-            _bounded_ctx("validation_error", "read_context: channel out of scope")
-        if (
-            not isinstance(source_message_id, int)
-            or isinstance(source_message_id, bool)
-            or source_message_id <= 0
-        ):
-            _bounded_ctx("validation_error", "read_context: invalid source_message_id")
-        if not isinstance(job_ref, str) or not job_ref:
-            _bounded_ctx("validation_error", "read_context: invalid job_ref")
         if before_message_id is not None and (
             not isinstance(before_message_id, int)
             or isinstance(before_message_id, bool)
@@ -1050,26 +862,18 @@ def create_server(settings: Settings) -> FastMCP:
             _bounded_ctx("validation_error", "read_context: before_message_id is future")
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 20:
             _bounded_ctx("validation_error", "read_context: limit must be 1..20")
+        accepted = _require_correlated(
+            "read_context",
+            cid,
+            source_message_id,
+            job_ref,
+            args,
+            scope_public="read_context: channel out of scope",
+        )
+        # Correlation ACCEPTED: the allowlist carries channel_id +
+        # source_message_id only (message bodies never touch the audit log).
+        args = dict(accepted)
         responder = state.get("responder")
-        if responder is None:
-            _bounded_ctx("validation_error", "read_context: auto controller not running")
-        try:
-            responder.correlated_job(source_message_id, job_ref, cid)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _bounded_ctx(_coarse_error_kind(exc), "read_context: correlation rejected")
-        # Correlation ACCEPTED: exact IDs may be audited raw from here on
-        # (message bodies never are -- only IDs/counts below).
-        args = {
-            "channel_id": cid,
-            "source_message_id": source_message_id,
-            "job_ref": job_ref,
-            "before_message_id": before_message_id,
-            "limit": limit,
-        }
-        if (cid, source_message_id) in send_blocked:
-            _bounded_ctx("delivery_error", "read_context: delivery uncertain")
         try:
             bot = _bot()
             guild = get_scoped_guild(bot, settings.guild_id)
@@ -1091,10 +895,8 @@ def create_server(settings: Settings) -> FastMCP:
         except Exception as exc:
             _bounded_ctx(_coarse_error_kind(exc), "read_context: history unavailable")
         collected.reverse()  # old->new chronological context
-        # Post-await freshness: never serve context for a job that died
-        # during the fetch.
-        if (cid, source_message_id) in send_blocked:
-            _bounded_ctx("delivery_error", "read_context: delivery uncertain")
+        # Post-await freshness: never serve context for a job that moved
+        # terminal during the fetch.
         try:
             responder.correlated_job(source_message_id, job_ref, cid)
         except asyncio.CancelledError:
@@ -1103,55 +905,28 @@ def create_server(settings: Settings) -> FastMCP:
             _bounded_ctx(_coarse_error_kind(exc), "read_context: correlation rejected")
         messages: list[dict[str, Any]] = []
         for m in collected:
-            mid = getattr(m, "id", None)
-            if not isinstance(mid, int) or isinstance(mid, bool) or mid <= 0:
-                _bounded_ctx("validation_error", "read_context: invalid message id")
-            if mid >= bound:
+            # Typed SDK reads: history of this channel can only hold its own
+            # messages with native int ids, str bodies, and datetimes. Scope
+            # mismatches and future rows are selection-policy refusals, not
+            # SDK distrust.
+            if m.id >= bound:
                 _bounded_ctx("validation_error", "read_context: future message")
-            got_cid = getattr(getattr(m, "channel", None), "id", None)
-            if got_cid != cid:
+            if m.channel.id != cid:
                 _bounded_ctx("validation_error", "read_context: channel mismatch")
-            got_gid = getattr(getattr(m, "guild", None), "id", None)
-            if got_gid != settings.guild_id:
+            if m.guild is None or m.guild.id != settings.guild_id:
                 _bounded_ctx("validation_error", "read_context: guild mismatch")
-            author = getattr(m, "author", None)
-            auid = getattr(author, "id", None)
-            if not isinstance(auid, int) or isinstance(auid, bool) or auid <= 0:
-                _bounded_ctx("validation_error", "read_context: invalid author id")
-            name = getattr(author, "display_name", None)
-            if not isinstance(name, str):
-                _bounded_ctx("validation_error", "read_context: invalid author name")
-            content = getattr(m, "content", None)
-            if not isinstance(content, str) or len(content) > 4000:
-                _bounded_ctx("validation_error", "read_context: invalid content")
-            ref = getattr(m, "reference", None)
-            reply_to = getattr(ref, "message_id", None) if ref is not None else None
-            if reply_to is not None and (
-                not isinstance(reply_to, int) or isinstance(reply_to, bool) or reply_to <= 0
-            ):
-                _bounded_ctx("validation_error", "read_context: invalid reply ref")
-            created = getattr(m, "created_at", None)
-            if hasattr(created, "isoformat"):
-                try:
-                    timestamp: Any = created.isoformat()
-                except Exception:
-                    _bounded_ctx("validation_error", "read_context: invalid timestamp")
-            elif isinstance(created, str) and created:
-                timestamp = created
-            else:
-                _bounded_ctx("validation_error", "read_context: invalid timestamp")
+            ref = m.reference
+            reply_to = ref.message_id if ref is not None else None
             messages.append(
                 {
-                    "message_id": mid,
-                    "author_uid": auid,
-                    "author_name": name,
-                    "content": content,
+                    "message_id": m.id,
+                    "author_uid": m.author.id,
+                    "author_name": m.author.display_name,
+                    "content": m.content,
                     "reply_to_message_id": reply_to,
-                    "timestamp": timestamp,
+                    "timestamp": m.created_at.isoformat(),
                 }
             )
-        args["returned_count"] = len(messages)
-        args["message_ids"] = [m["message_id"] for m in messages]
         return _ok(
             "read_context",
             args,
@@ -1197,16 +972,44 @@ def create_server(settings: Settings) -> FastMCP:
             assert bot.user is not None
             guild = get_scoped_guild(bot, settings.guild_id)
             members = []
-            async for member in guild.fetch_members(limit=limit):
-                actor = classify_actor(
-                    member.id,
-                    member.display_name,
-                    bot_uid=bot.user.id,
-                    owner_uid=settings.owner_uid,
-                )
-                members.append(
-                    {"uid": actor.uid, "display_name": actor.display_name, "kind": actor.kind.value}
-                )
+            if guild.chunked:
+                # Member cache is complete: read it directly, no API call.
+                cached = sorted(guild.members, key=lambda m: m.id)[:limit]
+                for member in cached:
+                    actor = classify_actor(
+                        member.id,
+                        member.display_name,
+                        bot_uid=bot.user.id,
+                        owner_uid=settings.owner_uid,
+                    )
+                    members.append(
+                        {
+                            "uid": actor.uid,
+                            "display_name": actor.display_name,
+                            "kind": actor.kind.value,
+                        }
+                    )
+            else:
+                # Cache incomplete (chunk timed out, intents off, missed
+                # events): page the REST endpoint instead of serving a
+                # partial cache. Never backfills the cache. Note the native
+                # fetch_members yields pages reversed (descending); the cache
+                # path above deliberately sorts ascending-by-id instead, so
+                # the two paths do not share an order contract.
+                async for member in guild.fetch_members(limit=limit):
+                    actor = classify_actor(
+                        member.id,
+                        member.display_name,
+                        bot_uid=bot.user.id,
+                        owner_uid=settings.owner_uid,
+                    )
+                    members.append(
+                        {
+                            "uid": actor.uid,
+                            "display_name": actor.display_name,
+                            "kind": actor.kind.value,
+                        }
+                    )
             return _ok("list_members", {"limit": limit}, members)
         except Exception as exc:
             _fail("list_members", {"limit": limit}, exc)
@@ -1278,7 +1081,10 @@ def create_server(settings: Settings) -> FastMCP:
             bot = _bot()
             guild = get_scoped_guild(bot, settings.guild_id)
             await _resolve_text_channel(bot, guild, cid)
-            _check_outbox_consistent(settings)  # refuse to start on state loss/corruption
+            # Refuse to start on a corrupt DB: Store.open fail-louds via
+            # quick_check + user_version gate (never auto-reset/delete).
+            with Store.open(settings.db_path):
+                pass
             registry.register(name, _make_poll_tick(cid), seconds=seconds)
             registry.start(name)
             info = registry.status(name)
@@ -1310,12 +1116,8 @@ def create_server(settings: Settings) -> FastMCP:
     async def read_outbox(limit: int = 50, unread_only: bool = True) -> str:
         """Pull the outbox. (Agent-facing text is the decorator description above.)"""
         try:
-            result = read_entries(
-                settings.outbox_path,
-                settings.outbox_state_path,
-                limit=limit,
-                unread_only=unread_only,
-            )
+            with Store.open(settings.db_path) as _store:
+                result = _store.read_entries(limit=limit, unread_only=unread_only)
             return _ok("read_outbox", {"limit": limit, "unread_only": unread_only}, result)
         except Exception as exc:
             _fail("read_outbox", {"limit": limit, "unread_only": unread_only}, exc)
@@ -1329,11 +1131,13 @@ def create_server(settings: Settings) -> FastMCP:
         Double-ack at/below the current acked seq is a no-op.
         """
         try:
-            _check_outbox_consistent(settings)  # state-only ack must not reset on state loss
+            # Store.open fail-louds on a corrupt DB; the ack itself is
+            # monotonic and rejects beyond-latest (never silently clamps).
             responder = state.get("responder")
             if responder is not None:
                 responder.guard_ack(up_to_seq)  # beyond-prefix rejected, no silent clamp
-            acked = ack_entries(settings.outbox_state_path, up_to_seq)
+            with Store.open(settings.db_path) as _store:
+                acked = _store.ack_entries(up_to_seq)
             return _ok("ack_outbox", {"up_to_seq": up_to_seq}, {"acked": acked})
         except Exception as exc:
             _fail("ack_outbox", {"up_to_seq": up_to_seq}, exc)

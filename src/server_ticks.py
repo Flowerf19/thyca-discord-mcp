@@ -18,16 +18,17 @@ returns an async TickFn that only works when the native loop calls it.
 
 Failure policy (preserved exactly): heartbeat failures are recorded, not
 hidden, and the loop survives; poll errors audit ok:false and leave the
-cursor for retry; auto-reply errors audit coarse kinds only and stop their
-own loop unconditionally (an audit-sink failure emits a fixed sanitized
-stderr signal and still stops); CancelledError always propagates untouched.
+cursor for retry; auto-reply errors propagate to fail the native Loop
+(its error handler audits coarse kinds only) and an audit-sink failure
+emits a fixed sanitized stderr signal; CancelledError always propagates
+untouched.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from contextlib import suppress
 from typing import Any, Protocol
 
@@ -36,12 +37,16 @@ import discord
 from bot import get_scoped_guild
 from config import Settings
 from identity import classify_actor
-from outbox import append_entry, get_poll_cursor, set_poll_cursor
-from server_helpers import _check_outbox_consistent, _coarse_error_kind, _resolve_text_channel
+from server_helpers import _coarse_error_kind, _resolve_text_channel
+from store import Store
 from tasks import TickFn
+
+#: Native Loop error-handler: called once with the failure, must not raise.
+ErrorFn = Callable[[BaseException], Coroutine[None, None, None]]
 
 __all__ = [
     "AppendAuditFn",
+    "ErrorFn",
     "GetBotFn",
     "GetBotOrNoneFn",
     "TickableResponder",
@@ -129,8 +134,12 @@ def make_poll_tick(
             guild = get_scoped_guild(bot, settings.guild_id)
             channel = await _resolve_text_channel(bot, guild, channel_id)
             assert bot.user is not None
-            _check_outbox_consistent(settings)  # before cursor use: no history on state loss
-            cursor = get_poll_cursor(settings.outbox_state_path, channel_id)
+            # History fetch happens BEFORE any store transaction (never hold a
+            # txn across an await). The batch append + cursor advance below is
+            # one BEGIN IMMEDIATE transaction; Store.open fail-louds on a
+            # corrupt DB, so no separate consistency check is needed here.
+            with Store.open(settings.db_path) as _store:
+                cursor = _store.get_poll_cursor(channel_id)
             if cursor is None:
                 # Newest-first page of the 20 newest; reverse to append old->new.
                 # Never oldest_first=True here: that would page from channel creation.
@@ -144,6 +153,7 @@ def make_poll_tick(
                     )
                 ]
             max_id = cursor or 0
+            items: list[dict[str, Any]] = []
             for m in collected:
                 actor = classify_actor(
                     m.author.id,
@@ -151,22 +161,27 @@ def make_poll_tick(
                     bot_uid=bot.user.id,
                     owner_uid=settings.owner_uid,
                 )
-                append_entry(
-                    settings.outbox_path,
-                    settings.outbox_state_path,
-                    type="poll",
-                    channel_id=channel_id,
-                    message_id=m.id,
-                    author_uid=m.author.id,
-                    author_name=m.author.display_name,
-                    actor_kind=actor.kind.value,
-                    content=m.content if m.content else "",
-                    author_is_bot=m.author.bot,
-                    reply_to_message_id=m.reference.message_id if m.reference is not None else None,
+                items.append(
+                    {
+                        "type": "poll",
+                        "channel_id": channel_id,
+                        "message_id": m.id,
+                        "author_uid": m.author.id,
+                        "author_name": m.author.display_name,
+                        "actor_kind": actor.kind.value,
+                        "content": m.content if m.content else "",
+                        "author_is_bot": m.author.bot,
+                        "reply_to_message_id": m.reference.message_id
+                        if m.reference is not None
+                        else None,
+                    }
                 )
                 max_id = max(max_id, m.id)
             if collected:
-                set_poll_cursor(settings.outbox_state_path, channel_id, max_id)
+                # Poll batch + cursor in ONE transaction: either every new
+                # message and the cursor land together, or nothing does.
+                with Store.open(settings.db_path) as _store:
+                    _store.append_poll_batch(channel_id, items, max_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -188,48 +203,43 @@ def make_auto_reply_tick(
     settings: Settings,
     responder: TickableResponder,
     append_audit_fn: AppendAuditFn,
-) -> tuple[TickFn, dict[str, Any]]:
+) -> tuple[TickFn, ErrorFn]:
     """Drive one FIFO worker step; fail the loop closed on any error.
 
-    Returns the tick coroutine plus a holder the lifespan fills with the
-    registered native Loop, so a failing tick can stop its own loop (no
-    state reset, no blind repeat POST). Failures are audited with coarse
-    kinds only; stopping is UNCONDITIONAL (an audit-sink failure emits a
-    fixed sanitized stderr signal and still stops -- a raise here would
-    let the native Loop backoff-retry instead). Cancellation propagates
-    untouched.
+    Returns the tick coroutine plus a native Loop error handler the lifespan
+    registers via ``loop.error(...)``. The tick lets exceptions propagate so
+    the Loop ends failed (no state reset, no blind repeat POST); the handler
+    audits coarse kinds only. ``loop.clear_exception_types()`` in the
+    lifespan is REQUIRED: without it the Loop backoff-retries OSError and
+    friends instead of ever reaching this handler. The handler must not
+    raise (a raising handler replaces the task exception); an audit-sink
+    failure emits a fixed sanitized stderr signal instead. Cancellation
+    propagates untouched (native Loops skip the handler for CancelledError).
     """
-    holder: dict[str, Any] = {}
 
     async def _auto_reply_tick() -> None:
-        try:
-            await responder.tick()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            kind = _coarse_error_kind(exc)
-            try:
-                append_audit_fn(
-                    settings.audit_path,
-                    session_id=settings.target_bot_id,
-                    actor="system",
-                    tool="auto_reply_tick",
-                    args={"error_kind": kind},
-                    ok=False,
-                    error=f"auto_reply_tick failed kind={kind}",
-                )
-            except Exception:
-                # Audit sink failed: fixed sanitized signal only (never the
-                # original exception chain), then still fail closed below.
-                with suppress(Exception):
-                    print(
-                        "thyca-discord-mcp: auto_reply_tick audit failed",
-                        file=sys.stderr,
-                    )
-            finally:
-                loop = holder.get("loop")
-                if loop is not None:
-                    loop.stop()  # fail close: unconditional, never swallowed
-            return
+        await responder.tick()
 
-    return _auto_reply_tick, holder
+    async def _auto_reply_error(exc: BaseException) -> None:
+        kind = _coarse_error_kind(exc)
+        try:
+            append_audit_fn(
+                settings.audit_path,
+                session_id=settings.target_bot_id,
+                actor="system",
+                tool="auto_reply_tick",
+                args={"error_kind": kind},
+                ok=False,
+                error=f"auto_reply_tick failed kind={kind}",
+            )
+        except Exception:
+            # Audit sink failed: fixed sanitized signal only (never the
+            # original exception chain). The Loop is already failed here;
+            # nothing further is needed to fail closed.
+            with suppress(Exception):
+                print(
+                    "thyca-discord-mcp: auto_reply_tick audit failed",
+                    file=sys.stderr,
+                )
+
+    return _auto_reply_tick, _auto_reply_error

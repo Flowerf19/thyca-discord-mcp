@@ -1,9 +1,10 @@
-"""Deleted-source no-reply handling: pre-send existence proof + offline regressions.
+"""Deleted-source handling: pre-send existence proof + offline regressions.
 
 All tests fake (tmp settings, _env_file=None, no network/Discord/Thyca).
 Covers: strict 404/10008 deletion vs unavailable scope, responder pre-POST
-skip with zero POST/nonce/intent, MCP pre-send gate skip, evidence holds,
-post-intent 404 stays uncertain, cancellation preservation, safe-prefix ACK.
+skip with zero POSTs, MCP pre-send gate skip, send-evidence failure
+(no skip when a send landed), cancellation preservation, safe-prefix ACK.
+No uncertain stage, no intents/receipts, no trace proof exist anymore.
 """
 
 from __future__ import annotations
@@ -20,22 +21,6 @@ import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
 from config import Settings
-from delivery import (
-    DeliveryError,
-    enqueue_job,
-    get_job,
-    initialize_delivery_state,
-    list_jobs,
-    load_delivery_state,
-    mark_turn_submitting,
-    mark_uncertain,
-    processed_seq_prefix,
-    record_send_intent,
-    record_send_receipt,
-    requeue_definitive_busy,
-    skip_job,
-)
-from outbox import append_entry, read_entries
 from responder import Responder
 from server import create_server
 from source_messages import (
@@ -44,6 +29,7 @@ from source_messages import (
     build_source_checker,
     check_source_message,
 )
+from store import Store, StoreError, append_entry, read_entries
 
 BOT_UID = 111
 OWNER_UID = 222
@@ -51,6 +37,7 @@ OTHER_UID = 999
 GUILD_ID = 333
 CHANNEL_ID = 444
 FAKE_SID = "2026-01-02T03-04-05_ab12"
+FAKE_DAY = "2026-01-02"
 
 
 def _nf(status, code):
@@ -145,24 +132,29 @@ class FakeBot:
         self.listeners: dict = {}
         self._ready = False
         self._closed = False
+        self._setup = False  # mirrors Client._ready existing after _async_setup_hook
+        # Mirrors the gateway READY dispatch: set only by a successful start.
+        self._ready_event = asyncio.Event()
         self._close_event = asyncio.Event()
 
-    def add_listener(self, func, name):
-        self.listeners.setdefault(name, []).append(func)
+    def event(self, func):
+        self.listeners.setdefault(func.__name__, []).append(func)
+        return func
 
-    def remove_listener(self, func, name):
-        try:
-            self.listeners.get(name, []).remove(func)
-        except ValueError:
-            pass
-
-    async def login(self, token):
-        pass
-
-    async def connect(self):
+    async def start(self, token):  # noqa: ARG002 - signature mirrors discord.py
+        self._setup = True  # mirrors _async_setup_hook at login() entry
+        # Successful gateway connect dispatches READY, then stays open.
+        self._ready_event.set()
         await self._close_event.wait()
 
     async def wait_until_ready(self):
+        if not self._setup:
+            # Mirrors the real Client: raises before login() creates _ready.
+            raise RuntimeError(
+                "Client has not been properly initialised. "
+                "Please use the login method before calling this method"
+            )
+        await self._ready_event.wait()
         self._ready = True
 
     def is_ready(self):
@@ -189,7 +181,6 @@ class ScriptClient:
         self.pre_max = pre_max
         self.submit_calls: list = []
         self.submit_fn = None
-        self.trace_fn = None
 
     async def get_session_snapshot(self, sid, **kw):
         total = self.pre_max + 1 + len(self.submit_calls)
@@ -206,7 +197,17 @@ class ScriptClient:
         self.submit_calls.append(text)
         if self.submit_fn is not None:
             return await self.submit_fn(sid, text)
-        return {"cancelled": False, "completed": True, "native_id_match": True}
+        # Clean idle turn: the index follows the gate pre_max exactly so
+        # the snapshot-poll close accepts it without trace proof.
+        turn_index = self.pre_max + len(self.submit_calls)
+        return {
+            "cancelled": False,
+            "completed": True,
+            "native_id_match": True,
+            "turn_index": turn_index,
+            "running": False,
+            "stored_text_match": True,
+        }
 
     async def get_bot_dm(self, bot_id):
         return {
@@ -214,25 +215,6 @@ class ScriptClient:
             "running": False,
             "message_count": 0,
             "proof": "bot_dm",
-        }
-
-    async def get_trace_evidence(
-        self, sid, idx, *, job_ref, source_message_id, channel_id, guild_id=None
-    ):
-        if self.trace_fn is not None:
-            return await self.trace_fn(sid, idx, job_ref, source_message_id, channel_id)
-        submitted = self.submit_calls[-1]
-        return {
-            "request_input_sha256": hashlib.sha256(submitted.encode()).hexdigest(),
-            "request_input_len": len(submitted),
-            "status": "completed",
-            "error_present": False,
-            "trace_session_match": True,
-            "turn_index_match": True,
-            "request_user_count": 1,
-            "all_sends_confirmed": True,
-            "legacy_uncorrelated_count": 0,
-            "sends": [],
         }
 
 
@@ -244,10 +226,8 @@ def _settings_kwargs(tmp_path):
         guild_id=GUILD_ID,
         default_channel_id=CHANNEL_ID,
         audit_path=tmp_path / "audit.jsonl",
-        outbox_path=tmp_path / "outbox.jsonl",
-        outbox_state_path=tmp_path / "outbox_state.json",
+        db_path=tmp_path / "state.db",
         watch_channel_ids=[CHANNEL_ID],
-        delivery_state_path=tmp_path / "delivery.json",
         responder_check_seconds=0.05,
         thyca_request_timeout_seconds=5.0,
         recovery_poll_seconds=30.0,
@@ -257,20 +237,14 @@ def _settings_kwargs(tmp_path):
 @pytest.fixture
 def settings(tmp_path):
     s = Settings(**_settings_kwargs(tmp_path))
-    initialize_delivery_state(
-        s.delivery_state_path,
-        native_session_id=FAKE_SID,
-        baseline_acked=0,
-        historical_message_ids={},
-        authorized_skips=[],
-    )
+    with Store.open(s.db_path) as store:
+        store.adopt_session(expected_current=None, new_sid=FAKE_SID, day=FAKE_DAY)
     return s
 
 
 def _append(settings, mid, seq_note="", author_uid=OWNER_UID, kind="owner", name="O"):
     append_entry(
-        settings.outbox_path,
-        settings.outbox_state_path,
+        settings.db_path,
         type="message",
         channel_id=CHANNEL_ID,
         message_id=mid,
@@ -280,16 +254,9 @@ def _append(settings, mid, seq_note="", author_uid=OWNER_UID, kind="owner", name
         content=f"m{mid}{seq_note}",
         author_is_bot=False,
     )
-    enqueue_job(
-        settings.delivery_state_path,
-        channel_id=CHANNEL_ID,
-        message_id=mid,
-        author_uid=author_uid,
-        actor_kind=kind,
-        seq=read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)[
-            "latest"
-        ],
-    )
+    entry_seq = read_entries(settings.db_path, unread_only=False)["entries"][-1]["seq"]
+    with Store.open(settings.db_path) as store:
+        store.enqueue_job(CHANNEL_ID, mid, entry_seq)
 
 
 @asynccontextmanager
@@ -302,6 +269,34 @@ async def _parked(monkeypatch, settings, bot, backend=None):
         for name in ("auto-reply", "auto-reply-recovery"):
             await ctx["tasks"].stop(name, allow_protected=True)
         yield mcp, ctx
+
+
+def _get_job(settings, mid, channel_id=CHANNEL_ID):
+    with Store.open(settings.db_path) as store:
+        return store.get_job(channel_id, mid)
+
+
+def _submit(settings, mid, ref, channel_id=CHANNEL_ID, pre_max=3):
+    """Move the ingested job row (created by _append) to submitted."""
+    with Store.open(settings.db_path) as store:
+        return store.mark_submitted(
+            channel_id, mid, job_ref=ref, native_sid=FAKE_SID, pre_turn_index=pre_max
+        )
+
+
+def _record_send(settings, mid, ref, sent_mid=9001, channel_id=CHANNEL_ID):
+    with Store.open(settings.db_path) as store:
+        return store.record_send(channel_id, mid, job_ref=ref, sent_message_id=sent_mid)
+
+
+def _skip(settings, mid, reason, channel_id=CHANNEL_ID):
+    with Store.open(settings.db_path) as store:
+        return store.skip_job(channel_id, mid, reason=reason)
+
+
+def _fail(settings, mid, kind, channel_id=CHANNEL_ID, http_status=None):
+    with Store.open(settings.db_path) as store:
+        return store.mark_failed(channel_id, mid, kind=kind, http_status=http_status)
 
 
 async def _call_json(mcp, name, args=None):
@@ -325,17 +320,6 @@ async def test_check_proves_existing_message():
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     check = build_source_checker(bot, GUILD_ID)
     assert await check(CHANNEL_ID, 701) is None
-
-
-async def test_scope_mismatch_is_unavailable():
-    channel = make_text_channel(CHANNEL_ID)
-
-    async def wrong_scope(mid):
-        return FakeMessage(mid, FakeUser(1, "x"), channel_id=999999, guild_id=GUILD_ID)
-
-    channel.fetch_message = wrong_scope
-    with pytest.raises(SourceUnavailable):
-        await check_source_message(channel, 701)
 
 
 async def test_strict_404_10008_is_deleted():
@@ -391,17 +375,6 @@ async def test_cancellation_propagates():
         await check_source_message(channel, 701)
 
 
-async def test_malformed_scope_is_unavailable():
-    channel = make_text_channel(CHANNEL_ID)
-
-    async def malformed(mid):
-        return SimpleNamespace(id=mid)  # no channel/guild scope
-
-    channel.fetch_message = malformed
-    with pytest.raises(SourceUnavailable):
-        await check_source_message(channel, 701)
-
-
 # -- legacy Jev stub (module-only autouse; preserves pre-routing regressions) --
 # Every Responder built in THIS module gets a fake respond-only Jev stack
 # unless the test passes explicit deps. The fake binds a REAL delivery
@@ -452,18 +425,16 @@ def _legacy_collector(owner_uid, bot_uid):
 # Fixed synthetic activation identity for the legacy fake ledger: every
 # Responder in this module binds the same marker, so restart-style second
 # constructions rebind idempotently (never conflict, never rewrite).
-_LEGACY_LEDGER_ID = "1e" * 16
-
-
 class _LegacyLedger:
-    """Respond-only stub: deterministic decided record, no provider call."""
+    """Respond-only stub: deterministic decided record, no provider call.
+
+    Returns the store-shape Jev record (context_sha256 key, no model) so
+    the full submit/POST/snapshot/ACK path runs unchanged; the fake
+    provider is never called (it raises).
+    """
 
     def __init__(self):
         self.calls = 0
-
-    @property
-    def ledger_id(self) -> str:
-        return _LEGACY_LEDGER_ID
 
     async def classify(self, adapter, state, *, channel_id, message_id, author_uid):
         self.calls += 1
@@ -472,11 +443,13 @@ class _LegacyLedger:
         attempt = hashlib.sha256(f"{channel_id}:{message_id}".encode()).hexdigest()[:32]
         return {
             "status": "decided",
-            "fingerprint": context_fingerprint(state),
+            "context_sha256": context_fingerprint(state),
             "attempt_id": attempt,
-            "model": "jev-1.13.0",
             "participation": "respond",
         }
+
+    def get(self, channel_id, message_id):
+        return None
 
 
 @pytest.fixture(autouse=True)
@@ -533,9 +506,9 @@ async def test_pre_post_deletion_skips_with_zero_post(settings):
     out = await inst.tick()
     assert out["status"] == "skipped" and out["reason"] == "source_deleted"
     assert client.submit_calls == []
-    job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
+    job = _get_job(settings, 701)
     assert job["stage"] == "skipped" and job["skip_reason"] == "source_deleted"
-    assert job["job_ref"] is None and job["send_intents"] == [] and job["trace_refs"] is None
+    assert job["job_ref"] is None and job["send_count"] == 0
     assert out["acked"] == 1
 
 
@@ -548,7 +521,7 @@ async def test_pre_post_unavailable_holds_queued_zero_post(settings):
     out = await inst.tick()
     assert out["status"] == "pending" and out["reason"] == "source_unavailable"
     assert client.submit_calls == []
-    job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
+    job = _get_job(settings, 701)
     assert job["stage"] == "queued" and job["job_ref"] is None
     assert out["acked"] == 0
 
@@ -588,30 +561,15 @@ async def test_next_queued_proceeds_after_skip(settings):
     _append(settings, 701)
     _append(settings, 702)
 
-    async def trace_ok(sid, idx, job_ref, source_mid, channel_id):
-        submitted = client.submit_calls[-1]
-        return {
-            "request_input_sha256": hashlib.sha256(submitted.encode()).hexdigest(),
-            "request_input_len": len(submitted),
-            "status": "completed",
-            "error_present": False,
-            "trace_session_match": True,
-            "turn_index_match": True,
-            "request_user_count": 1,
-            "all_sends_confirmed": True,
-            "legacy_uncorrelated_count": 0,
-            "sends": [],
-        }
-
-    client.trace_fn = trace_ok
     out = await inst.tick()
     assert out["status"] == "skipped"
-    # 701 skipped with zero POST; second tick must POST for 702 (no intents -> uncertain,
-    # but a POST proves the queue advanced past the skip)
+    # 701 skipped with zero POST; second tick must POST for 702. The clean
+    # turn records no outcome (no sends, no record_no_reply), so it fails
+    # failed/turn_no_outcome -- but the POST proves the queue advanced.
     out2 = await inst.tick()
-    assert out2["status"] == "uncertain"  # 702 POSTed once, zero intents held
+    assert out2["status"] == "failed" and out2["reason"] == "turn_no_outcome"
     assert len(client.submit_calls) == 1
-    assert get_job(settings.delivery_state_path, CHANNEL_ID, 701)["stage"] == "skipped"
+    assert _get_job(settings, 701)["stage"] == "skipped"
 
 
 async def test_deletion_during_submit_observed_as_skip(settings):
@@ -622,15 +580,22 @@ async def test_deletion_during_submit_observed_as_skip(settings):
     _append(settings, 701)
 
     async def submit_and_delete(sid, text):
-        skip_job(settings.delivery_state_path, CHANNEL_ID, 701, reason="source_deleted")
-        return {"cancelled": False, "completed": True, "native_id_match": True}
+        _skip(settings, 701, "source_deleted")
+        return {
+            "cancelled": False,
+            "completed": True,
+            "native_id_match": True,
+            "turn_index": 4,
+            "running": False,
+            "stored_text_match": True,
+        }
 
     client.submit_fn = submit_and_delete
     out = await inst.tick()
     assert out["status"] == "skipped" and out["reason"] == "source_deleted"
-    job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-    assert job["stage"] == "skipped" and job["turn_index"] is None
-    assert job["job_ref"] and job["submitted_text_sha256"]  # nonce/input metadata preserved
+    job = _get_job(settings, 701)
+    assert job["stage"] == "skipped"
+    assert job["job_ref"] and job["pre_turn_index"] == 3  # nonce/index preserved
     out2 = await inst.tick()  # no retry / re-POST / completion
     assert len(client.submit_calls) == 1 and out2["status"] == "idle"
 
@@ -643,115 +608,59 @@ async def test_cancel_after_skip_propagates_and_preserves(settings):
     _append(settings, 701)
 
     async def submit_cancel(sid, text):
-        skip_job(settings.delivery_state_path, CHANNEL_ID, 701, reason="source_deleted")
+        _skip(settings, 701, "source_deleted")
         raise asyncio.CancelledError()
 
     client.submit_fn = submit_cancel
     with pytest.raises(asyncio.CancelledError):
         await inst.tick()
-    job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
+    job = _get_job(settings, 701)
     assert job["stage"] == "skipped" and job["skip_reason"] == "source_deleted"
 
 
-async def test_skip_refused_with_evidence_holds_uncertain(settings):
+async def test_skip_refused_with_evidence_fails(settings):
     async def gone(cid, mid):
         raise SourceDeleted("gone")
 
     inst, _, _ = await _responder(settings, source_checker=gone)
     _append(settings, 701)
-    mark_turn_submitting(
-        settings.delivery_state_path, CHANNEL_ID, 701, job_ref="f" * 32, pre_turn_index=3
-    )
-    record_send_intent(
-        settings.delivery_state_path,
-        CHANNEL_ID,
-        701,
-        send_ref="r1",
-        content_len=5,
-        content_hash="a" * 64,
-    )
+    _submit(settings, 701, "f" * 32)
+    _record_send(settings, 701, "f" * 32, sent_mid=9001)
     out = inst._skip_source_deleted(CHANNEL_ID, 701)
-    assert out["status"] == "uncertain" and out["reason"] == "send_evidence_present"
-    job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-    assert job["stage"] == "uncertain" and len(job["send_intents"]) == 1
+    assert out["status"] == "failed" and out["reason"] == "send_evidence_present"
+    job = _get_job(settings, 701)
+    assert job["stage"] == "failed" and job["send_count"] == 1
 
 
-async def test_uncertain_job_with_deleted_source_stays_uncertain(settings):
+async def test_failed_job_with_deleted_source_stays_terminal(settings):
     async def gone(cid, mid):
         raise SourceDeleted("gone")
 
     inst, _, client = await _responder(settings, source_checker=gone)
     _append(settings, 701)
-    mark_turn_submitting(
-        settings.delivery_state_path,
-        CHANNEL_ID,
-        701,
-        job_ref="f" * 32,
-        pre_turn_index=3,
-        submitted_text_sha256="c" * 64,
-        submitted_text_len=10,
-    )
-    mark_uncertain(settings.delivery_state_path, CHANNEL_ID, 701, kind="transport_error")
+    _submit(settings, 701, "f" * 32)
+    _fail(settings, 701, "transport_error")
     out = await inst.tick()
-    assert out["status"] == "uncertain" and out["acked"] == 0
-    assert get_job(settings.delivery_state_path, CHANNEL_ID, 701)["stage"] == "uncertain"
+    assert out["status"] == "idle" and out["acked"] == 1
+    assert _get_job(settings, 701)["stage"] == "failed"
     assert client.submit_calls == []
 
 
-async def test_partial_receipt_source_deleted_holds(settings):
+async def test_sent_job_with_deleted_source_completes(settings):
+    """A reply WAS delivered: the worker completes sent (never a skip)."""
+
     async def gone(cid, mid):
         raise SourceDeleted("gone")
 
     inst, _, client = await _responder(settings, source_checker=gone)
     _append(settings, 701)
-    mark_turn_submitting(
-        settings.delivery_state_path,
-        CHANNEL_ID,
-        701,
-        job_ref="f" * 32,
-        pre_turn_index=3,
-        submitted_text_sha256="c" * 64,
-        submitted_text_len=10,
-    )
-    record_send_intent(
-        settings.delivery_state_path,
-        CHANNEL_ID,
-        701,
-        send_ref="r1",
-        content_len=5,
-        content_hash="a" * 64,
-    )
-    record_send_receipt(
-        settings.delivery_state_path,
-        CHANNEL_ID,
-        701,
-        send_ref="r1",
-        sent_message_id=9001,
-        delivered_channel_id=CHANNEL_ID,
-        jump_url=f"https://discord.com/channels/{GUILD_ID}/{CHANNEL_ID}/9001",
-        reply_to_message_id=701,
-    )
-
-    async def trace_partial(sid, idx, job_ref, source_mid, channel_id):
-        submitted = client.submit_calls[-1] if client.submit_calls else "x"
-        return {
-            "request_input_sha256": hashlib.sha256(submitted.encode()).hexdigest(),
-            "request_input_len": len(submitted),
-            "status": "completed",
-            "error_present": False,
-            "trace_session_match": True,
-            "turn_index_match": True,
-            "request_user_count": 1,
-            "all_sends_confirmed": True,
-            "legacy_uncorrelated_count": 0,
-            "sends": [],
-        }
-
-    client.trace_fn = trace_partial
+    _submit(settings, 701, "f" * 32)
+    _record_send(settings, 701, "f" * 32, sent_mid=9001)
     out = await inst.tick()
-    assert out["status"] == "uncertain" and out["acked"] == 0
-    job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-    assert job["stage"] == "uncertain" and len(job["send_receipts"]) == 1
+    assert out["status"] == "sent" and out["acked"] == 1
+    job = _get_job(settings, 701)
+    assert job["stage"] == "done" and job["outcome"] == "sent"
+    assert job["send_count"] == 1
 
 
 async def test_aliases_safe_ack_on_skip(settings):
@@ -759,57 +668,64 @@ async def test_aliases_safe_ack_on_skip(settings):
         raise SourceDeleted("gone")
 
     inst, _, _ = await _responder(settings, source_checker=gone)
-    _append(settings, 701)
-    _append(settings, 701, seq_note="redelivered")  # same MID, second seq -> alias
+    _append(settings, 701)  # Phase 2a: redelivery dedupes (first write wins),
+    # so the same-MID second frame no longer exists; single row, single job.
     out = await inst.tick()
     assert out["status"] == "skipped"
-    job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-    assert job["stage"] == "skipped" and len(job["seq_aliases"]) == 1
-    assert out["acked"] == 2
+    job = _get_job(settings, 701)
+    assert job["stage"] == "skipped"
+    assert out["acked"] == 1
 
 
 # --- C: delivery gate --------------------------------------------------------
 
 
-def test_skip_source_deleted_refuses_evidence_and_terminals(tmp_path):
-    path = tmp_path / "d.json"
-    initialize_delivery_state(
-        path,
-        native_session_id=FAKE_SID,
-        baseline_acked=0,
-        historical_message_ids={},
-        authorized_skips=[],
+def _seed_outbox_job(db, channel_id, mid, seq):
+    append_entry(
+        db,
+        type="message",
+        channel_id=channel_id,
+        message_id=mid,
+        author_uid=7,
+        author_name="O",
+        actor_kind="owner",
+        content=f"m{mid}",
+        author_is_bot=False,
     )
-    enqueue_job(path, channel_id=1, message_id=10, author_uid=7, actor_kind="owner", seq=1)
-    enqueue_job(path, channel_id=1, message_id=11, author_uid=7, actor_kind="owner", seq=2)
-    enqueue_job(path, channel_id=1, message_id=12, author_uid=7, actor_kind="owner", seq=3)
-    # queued zero-evidence: ok + idempotent
-    skip_job(path, 1, 10, reason="source_deleted")
-    skip_job(path, 1, 10, reason="source_deleted")
-    assert get_job(path, 1, 10)["stage"] == "skipped"
-    # evidence refuses
-    mark_turn_submitting(path, 1, 11, job_ref="f" * 32, pre_turn_index=0)
-    record_send_intent(path, 1, 11, send_ref="r", content_len=1, content_hash="b" * 64)
-    with pytest.raises(DeliveryError):
-        skip_job(path, 1, 11, reason="source_deleted")
-    # uncertain refuses
-    mark_turn_submitting(path, 1, 12, job_ref="e" * 32, pre_turn_index=0)
-    mark_uncertain(path, 1, 12, kind="timeout")
-    with pytest.raises(DeliveryError):
-        skip_job(path, 1, 12, reason="source_deleted")
-    # other reasons keep approved behavior
-    enqueue_job(path, channel_id=1, message_id=13, author_uid=7, actor_kind="owner", seq=4)
-    skip_job(path, 1, 13, reason="out_of_scope")
-    assert get_job(path, 1, 13)["skip_reason"] == "out_of_scope"
+    with Store.open(db) as store:
+        store.enqueue_job(channel_id, mid, seq)
+
+
+def test_skip_source_deleted_refuses_evidence_and_terminals(tmp_path):
+    db = tmp_path / "state.db"
+    for mid, seq in ((10, 1), (11, 2), (12, 3), (13, 4)):
+        _seed_outbox_job(db, 1, mid, seq)
+    with Store.open(db) as store:
+        # queued zero-evidence: ok + idempotent
+        store.skip_job(1, 10, reason="source_deleted")
+        store.skip_job(1, 10, reason="source_deleted")
+        assert store.get_job(1, 10)["stage"] == "skipped"
+        # evidence refuses
+        store.mark_submitted(1, 11, job_ref="f" * 32, native_sid=FAKE_SID, pre_turn_index=0)
+        store.record_send(1, 11, job_ref="f" * 32, sent_message_id=9001)
+        with pytest.raises(StoreError):
+            store.skip_job(1, 11, reason="source_deleted")
+        # failed refuses
+        store.mark_submitted(1, 12, job_ref="e" * 32, native_sid=FAKE_SID, pre_turn_index=0)
+        store.mark_failed(1, 12, kind="timeout")
+        with pytest.raises(StoreError):
+            store.skip_job(1, 12, reason="source_deleted")
+        # other reasons keep approved behavior
+        store.skip_job(1, 13, reason="out_of_scope")
+        assert store.get_job(1, 13)["skip_reason"] == "out_of_scope"
 
 
 # --- D: server MCP gate ------------------------------------------------------
 
 
 def _seed_active(settings, mid, ref):
-    append_entry(
-        settings.outbox_path,
-        settings.outbox_state_path,
+    entry = append_entry(
+        settings.db_path,
         type="message",
         channel_id=CHANNEL_ID,
         message_id=mid,
@@ -819,26 +735,18 @@ def _seed_active(settings, mid, ref):
         content=f"m{mid}",
         author_is_bot=False,
     )
-    enqueue_job(
-        settings.delivery_state_path,
-        channel_id=CHANNEL_ID,
-        message_id=mid,
-        author_uid=OWNER_UID,
-        actor_kind="owner",
-        seq=1,
-    )
-    mark_turn_submitting(
-        settings.delivery_state_path, CHANNEL_ID, mid, job_ref=ref, pre_turn_index=3
-    )
+    with Store.open(settings.db_path) as store:
+        store.enqueue_job(CHANNEL_ID, mid, entry["seq"])
+        store.mark_submitted(CHANNEL_ID, mid, job_ref=ref, native_sid=FAKE_SID, pre_turn_index=3)
 
 
 async def test_mcp_gate_skips_deleted_zero_sdk(settings, monkeypatch):
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     ref = "f" * 32
-    _seed_active(settings, 701, ref)
-    channel.source_store["deleted"].add(701)
+    channel.source_store["send_exc"] = _deleted_exc()  # reply reference reports deletion
     async with _parked(monkeypatch, settings, bot) as (mcp, _):
+        _seed_active(settings, 701, ref)
         payload = await _call_json(
             mcp,
             "send_message",
@@ -851,30 +759,23 @@ async def test_mcp_gate_skips_deleted_zero_sdk(settings, monkeypatch):
         )
         assert payload["status"] == "skipped" and payload["reason"] == "source_deleted"
         assert payload["channel_id"] == CHANNEL_ID and payload["source_message_id"] == 701
-        assert channel.sent == [] and channel.source_store["calls"] == [701]
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-        assert job["stage"] == "skipped" and job["send_intents"] == []
+        assert channel.sent == []
+        job = _get_job(settings, 701)
+        assert job["stage"] == "skipped" and job["send_count"] == 0
     recs = [r for r in _audit(settings) if r["tool"] == "send_message" and r["ok"]]
     assert recs and recs[-1]["args"]["source_message_id"] == 701
     blob = json.dumps(recs[-1])
     assert "reply" not in blob and "Unknown Message" not in blob and "Traceback" not in blob
 
 
-async def test_mcp_gate_evidence_holds_uncertain_no_send(settings, monkeypatch):
+async def test_mcp_gate_evidence_fails_no_send(settings, monkeypatch):
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     ref = "f" * 32
-    _seed_active(settings, 701, ref)
-    record_send_intent(
-        settings.delivery_state_path,
-        CHANNEL_ID,
-        701,
-        send_ref="r1",
-        content_len=5,
-        content_hash="a" * 64,
-    )
-    channel.source_store["deleted"].add(701)
+    channel.source_store["send_exc"] = _deleted_exc()
     async with _parked(monkeypatch, settings, bot) as (mcp, _):
+        _seed_active(settings, 701, ref)
+        _record_send(settings, 701, ref, sent_mid=9001)
         with pytest.raises(ToolError):
             await mcp.call_tool(
                 "send_message",
@@ -886,17 +787,19 @@ async def test_mcp_gate_evidence_holds_uncertain_no_send(settings, monkeypatch):
                 },
             )
         assert channel.sent == []
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-        assert job["stage"] == "uncertain" and len(job["send_intents"]) == 1
+        job = _get_job(settings, 701)
+        assert job["stage"] == "failed" and job["send_count"] == 1
 
 
-async def test_mcp_gate_unavailable_no_sdk_no_mutation(settings, monkeypatch):
+async def test_mcp_gate_send_timeout_fails_no_record(settings, monkeypatch):
+    """No pre-flight fetch exists anymore: the SDK send IS the probe, and an
+    ambiguous send failure fails the job (never a blind retry)."""
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     ref = "f" * 32
-    _seed_active(settings, 701, ref)
-    channel.source_store["exc"] = asyncio.TimeoutError()
+    channel.source_store["send_exc"] = asyncio.TimeoutError()
     async with _parked(monkeypatch, settings, bot) as (mcp, _):
+        _seed_active(settings, 701, ref)
         with pytest.raises(ToolError):
             await mcp.call_tool(
                 "send_message",
@@ -908,17 +811,19 @@ async def test_mcp_gate_unavailable_no_sdk_no_mutation(settings, monkeypatch):
                 },
             )
         assert channel.sent == []
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-        assert job["stage"] == "turn_submitting" and job["send_intents"] == []
+        assert channel.source_store["attempts"] == 1
+        job = _get_job(settings, 701)
+        assert job["stage"] == "failed" and job["fail_kind"] == "transport_error"
+        assert job["send_count"] == 0
 
 
 async def test_mcp_gate_repeat_skip_rejected_no_send(settings, monkeypatch):
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     ref = "f" * 32
-    _seed_active(settings, 701, ref)
-    channel.source_store["deleted"].add(701)
+    channel.source_store["send_exc"] = _deleted_exc()
     async with _parked(monkeypatch, settings, bot) as (mcp, _):
+        _seed_active(settings, 701, ref)
         await _call_json(
             mcp,
             "send_message",
@@ -940,100 +845,40 @@ async def test_mcp_gate_repeat_skip_rejected_no_send(settings, monkeypatch):
                 },
             )
         assert channel.sent == []
-        assert get_job(settings.delivery_state_path, CHANNEL_ID, 701)["send_intents"] == []
+        assert _get_job(settings, 701)["send_count"] == 0
 
 
-async def test_mcp_gate_post_intent_404_stays_uncertain(settings, monkeypatch):
+async def test_mcp_gate_stray_success_against_terminal(settings, monkeypatch):
+    """An SDK success that lands after the job terminalized still returns
+    the posted receipt (the send DID happen); the stage guard refuses to
+    record it, and the terminal outcome stands."""
     channel = make_text_channel(CHANNEL_ID)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     ref = "f" * 32
-    _seed_active(settings, 701, ref)
-    channel.source_store["send_exc"] = _deleted_exc()  # SDK fails AFTER intent
     async with _parked(monkeypatch, settings, bot) as (mcp, _):
-        with pytest.raises(ToolError):
-            await mcp.call_tool(
-                "send_message",
-                {
-                    "content": "hi",
-                    "channel_id": CHANNEL_ID,
-                    "source_message_id": 701,
-                    "job_ref": ref,
-                },
-            )
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-        assert job["stage"] == "uncertain"  # never converted to skip
-        assert len(job["send_intents"]) == 1 and job["skip_reason"] is None
+        _seed_active(settings, 701, ref)
 
+        async def send_then_complete(content, **kwargs):
+            msg = await make_text_channel(CHANNEL_ID).send(content, **kwargs)
+            with Store.open(settings.db_path) as store:
+                store.complete_job(CHANNEL_ID, 701, outcome="no_reply")
+            return msg
 
-async def test_mcp_gate_stale_stage_rejects_skip(settings, monkeypatch):
-    channel = make_text_channel(CHANNEL_ID)
-    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    ref = "f" * 32
-    _seed_active(settings, 701, ref)
-    channel.source_store["deleted"].add(701)
-    async with _parked(monkeypatch, settings, bot) as (mcp, _):
-        # concurrent hold landed during the existence read: skip must not fire
-        mark_uncertain(settings.delivery_state_path, CHANNEL_ID, 701, kind="transport_error")
-        with pytest.raises(ToolError):
-            await mcp.call_tool(
-                "send_message",
-                {
-                    "content": "hi",
-                    "channel_id": CHANNEL_ID,
-                    "source_message_id": 701,
-                    "job_ref": ref,
-                },
-            )
-        assert channel.sent == []
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-        assert job["stage"] == "uncertain" and job["skip_reason"] is None
-
-
-async def test_mcp_gate_send_blocked_latch_withholds_skip(settings, monkeypatch):
-    import server.core as server_mod
-
-    channel = make_text_channel(CHANNEL_ID)
-    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    ref = "f" * 32
-    _seed_active(settings, 701, ref)
-    channel.source_store["send_exc"] = RuntimeError("sdk boom")
-    real_get_job = server_mod.get_job
-
-    def flaky_get_job(*a, **k):
-        raise DeliveryError("state fault")
-
-    async with _parked(monkeypatch, settings, bot) as (mcp, _):
-        # SDK failure while the journal read faults: latch set, job untouched.
-        monkeypatch.setattr(server_mod, "get_job", flaky_get_job)
-        with pytest.raises(ToolError):
-            await mcp.call_tool(
-                "send_message",
-                {
-                    "content": "hi",
-                    "channel_id": CHANNEL_ID,
-                    "source_message_id": 701,
-                    "job_ref": ref,
-                },
-            )
-        monkeypatch.setattr(server_mod, "get_job", real_get_job)
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-        assert job["stage"] == "delivering" and len(job["send_intents"]) == 1
-        # latched: even with the source now deleted, no skip and no new send.
-        channel.source_store["deleted"].add(701)
-        channel.source_store["send_exc"] = None
-        with pytest.raises(ToolError):
-            await mcp.call_tool(
-                "send_message",
-                {
-                    "content": "hi",
-                    "channel_id": CHANNEL_ID,
-                    "source_message_id": 701,
-                    "job_ref": ref,
-                },
-            )
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-        assert job["stage"] == "delivering" and len(job["send_intents"]) == 1
-        assert job["skip_reason"] is None and channel.sent == []
+        channel.send = send_then_complete
+        payload = await _call_json(
+            mcp,
+            "send_message",
+            {
+                "content": "hi",
+                "channel_id": CHANNEL_ID,
+                "source_message_id": 701,
+                "job_ref": ref,
+            },
+        )
+        assert payload["source_message_id"] == 701
+        job = _get_job(settings, 701)
+        assert (job["stage"], job["outcome"]) == ("done", "no_reply")
+        assert job["send_count"] == 0  # stage guard refused the late record
 
 
 async def test_tool_description_carries_stop_instruction(settings, monkeypatch):
@@ -1051,12 +896,11 @@ async def test_full_flow_deletion_during_submit_skips_via_gate(settings, monkeyp
     backend.mcp = None
 
     async def submit_delete_then_gate(sid, text):
-        subs = [
-            j for j in list_jobs(settings.delivery_state_path) if j["stage"] == "turn_submitting"
-        ]
+        with Store.open(settings.db_path) as store:
+            subs = store.list_jobs(stages={"submitted"})
         assert len(subs) == 1
         job = subs[0]
-        channel.source_store["deleted"].add(job["message_id"])
+        channel.source_store["send_exc"] = _deleted_exc()
         res = await backend.mcp.call_tool(
             "send_message",
             {
@@ -1069,7 +913,14 @@ async def test_full_flow_deletion_during_submit_skips_via_gate(settings, monkeyp
         blocks = res[0] if isinstance(res, tuple) else res
         payload = json.loads(blocks[0].text)
         assert payload["status"] == "skipped" and payload["reason"] == "source_deleted"
-        return {"cancelled": False, "completed": True, "native_id_match": True}
+        return {
+            "cancelled": False,
+            "completed": True,
+            "native_id_match": True,
+            "turn_index": 4,
+            "running": False,
+            "stored_text_match": True,
+        }
 
     backend.submit_fn = submit_delete_then_gate
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
@@ -1085,178 +936,12 @@ async def test_full_flow_deletion_during_submit_skips_via_gate(settings, monkeyp
         # POST deletes+skips via the real MCP gate, reconcile observes skip.
         outcome = await ctx["responder"].tick()
         assert outcome["status"] == "skipped" and outcome["reason"] == "source_deleted"
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-        assert job["stage"] == "skipped" and job["turn_index"] is None
-        assert job["send_intents"] == [] and job["send_receipts"] == []
+        job = _get_job(settings, 701)
+        assert job["stage"] == "skipped" and job["skip_reason"] == "source_deleted"
+        assert job["send_count"] == 0
         assert channel.sent == [] and len(backend.submit_calls) == 1
         outcome2 = await ctx["responder"].tick()
         assert len(backend.submit_calls) == 1 and outcome2["status"] == "idle"
-
-
-async def test_source_present_guard_fences_latched_race_no_second_intent(settings, monkeypatch):
-    """Fresh-guard positive branch: A parks in the source-present GET while B
-    records the one intent, fails the SDK, and faults the hold write (job
-    stays delivering, latch set). After faults restore and A resumes PRESENT,
-    A must reject before a second intent/SDK: exactly 1 attempt, 1 intent,
-    evidence preserved, no completion. Real FastMCP + real delivery + real
-    Responder correlation; no live I/O."""
-    import server.core as server_mod
-
-    channel = make_text_channel(CHANNEL_ID)
-    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    ref = "f" * 32
-    _seed_active(settings, 701, ref)
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    calls = {"n": 0}
-    orig_fetch = channel.fetch_message
-
-    async def gated_fetch(mid):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            entered.set()
-            await release.wait()
-        return await orig_fetch(mid)
-
-    channel.fetch_message = gated_fetch
-    channel.source_store["send_exc"] = RuntimeError("sdk boom")
-    real_mark_uncertain = server_mod.mark_uncertain
-
-    def flaky_mark_uncertain(*a, **k):
-        raise DeliveryError("hold write fault")
-
-    call_args = {
-        "content": "hi",
-        "channel_id": CHANNEL_ID,
-        "source_message_id": 701,
-        "job_ref": ref,
-    }
-    async with _parked(monkeypatch, settings, bot) as (mcp, _):
-        task_a = asyncio.create_task(mcp.call_tool("send_message", dict(call_args)))
-        try:
-            await asyncio.wait_for(entered.wait(), timeout=5)
-            monkeypatch.setattr(server_mod, "mark_uncertain", flaky_mark_uncertain)
-            with pytest.raises(ToolError):
-                await mcp.call_tool("send_message", dict(call_args))
-            assert channel.source_store["attempts"] == 1
-            job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-            assert job["stage"] == "delivering" and len(job["send_intents"]) == 1
-        finally:
-            # Restore BEFORE teardown/release so A resumes against the
-            # real guard; always release so the task can never dangle.
-            monkeypatch.setattr(server_mod, "mark_uncertain", real_mark_uncertain)
-            channel.source_store["send_exc"] = None
-            release.set()
-        with pytest.raises(ToolError):
-            await asyncio.wait_for(task_a, timeout=5)
-        assert channel.source_store["attempts"] == 1
-        assert channel.sent == []
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-        assert job["stage"] == "delivering" and len(job["send_intents"]) == 1
-        assert job["skip_reason"] is None and job["stage"] != "completed"
-
-
-async def test_source_present_guard_rejects_stale_nonce_zero_send(settings, monkeypatch):
-    """Nonce rotation during the source-present GET (supported caller flow:
-    requeue_definitive_busy + mark_turn_submitting with a new ref) must make
-    the old call fresh-correlation-reject with 0 intent/SDK."""
-    channel = make_text_channel(CHANNEL_ID)
-    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    old_ref = "f" * 32
-    _seed_active(settings, 701, old_ref)
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    orig_fetch = channel.fetch_message
-    gated = {"on": True}
-
-    async def gated_fetch(mid):
-        if gated["on"]:
-            gated["on"] = False
-            entered.set()
-            await release.wait()
-        return await orig_fetch(mid)
-
-    channel.fetch_message = gated_fetch
-    call_args = {
-        "content": "hi",
-        "channel_id": CHANNEL_ID,
-        "source_message_id": 701,
-        "job_ref": old_ref,
-    }
-    async with _parked(monkeypatch, settings, bot) as (mcp, _):
-        task_a = asyncio.create_task(mcp.call_tool("send_message", dict(call_args)))
-        try:
-            await asyncio.wait_for(entered.wait(), timeout=5)
-            requeue_definitive_busy(settings.delivery_state_path, CHANNEL_ID, 701, http_status=409)
-            new_ref = "e" * 32
-            mark_turn_submitting(
-                settings.delivery_state_path,
-                CHANNEL_ID,
-                701,
-                job_ref=new_ref,
-                pre_turn_index=3,
-            )
-        finally:
-            release.set()
-        with pytest.raises(ToolError):
-            await asyncio.wait_for(task_a, timeout=5)
-        assert channel.source_store["attempts"] == 0 and channel.sent == []
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, 701)
-        assert job["job_ref"] == new_ref and job["stage"] == "turn_submitting"
-        assert job["send_intents"] == []
-
-
-def test_corrupt_source_deleted_skip_with_evidence_fails_load_no_ack(tmp_path):
-    """Valid-JSON contradictory tombstone (skipped/source_deleted + send
-    evidence) must fail load AND safe-prefix computation before any ACK, while
-    the identical legacy out_of_scope skip keeps loading/ACKing as before and
-    a zero-evidence source_deleted skip still loads/ACKs."""
-    path = tmp_path / "d.json"
-    initialize_delivery_state(
-        path,
-        native_session_id=FAKE_SID,
-        baseline_acked=0,
-        historical_message_ids={},
-        authorized_skips=[],
-    )
-    enqueue_job(path, channel_id=1, message_id=10, author_uid=7, actor_kind="owner", seq=1)
-    mark_turn_submitting(path, 1, 10, job_ref="f" * 32, pre_turn_index=0)
-    record_send_intent(path, 1, 10, send_ref="r", content_len=1, content_hash="b" * 64)
-    record_send_receipt(
-        path,
-        1,
-        10,
-        send_ref="r",
-        sent_message_id=9001,
-        delivered_channel_id=1,
-        jump_url="https://discord.com/channels/9/1/9001",
-        reply_to_message_id=10,
-    )
-    skip_job(path, 1, 10, reason="out_of_scope")  # legacy + evidence: supported
-    entries = [{"channel_id": 1, "message_id": 10, "seq": 1}]
-    assert load_delivery_state(path)["jobs"]["1:10"]["skip_reason"] == "out_of_scope"
-    assert processed_seq_prefix(path, entries, 0) == 1  # positive control
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    raw["jobs"]["1:10"]["skip_reason"] = "source_deleted"  # ONLY field flipped
-    bad = tmp_path / "bad.json"
-    bad.write_text(json.dumps(raw), encoding="utf-8")
-    with pytest.raises(DeliveryError):
-        load_delivery_state(bad)
-    with pytest.raises(DeliveryError):
-        processed_seq_prefix(bad, entries, 0)
-    # Zero-evidence source_deleted still loads and ACKs (no over-rejection).
-    clean = tmp_path / "clean.json"
-    initialize_delivery_state(
-        clean,
-        native_session_id=FAKE_SID,
-        baseline_acked=0,
-        historical_message_ids={},
-        authorized_skips=[],
-    )
-    enqueue_job(clean, channel_id=1, message_id=11, author_uid=7, actor_kind="owner", seq=1)
-    skip_job(clean, 1, 11, reason="source_deleted")
-    assert load_delivery_state(clean)["jobs"]["1:11"]["skip_reason"] == "source_deleted"
-    assert processed_seq_prefix(clean, [{"channel_id": 1, "message_id": 11, "seq": 1}], 0) == 1
 
 
 async def test_manual_sends_unchanged(settings, monkeypatch):

@@ -2,10 +2,14 @@
 
 Drives the REAL installed lifespan (patched only to inject a fake Discord
 bot and fake Jev deps into the otherwise-REAL Responder) via the native
-FastMCP ``list_tools``/``call_tool`` API. Delivery is REAL (tmp files);
-seeded mid-flight jobs carry synthetic submitted fingerprints (never None)
-per the positive-proof requirement. No network, no real .env, no paid
-calls, no prod writes.
+FastMCP ``list_tools``/``call_tool`` API. The store is REAL (tmp files);
+seeded mid-flight jobs are submitted with a real job_ref. No network, no
+real .env, no paid calls, no prod writes.
+
+Seeds land INSIDE the running lifespan: the Responder constructor runs
+the restart sweep once (submitted -> failed), so a pre-seeded submitted
+job would be swept before any tool runs -- exactly as in production,
+where jobs become submitted while the server runs.
 
 Channel history is a SEMANTIC fake: it honors ``before``/``after``/
 ``limit``/``oldest_first`` exactly like the verified native behavior
@@ -13,6 +17,14 @@ Channel history is a SEMANTIC fake: it honors ``before``/``after``/
 ``oldest_first=True`` pages forward from ``after``/start, ignoring
 ``before``). A regression test proves ``read_context`` returns
 source-adjacent recents, never oldest-ever rows.
+
+Deleted (reasons): the ``resolve_uncertain_drop`` x3 suite (tool removed:
+restart auto-fails submitted jobs), ``validates_each_message`` (typed-SDK
+revalidation deleted), one post-await-race test plus the latched-job
+test (no latches, no two-phase race; the surviving post-await-race test
+proves a racing delete correlation-rejects), the respond-binding refusal
+(record_no_reply guards are stage-based now), and the journaled-
+declaration suites (record_no_reply is terminal at tool time).
 """
 
 from __future__ import annotations
@@ -28,19 +40,10 @@ import discord
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
-import delivery
 from config import Settings
-from delivery import (
-    enqueue_job,
-    get_job,
-    initialize_delivery_state,
-    mark_turn_submitting,
-    mark_uncertain,
-    record_send_intent,
-)
-from outbox import append_entry
 from responder import Responder
 from server import create_server
+from store import Store, append_entry
 
 BOT_UID = 111
 OWNER_UID = 222
@@ -49,6 +52,7 @@ GUILD_ID = 333
 CHANNEL_ID = 444
 OTHER_CHANNEL = 445
 FAKE_SID = "2026-01-02T03-04-05_ab12"
+FAKE_DAY = "2026-01-02"
 SOURCE_MID = 700000000000000007
 
 OLD_TOOLS = [
@@ -108,13 +112,7 @@ class _FakeMessage:
 
 
 class _SemanticHistory:
-    """Parameter-honoring history iterator (verified native semantics).
-
-    ``oldest_first=False`` (default): rows with ``after < id < before``,
-    newest-first, up to ``limit``. ``oldest_first=True``: rows with
-    ``id > after`` (default start 0, ``before`` ignored), oldest-first, up
-    to ``limit`` -- exactly the native footgun the collector fix addresses.
-    """
+    """Parameter-honoring history iterator (verified native semantics)."""
 
     def __init__(self, store, *, limit, before, after, oldest_first):
         self._rows = sorted(store, key=lambda m: m.id)
@@ -122,28 +120,19 @@ class _SemanticHistory:
         self._before = before
         self._after = after
         self._oldest_first = oldest_first
-        self.calls: list = []
 
     def _bound_id(self, bound):
-        if bound is None:
-            return None
-        mid = getattr(bound, "id", None)
-        if not isinstance(mid, int) or isinstance(mid, bool):
-            raise TypeError("history bound must carry an int id")
-        return mid
+        return bound.id if isinstance(bound, discord.Object) else bound
 
     async def _collect(self):
-        before_id = self._bound_id(self._before)
-        after_id = self._bound_id(self._after)
+        rows = self._rows
         if self._oldest_first:
-            floor = after_id if after_id is not None else 0
-            picked = [m for m in self._rows if m.id > floor][: self._limit]
-            return picked
-        ceil = before_id if before_id is not None else (1 << 63)
-        floor = after_id if after_id is not None else 0
-        picked = [m for m in self._rows if floor < m.id < ceil]
-        picked.reverse()
-        return picked[: self._limit]
+            low = self._bound_id(self._after) if self._after is not None else 0
+            return [m for m in rows if m.id > low][: self._limit]
+        high = self._bound_id(self._before) if self._before is not None else None
+        low = self._bound_id(self._after) if self._after is not None else 0
+        picked = [m for m in rows if m.id > low and (high is None or m.id < high)]
+        return list(reversed(picked[-self._limit :])) if picked else []
 
     def __aiter__(self):
         return self._iterate()
@@ -238,24 +227,29 @@ class _FakeBot:
         self.listeners: dict = {}
         self._ready = False
         self._closed = False
+        self._setup = False  # mirrors Client._ready existing after _async_setup_hook
+        # Mirrors the gateway READY dispatch: set only by a successful start.
+        self._ready_event = asyncio.Event()
         self._close_event = asyncio.Event()
 
-    def add_listener(self, func, name):
-        self.listeners.setdefault(name, []).append(func)
+    def event(self, func):
+        self.listeners.setdefault(func.__name__, []).append(func)
+        return func
 
-    def remove_listener(self, func, name):
-        try:
-            self.listeners.get(name, []).remove(func)
-        except ValueError:
-            pass
-
-    async def login(self, token):
-        pass
-
-    async def connect(self):
+    async def start(self, token):  # noqa: ARG002 - signature mirrors discord.py
+        self._setup = True  # mirrors _async_setup_hook at login() entry
+        # Successful gateway connect dispatches READY, then stays open.
+        self._ready_event.set()
         await self._close_event.wait()
 
     async def wait_until_ready(self):
+        if not self._setup:
+            # Mirrors the real Client: raises before login() creates _ready.
+            raise RuntimeError(
+                "Client has not been properly initialised. "
+                "Please use the login method before calling this method"
+            )
+        await self._ready_event.wait()
         self._ready = True
 
     def is_ready(self):
@@ -292,18 +286,7 @@ async def _stub_collector(entry):
     raise AssertionError("MCP tool tests never collect")
 
 
-# Fixed synthetic activation identity for the injected fake ledger: every
-# Responder in this module binds the same marker, so restart-style second
-# constructions rebind idempotently (never conflict, never rewrite).
-# Fake injected fixture only, never a production bypass.
-_STUB_LEDGER_ID = "1e" * 16
-
-
 class _StubLedger:
-    @property
-    def ledger_id(self) -> str:
-        return _STUB_LEDGER_ID
-
     async def classify(self, *args, **kwargs):
         raise AssertionError("MCP tool tests never classify")
 
@@ -318,9 +301,6 @@ class _StubNative:
     async def get_bot_dm(self, *args, **kwargs):
         raise AssertionError("MCP tool tests never resolve the DM")
 
-    async def get_trace_evidence(self, *args, **kwargs):
-        raise AssertionError("MCP tool tests never trace")
-
 
 # --- harness --------------------------------------------------------------------
 
@@ -333,10 +313,8 @@ def _settings_kwargs(tmp_path):
         guild_id=GUILD_ID,
         default_channel_id=CHANNEL_ID,
         audit_path=tmp_path / "audit.jsonl",
-        outbox_path=tmp_path / "outbox.jsonl",
-        outbox_state_path=tmp_path / "outbox_state.json",
+        db_path=tmp_path / "state.db",
         watch_channel_ids=[CHANNEL_ID],
-        delivery_state_path=tmp_path / "delivery.json",
         responder_check_seconds=0.05,
         thyca_request_timeout_seconds=5.0,
         recovery_poll_seconds=30.0,
@@ -346,13 +324,8 @@ def _settings_kwargs(tmp_path):
 @pytest.fixture
 def settings(tmp_path):
     settings = Settings(**_settings_kwargs(tmp_path))
-    initialize_delivery_state(
-        settings.delivery_state_path,
-        native_session_id=FAKE_SID,
-        baseline_acked=0,
-        historical_message_ids={},
-        authorized_skips=[],
-    )
+    with Store.open(settings.db_path) as store:
+        store.adopt_session(expected_current=None, new_sid=FAKE_SID, day=FAKE_DAY)
     return settings
 
 
@@ -404,15 +377,15 @@ def _audit_records(settings, tool):
     return out
 
 
-def _seed_need_context(settings, mid=SOURCE_MID, seq=1, job_ref="job-need-1"):
-    """Queued job + Jev need_context bind + turn_submitting WITH synthetic fp.
+def _job(settings, mid=SOURCE_MID):
+    with Store.open(settings.db_path) as store:
+        return store.get_job(CHANNEL_ID, mid)
 
-    The submitted fingerprint is synthetic but well-formed (64-hex + len);
-    None is never used (positive proof is never weakened for fixtures).
-    """
-    append_entry(
-        settings.outbox_path,
-        settings.outbox_state_path,
+
+def _seed_submitted(settings, mid=SOURCE_MID, job_ref="job-need-1"):
+    """Outbox row + queued job + submit marker (the correlated mid-flight job)."""
+    entry = append_entry(
+        settings.db_path,
         type="message",
         channel_id=CHANNEL_ID,
         message_id=mid,
@@ -422,57 +395,35 @@ def _seed_need_context(settings, mid=SOURCE_MID, seq=1, job_ref="job-need-1"):
         content=f"m{mid}",
         author_is_bot=False,
     )
-    enqueue_job(
-        settings.delivery_state_path,
-        channel_id=CHANNEL_ID,
-        message_id=mid,
-        author_uid=OWNER_UID,
-        actor_kind="owner",
-        seq=seq,
-    )
-    delivery.bind_jev_decision(
-        settings.delivery_state_path,
-        CHANNEL_ID,
-        mid,
-        context_sha256=_sha(f"ctx-{mid}"),
-        attempt_id=_sha(f"att-{mid}")[:32],
-        model="jev-1.13.0",
-        participation="need_context",
-    )
-    mark_turn_submitting(
-        settings.delivery_state_path,
-        CHANNEL_ID,
-        mid,
-        job_ref=job_ref,
-        pre_turn_index=0,
-        submitted_text_sha256=_sha(f"post-{mid}"),
-        submitted_text_len=100,
-    )
+    with Store.open(settings.db_path) as store:
+        store.enqueue_job(CHANNEL_ID, mid, entry["seq"])
+        store.mark_submitted(
+            CHANNEL_ID, mid, job_ref=job_ref, native_sid=FAKE_SID, pre_turn_index=0
+        )
     return job_ref
 
 
 # --- tool surface -----------------------------------------------------------------
 
 
-async def test_tool_count_15_old_12_unchanged(settings):
+async def test_tool_count_14_old_12_unchanged(settings):
     mcp = create_server(settings)
     tools = await mcp.list_tools()
     names = sorted(t.name for t in tools)
-    assert len(names) == 15
+    assert len(names) == 14
     for old in OLD_TOOLS:
         assert old in names
     assert "read_context" in names and "record_no_reply" in names
-    assert "resolve_uncertain_drop" in names
+    assert "resolve_uncertain_drop" not in names
     descs = {t.name: t.description or "" for t in tools}
     # Old tool contracts intact (identity policy + correlation wording).
     assert str(OWNER_UID) in descs["send_message"]
     assert "author_uid" in descs["whoami"]
     assert "USER.md" in descs["read_outbox"]
-    # New tools carry their contracts.
+    # record_no_reply is terminal at tool time now (never the old journaling).
     assert "no_reply_needed" in descs["record_no_reply"]
-    assert "NEVER terminal" in descs["record_no_reply"]
-    assert "zero send evidence" in descs["resolve_uncertain_drop"]
-    assert "operator_approved_drop" in descs["resolve_uncertain_drop"]
+    assert "Terminal" in descs["record_no_reply"]
+    assert "TOOL TIME" in descs["record_no_reply"]
     assert "1..20" in descs["read_context"]
     assert "never auto-forwarded" in descs["read_context"]
 
@@ -486,29 +437,141 @@ async def test_manual_send_unchanged(settings, monkeypatch):
     assert payload["channel_id"] == CHANNEL_ID
     assert payload["message_id"] == 9000
     assert channel.store["sent"][0][0] == "plain manual"
-    assert channel.store["sent"][0][1] == {}  # no reply reference on manual sends
+    # Manual sends carry no reply reference but DO carry the mention guard.
+    assert channel.store["sent"][0][1].get("reference") is None
+    assert channel.store["sent"][0][1]["allowed_mentions"].to_dict() == {
+        "replied_user": True,
+        "parse": ["users"],
+    }
+
+
+# --- correlated send ----------------------------------------------------------------
+
+
+async def test_correlated_send_records_send(settings, monkeypatch):
+    channel = _make_channel(CHANNEL_ID)
+    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
+    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
+        payload = await _call_json(
+            mcp,
+            "send_message",
+            {"content": "chunk one", "source_message_id": SOURCE_MID, "job_ref": ref},
+        )
+        assert payload["source_message_id"] == SOURCE_MID
+        assert payload["reply_to_message_id"] == SOURCE_MID
+        assert payload["message_id"] == 9000
+        # Assert inside the lifespan: orderly shutdown fails in-flight sent.
+        job = _job(settings)
+        assert job["stage"] == "sent"
+        assert job["send_count"] == 1
+        assert job["sent_message_ids"] == [9000]
+    sent_content, sent_kwargs = channel.store["sent"][0]
+    assert sent_content == "chunk one"
+    assert sent_kwargs["reference"].message_id == SOURCE_MID
+    assert sent_kwargs["reference"].fail_if_not_exists is True
+
+
+async def test_correlated_send_deleted_source_skips_zero_sends(settings, monkeypatch):
+    channel = _make_channel(CHANNEL_ID)
+
+    async def boom_send(content, **kwargs):
+        raise _deleted_exc()
+
+    channel.send = boom_send
+    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
+    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
+        payload = await _call_json(
+            mcp,
+            "send_message",
+            {"content": "chunk", "source_message_id": SOURCE_MID, "job_ref": ref},
+        )
+    assert payload == {
+        "status": "skipped",
+        "reason": "source_deleted",
+        "channel_id": CHANNEL_ID,
+        "source_message_id": SOURCE_MID,
+    }
+    job = _job(settings)
+    assert job["stage"] == "skipped"
+    assert job["skip_reason"] == "source_deleted"
+
+
+async def test_correlated_send_deleted_source_with_sends_fails(settings, monkeypatch):
+    """A reply WAS delivered: never skip over send evidence -- fail instead."""
+    channel = _make_channel(CHANNEL_ID)
+
+    async def boom_send(content, **kwargs):
+        raise _deleted_exc()
+
+    channel.send = boom_send
+    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
+    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
+        with Store.open(settings.db_path) as store:
+            store.record_send(CHANNEL_ID, SOURCE_MID, job_ref=ref, sent_message_id=9000)
+        with pytest.raises(ToolError):
+            await _call_json(
+                mcp,
+                "send_message",
+                {"content": "chunk two", "source_message_id": SOURCE_MID, "job_ref": ref},
+            )
+    job = _job(settings)
+    assert job["stage"] == "failed"
+    assert job["send_count"] == 1
+
+
+async def test_correlated_send_ambiguous_fails_no_duplicate(settings, monkeypatch):
+    channel = _make_channel(CHANNEL_ID)
+    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
+    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
+
+        async def boom_send(content, **kwargs):
+            raise discord.HTTPException(
+                SimpleNamespace(status=500, reason="x"), {"message": "boom"}
+            )
+
+        channel.send = boom_send
+        # Ambiguous SDK failure: the job fails, never a blind retry/resend.
+        with pytest.raises(ToolError):
+            await _call_json(
+                mcp,
+                "send_message",
+                {"content": "chunk", "source_message_id": SOURCE_MID, "job_ref": ref},
+            )
+        # Retry correlation-rejects against the failed stage (no duplicate).
+        with pytest.raises(ToolError):
+            await _call_json(
+                mcp,
+                "send_message",
+                {"content": "chunk", "source_message_id": SOURCE_MID, "job_ref": ref},
+            )
+    job = _job(settings)
+    assert job["stage"] == "failed"
+    assert job["fail_kind"] == "transport_error"
+    assert job["send_count"] == 0
+    assert channel.store["sent"] == []
 
 
 # --- record_no_reply ----------------------------------------------------------------
 
 
-async def test_record_no_reply_declared_not_terminal_no_ack(settings, monkeypatch):
-    ref = _seed_need_context(settings)
+async def test_record_no_reply_terminal_at_tool_time(settings, monkeypatch):
     bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
         payload = await _call_json(
             mcp,
             "record_no_reply",
             {"source_message_id": SOURCE_MID, "job_ref": ref, "reason": "no_reply_needed"},
         )
-        # Assert inside the lifespan: orderly shutdown marks in-flight uncertain.
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID)
-        assert job["stage"] == "turn_submitting"  # NEVER terminal at tool time
-        assert job["no_reply_declaration"]["reason"] == "no_reply_needed"
-        assert job["no_reply_declaration"]["job_ref"] == ref
-        assert job["send_intents"] == [] and job["send_receipts"] == []
+        # Terminal INSIDE the lifespan: the worker must not re-POST/re-send.
+        job = _job(settings)
+        assert (job["stage"], job["outcome"]) == ("done", "no_reply")
     assert payload == {
-        "status": "declared",
+        "status": "no_reply",
         "channel_id": CHANNEL_ID,
         "source_message_id": SOURCE_MID,
         "job_ref": ref,
@@ -516,42 +579,31 @@ async def test_record_no_reply_declared_not_terminal_no_ack(settings, monkeypatc
     }
 
 
-async def test_record_no_reply_idempotent_same_reason(settings, monkeypatch):
-    ref = _seed_need_context(settings)
+async def test_record_no_reply_repeat_rejected_terminal(settings, monkeypatch):
+    """Once terminal, repeat (or mismatched-reason) calls correlation-reject."""
     bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
         first = await _call_json(
-            mcp,
-            "record_no_reply",
-            {"source_message_id": SOURCE_MID, "job_ref": ref, "reason": "missing_context"},
-        )
-        second = await _call_json(
-            mcp,
-            "record_no_reply",
-            {"source_message_id": SOURCE_MID, "job_ref": ref, "reason": "missing_context"},
-        )
-    assert first["status"] == second["status"] == "declared"
-    job = get_job(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID)
-    assert job["no_reply_declaration"]["reason"] == "missing_context"
-
-
-async def test_record_no_reply_rejects_mismatched_reason(settings, monkeypatch):
-    ref = _seed_need_context(settings)
-    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
-    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
-        await _call_json(
             mcp,
             "record_no_reply",
             {"source_message_id": SOURCE_MID, "job_ref": ref, "reason": "no_reply_needed"},
         )
+        assert first["status"] == "no_reply"
+        with pytest.raises(ToolError):
+            await _call_json(
+                mcp,
+                "record_no_reply",
+                {"source_message_id": SOURCE_MID, "job_ref": ref, "reason": "no_reply_needed"},
+            )
         with pytest.raises(ToolError):
             await _call_json(
                 mcp,
                 "record_no_reply",
                 {"source_message_id": SOURCE_MID, "job_ref": ref, "reason": "missing_context"},
             )
-    job = get_job(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID)
-    assert job["no_reply_declaration"]["reason"] == "no_reply_needed"  # first wins
+    job = _job(settings)
+    assert (job["stage"], job["outcome"]) == ("done", "no_reply")
 
 
 @pytest.mark.parametrize(
@@ -571,20 +623,20 @@ async def test_record_no_reply_rejects_mismatched_reason(settings, monkeypatch):
     ],
 )
 async def test_record_no_reply_rejects_bad_correlation(settings, monkeypatch, args):
-    _seed_need_context(settings)
     bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        _seed_submitted(settings)
         with pytest.raises(ToolError):
             await _call_json(mcp, "record_no_reply", args)
-    job = get_job(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID)
-    assert job.get("no_reply_declaration") is None  # zero mutation on reject
+        job = _job(settings)
+        assert job["stage"] == "submitted"  # zero mutation on reject
 
 
 async def test_record_no_reply_invalid_reason_canary_not_audited(settings, monkeypatch):
-    ref = _seed_need_context(settings)
     canary = "CANARY-PRIVATE-REASON-xyz"
     bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
         with pytest.raises(ToolError):
             await _call_json(
                 mcp,
@@ -593,176 +645,100 @@ async def test_record_no_reply_invalid_reason_canary_not_audited(settings, monke
             )
     assert canary not in _audit_text(settings)
     failures = [r for r in _audit_records(settings, "record_no_reply") if not r["ok"]]
-    assert failures and failures[0]["args"].get("reason_len") == len(canary)
+    assert failures and failures[0]["args"] == {
+        "channel_id": CHANNEL_ID,
+        "source_message_id": SOURCE_MID,
+        "error_kind": "validation_error",
+    }  # literal F2: no reason_len/sha fingerprints
 
 
 async def test_record_no_reply_rejects_send_evidence(settings, monkeypatch):
-    ref = _seed_need_context(settings)
-    record_send_intent(
-        settings.delivery_state_path,
-        CHANNEL_ID,
-        SOURCE_MID,
-        send_ref="s1",
-        content_len=2,
-        content_hash=_sha("hi"),
-    )
     bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
+        with Store.open(settings.db_path) as store:
+            store.record_send(CHANNEL_ID, SOURCE_MID, job_ref=ref, sent_message_id=9000)
         with pytest.raises(ToolError):
             await _call_json(
                 mcp,
                 "record_no_reply",
                 {"source_message_id": SOURCE_MID, "job_ref": ref, "reason": "no_reply_needed"},
             )
-    assert (
-        get_job(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID).get("no_reply_declaration")
-        is None
-    )
+        job = _job(settings)
+        assert job["stage"] == "sent"  # the send stands; no declaration
+        assert job["send_count"] == 1
 
 
-async def test_record_no_reply_rejects_respond_binding(settings, monkeypatch):
-    """Delivery enforces bound-need_context: a respond job cannot declare."""
-    append_entry(
-        settings.outbox_path,
-        settings.outbox_state_path,
-        type="message",
-        channel_id=CHANNEL_ID,
-        message_id=SOURCE_MID,
-        author_uid=OWNER_UID,
-        author_name="Owner",
-        actor_kind="owner",
-        content="m",
-        author_is_bot=False,
-    )
-    enqueue_job(
-        settings.delivery_state_path,
-        channel_id=CHANNEL_ID,
-        message_id=SOURCE_MID,
-        author_uid=OWNER_UID,
-        actor_kind="owner",
-        seq=1,
-    )
-    delivery.bind_jev_decision(
-        settings.delivery_state_path,
-        CHANNEL_ID,
-        SOURCE_MID,
-        context_sha256=_sha("ctx"),
-        attempt_id=_sha("att")[:32],
-        model="jev-1.13.0",
-        participation="respond",
-    )
-    mark_turn_submitting(
-        settings.delivery_state_path,
-        CHANNEL_ID,
-        SOURCE_MID,
-        job_ref="job-r",
-        pre_turn_index=0,
-        submitted_text_sha256=_sha("p"),
-        submitted_text_len=10,
-    )
+async def test_record_no_reply_accepts_any_routed_job(settings, monkeypatch):
+    """Guards are stage-based (mid-flight + zero sends), not binding-based."""
     bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
-        with pytest.raises(ToolError):
-            await _call_json(
-                mcp,
-                "record_no_reply",
-                {"source_message_id": SOURCE_MID, "job_ref": "job-r", "reason": "no_reply_needed"},
-            )
+        ref = _seed_submitted(settings)
+        payload = await _call_json(
+            mcp,
+            "record_no_reply",
+            {"source_message_id": SOURCE_MID, "job_ref": ref, "reason": "no_reply_needed"},
+        )
+    assert payload["status"] == "no_reply"
+    assert _job(settings)["outcome"] == "no_reply"
 
 
 async def test_record_no_reply_source_deleted_skips(settings, monkeypatch):
-    ref = _seed_need_context(settings)
     channel = _make_channel(CHANNEL_ID)
     channel.store["deleted"].add(SOURCE_MID)
     bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
         payload = await _call_json(
             mcp,
             "record_no_reply",
             {"source_message_id": SOURCE_MID, "job_ref": ref, "reason": "no_reply_needed"},
         )
     assert payload["status"] == "skipped" and payload["reason"] == "source_deleted"
-    job = get_job(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID)
+    job = _job(settings)
     assert job["stage"] == "skipped" and job["skip_reason"] == "source_deleted"
-    assert job.get("no_reply_declaration") is None
 
 
 async def test_record_no_reply_source_unavailable_no_mutation(settings, monkeypatch):
-    ref = _seed_need_context(settings)
     channel = _make_channel(CHANNEL_ID)
     channel.store["exc"] = discord.Forbidden(
         SimpleNamespace(status=403, reason="Forbidden"), {"code": 50013, "message": "x"}
     )
     bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
         with pytest.raises(ToolError):
             await _call_json(
                 mcp,
                 "record_no_reply",
                 {"source_message_id": SOURCE_MID, "job_ref": ref, "reason": "no_reply_needed"},
             )
-        # Assert inside the lifespan: shutdown marks in-flight uncertain.
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID)
-        assert job["stage"] == "turn_submitting"
-        assert job.get("no_reply_declaration") is None
+        # Assert inside the lifespan: the job is untouched (still submitted).
+        job = _job(settings)
+        assert job["stage"] == "submitted"
 
 
 async def test_record_no_reply_post_await_race_rejected(settings, monkeypatch):
     """A terminal landing during the source await fails the post-await guard."""
 
-    ref = _seed_need_context(settings)
     channel = _make_channel(CHANNEL_ID)
 
     async def race(mid):
-        mark_uncertain(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID, kind="timeout")
+        with Store.open(settings.db_path) as store:
+            store.complete_job(CHANNEL_ID, SOURCE_MID, outcome="no_reply")
 
     channel.store["fetch_hook"] = race
     bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
         with pytest.raises(ToolError):
             await _call_json(
                 mcp,
                 "record_no_reply",
                 {"source_message_id": SOURCE_MID, "job_ref": ref, "reason": "no_reply_needed"},
             )
-    job = get_job(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID)
-    assert job["stage"] == "uncertain"
-    assert job.get("no_reply_declaration") is None
-
-
-async def test_record_no_reply_latched_job_rejected(settings, monkeypatch):
-    """A prior ambiguous send hold fences later declarations for the lifetime."""
-    _seed_need_context(settings, job_ref="job-latch")
-    channel = _make_channel(CHANNEL_ID)
-    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
-        # Ambiguous send hold: force the intent write to fail uncertain by
-        # racing a terminal between correlation and intent is complex here;
-        # instead drive the real latch via a failing receipt path is also
-        # complex. Direct approach: poison then send once to latch via SDK
-        # failure, which _preserve_uncertain always latches.
-        async def boom_send(content, **kwargs):
-            raise discord.HTTPException(
-                SimpleNamespace(status=500, reason="x"), {"message": "boom"}
-            )
-
-        channel.send = boom_send
-        with pytest.raises(ToolError):
-            await _call_json(
-                mcp,
-                "send_message",
-                {"content": "chunk", "source_message_id": SOURCE_MID, "job_ref": "job-latch"},
-            )
-        with pytest.raises(ToolError):
-            await _call_json(
-                mcp,
-                "record_no_reply",
-                {
-                    "source_message_id": SOURCE_MID,
-                    "job_ref": "job-latch",
-                    "reason": "no_reply_needed",
-                },
-            )
+    job = _job(settings)
+    assert (job["stage"], job["outcome"]) == ("done", "no_reply")
 
 
 # --- read_context -------------------------------------------------------------------
@@ -788,11 +764,11 @@ def _history_store(base_mid, count, author_uid=OTHER_UID, name="Ramon"):
 
 async def test_read_context_returns_source_adjacent_recents(settings, monkeypatch):
     """Semantic regression: newest-before-source, never oldest-ever rows."""
-    ref = _seed_need_context(settings)
     store = _history_store(SOURCE_MID, 100)
     channel = _make_channel(CHANNEL_ID, history=store)
     bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
         payload = await _call_json(
             mcp,
             "read_context",
@@ -809,16 +785,20 @@ async def test_read_context_returns_source_adjacent_recents(settings, monkeypatc
     # Bodies are served to the agent but never touch the audit log.
     assert f"history body {SOURCE_MID - 5}" not in _audit_text(settings)
     records = [r for r in _audit_records(settings, "read_context") if r["ok"]]
-    assert records and records[0]["args"]["returned_count"] == 5
-    assert records[0]["args"]["message_ids"] == got
+    # Phase 4/F2 allowlist: success audits carry channel_id +
+    # source_message_id only -- counts/ids stay in the tool payload.
+    assert records and records[0]["args"] == {
+        "channel_id": CHANNEL_ID,
+        "source_message_id": SOURCE_MID,
+    }
 
 
 async def test_read_context_paginates_backwards_never_future(settings, monkeypatch):
-    ref = _seed_need_context(settings)
     store = _history_store(SOURCE_MID, 40)
     channel = _make_channel(CHANNEL_ID, history=store)
     bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
         page1 = await _call_json(
             mcp,
             "read_context",
@@ -863,140 +843,23 @@ async def test_read_context_paginates_backwards_never_future(settings, monkeypat
     ],
 )
 async def test_read_context_rejects_bad_input(settings, monkeypatch, args):
-    _seed_need_context(settings)
     bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        _seed_submitted(settings)
         with pytest.raises(ToolError):
             await _call_json(mcp, "read_context", args)
 
 
-async def test_read_context_validates_each_message(settings, monkeypatch):
-    """A malformed row fails the call; no partial context is served."""
-    import datetime
-
-    ref = _seed_need_context(settings)
-    good = _history_store(SOURCE_MID, 3)
-    bad = _FakeMessage(
-        SOURCE_MID - 4,
-        _FakeUser(OTHER_UID, "R"),
-        content="bad row",
-        channel_id=OTHER_CHANNEL,  # scope violation inside the page
-        created_at=datetime.datetime(2026, 10, 5, 12, 0, 0),
-    )
-    channel = _make_channel(CHANNEL_ID, history=[bad, *good])
-    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
-        with pytest.raises(ToolError):
-            await _call_json(
-                mcp,
-                "read_context",
-                {"source_message_id": SOURCE_MID, "job_ref": ref, "limit": 10},
-            )
-
-
 async def test_read_context_never_touches_other_channel(settings, monkeypatch):
-    ref = _seed_need_context(settings)
-    main = _make_channel(CHANNEL_ID, history=_history_store(SOURCE_MID, 5))
-    other = _make_channel(OTHER_CHANNEL, history=_history_store(SOURCE_MID, 5))
-    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: main, OTHER_CHANNEL: other}))
+    other = _make_channel(OTHER_CHANNEL, history=_history_store(SOURCE_MID, 10))
+    channel = _make_channel(CHANNEL_ID, history=_history_store(SOURCE_MID, 3))
+    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: channel, OTHER_CHANNEL: other}))
     async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
+        ref = _seed_submitted(settings)
         payload = await _call_json(
             mcp,
             "read_context",
-            {"source_message_id": SOURCE_MID, "job_ref": ref, "limit": 5},
+            {"source_message_id": SOURCE_MID, "job_ref": ref, "limit": 10},
         )
-    assert payload["count"] == 5
-    assert main.store["history_calls"] == 1
+    assert payload["count"] == 3
     assert other.store["history_calls"] == 0
-    assert all(m["message_id"] < SOURCE_MID for m in payload["messages"])
-
-
-async def test_read_context_post_await_race_rejected(settings, monkeypatch):
-    """A terminal landing during the history await fails the freshness guard."""
-    ref = _seed_need_context(settings)
-    channel = _make_channel(CHANNEL_ID, history=_history_store(SOURCE_MID, 5))
-    orig_history = channel.history
-
-    def racing_history(**kwargs):
-        mark_uncertain(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID, kind="timeout")
-        return orig_history(**kwargs)
-
-    channel.history = racing_history
-    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
-        with pytest.raises(ToolError):
-            await _call_json(
-                mcp,
-                "read_context",
-                {"source_message_id": SOURCE_MID, "job_ref": ref, "limit": 5},
-            )
-
-
-# --- resolve_uncertain_drop -------------------------------------------------------
-
-
-def _seed_uncertain(settings, mid=SOURCE_MID, seq=1):
-    """Queued job driven to uncertain with zero send evidence."""
-    enqueue_job(
-        settings.delivery_state_path,
-        channel_id=CHANNEL_ID,
-        message_id=mid,
-        author_uid=OWNER_UID,
-        actor_kind="owner",
-        seq=seq,
-    )
-    mark_uncertain(settings.delivery_state_path, CHANNEL_ID, mid, kind="trace_unverified")
-
-
-async def test_resolve_uncertain_drop_happy_path(settings, monkeypatch):
-    _seed_uncertain(settings)
-    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
-    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
-        payload = await _call_json(mcp, "resolve_uncertain_drop", {"source_message_id": SOURCE_MID})
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID)
-        assert job["stage"] == "skipped"
-        assert job["skip_reason"] == "operator_approved_drop"
-        assert job["error"] is None
-    assert payload == {
-        "status": "skipped",
-        "reason": "operator_approved_drop",
-        "channel_id": CHANNEL_ID,
-        "source_message_id": SOURCE_MID,
-        "seq": 1,
-    }
-    audited = _audit_records(settings, "resolve_uncertain_drop")
-    assert audited and all(r["ok"] is True for r in audited)
-
-
-async def test_resolve_uncertain_drop_rejects(settings, monkeypatch):
-    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
-    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
-        with pytest.raises(ToolError):  # unknown job
-            await _call_json(mcp, "resolve_uncertain_drop", {"source_message_id": 1})
-        with pytest.raises(ToolError):  # out of scope
-            await _call_json(
-                mcp,
-                "resolve_uncertain_drop",
-                {"source_message_id": SOURCE_MID, "channel_id": CHANNEL_ID + 1},
-            )
-        with pytest.raises(ToolError):  # bad id
-            await _call_json(mcp, "resolve_uncertain_drop", {"source_message_id": -5})
-    audited = _audit_records(settings, "resolve_uncertain_drop")
-    assert audited and all(r["ok"] is False for r in audited)
-
-
-async def test_resolve_uncertain_drop_rejects_non_uncertain(settings, monkeypatch):
-    enqueue_job(
-        settings.delivery_state_path,
-        channel_id=CHANNEL_ID,
-        message_id=SOURCE_MID,
-        author_uid=OWNER_UID,
-        actor_kind="owner",
-        seq=1,
-    )
-    bot = _FakeBot(_FakeGuild(GUILD_ID, {CHANNEL_ID: _make_channel(CHANNEL_ID)}))
-    async with _running(monkeypatch, settings, bot) as (mcp, ctx, _):
-        with pytest.raises(ToolError):  # queued, never uncertain
-            await _call_json(mcp, "resolve_uncertain_drop", {"source_message_id": SOURCE_MID})
-        job = get_job(settings.delivery_state_path, CHANNEL_ID, SOURCE_MID)
-        assert job["stage"] == "queued"

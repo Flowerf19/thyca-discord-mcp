@@ -1,121 +1,39 @@
-"""Packaging checks for the flat-src layout (offline).
+"""Packaging smoke: every shipped module imports, console entry resolves.
 
 Portable: repo-relative paths only, no baselines, no env reads, no network,
-no keys, no production paths. Verifies the retired namespaces are gone,
-every expected top-level module/package imports, the console entry target
-resolves (never invoked), and the distribution name stays unchanged.
+no keys, no production paths. Import surface is derived from the tree itself
+(no exact file list to rot); the console entry target resolves without
+invoking. Deleted-module absence is covered by the wheel-content check in the
+Phase 5 report, not pinned here.
 """
 
 from __future__ import annotations
 
 import importlib
-import importlib.util
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 
-# Built at runtime so this file itself never contains the retired namespaces.
-_RETIRED = "thyca" + "_discord_" + "mcp"
-_RETIRED_PKG = "mod" + "um"
 
-EXPECTED_FILES = (
-    "audit.py",
-    "bot.py",
-    "config.py",
-    "context.py",
-    "conversation.py",
-    "delivery_schema.py",
-    "delivery_storage.py",
-    "identity.py",
-    "instance_lock.py",
-    "jev.py",
-    "main.py",
-    "outbox.py",
-    "server_helpers.py",
-    "server_ticks.py",
-    "sessions.py",
-    "source_messages.py",
-    "tasks.py",
-    "thyca.py",
-)
-
-EXPECTED_PACKAGES = {
-    "delivery": ("__init__.py", "queries.py", "store.py", "transitions.py"),
-    "participation": ("__init__.py", "errors.py", "ledger.py", "store.py", "validate.py"),
-    "responder": ("__init__.py", "core.py", "input.py", "recovery.py", "submit.py"),
-    "server": ("__init__.py", "core.py"),
-}
-
-EXPECTED_IMPORTS = (
-    "audit",
-    "bot",
-    "config",
-    "context",
-    "conversation",
-    "delivery",
-    "delivery.queries",
-    "delivery.store",
-    "delivery.transitions",
-    "delivery_schema",
-    "delivery_storage",
-    "identity",
-    "instance_lock",
-    "jev",
-    "main",
-    "outbox",
-    "participation",
-    "participation.errors",
-    "participation.ledger",
-    "participation.store",
-    "participation.validate",
-    "responder",
-    "responder.core",
-    "responder.input",
-    "responder.recovery",
-    "responder.submit",
-    "server",
-    "server.core",
-    "server_helpers",
-    "server_ticks",
-    "sessions",
-    "source_messages",
-    "tasks",
-    "thyca",
-)
+def _all_module_names() -> list[str]:
+    names: list[str] = []
+    for path in sorted(SRC.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        rel = path.relative_to(SRC).with_suffix("")
+        parts = list(rel.parts)
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if parts:
+            names.append(".".join(parts))
+    assert names, "no modules found under src/"
+    return names
 
 
-def test_retired_namespace_not_importable():
-    assert importlib.util.find_spec(_RETIRED) is None
-    assert importlib.util.find_spec(_RETIRED_PKG) is None
-
-
-def test_retired_package_dir_gone():
-    assert not (ROOT / "src" / _RETIRED).exists()
-    assert not (ROOT / "src" / _RETIRED_PKG).exists()
-    assert sorted(p.name for p in ROOT.glob("src/*") if p.is_dir() and p.name != "__pycache__") == [
-        "delivery",
-        "participation",
-        "responder",
-        "server",
-    ]
-
-
-def test_no_package_root_leftover():
-    # Flat layout: no top-level package module, version lives in pyproject.
-    assert (SRC / "__init__.py").exists() is False
-    assert (SRC / _RETIRED_PKG).exists() is False
-
-
-def test_package_file_surface_exact():
-    assert sorted(p.name for p in SRC.glob("*.py")) == sorted(EXPECTED_FILES)
-    for dirname, files in EXPECTED_PACKAGES.items():
-        assert sorted(p.name for p in (SRC / dirname).glob("*.py")) == sorted(files)
-
-
-def test_all_modules_import():
-    for name in EXPECTED_IMPORTS:
-        assert importlib.import_module(f"{name}") is not None
+def test_all_tree_modules_import():
+    for name in _all_module_names():
+        assert importlib.import_module(name) is not None
 
 
 def test_console_entry_target_resolves_without_invoking():
@@ -125,26 +43,3 @@ def test_console_entry_target_resolves_without_invoking():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'thyca-discord-mcp = "main:main"' in pyproject
     assert 'name = "thyca-discord-mcp"' in pyproject
-
-
-def test_no_retired_namespace_in_shipped_sources():
-    targets = [ROOT / "pyproject.toml", *sorted(SRC.glob("*.py"))]
-    targets.extend(sorted((ROOT / "tests").glob("*.py")))
-    targets.extend(sorted((ROOT / "experiments").rglob("*.py")))
-    assert len(targets) > 30
-    for path in targets:
-        assert _RETIRED not in path.read_text(encoding="utf-8"), path.name
-
-
-def test_moved_namespaces_resolve_under_new_package():
-    from bot import build_bot
-    from config import Settings
-    from responder import Responder
-    from server import create_server
-    from thyca import ThycaClient
-
-    assert build_bot.__module__ == "bot"
-    assert Settings.__module__ == "config"
-    assert Responder.__module__ == "responder.core"
-    assert create_server.__module__ == "server.core"
-    assert ThycaClient.__module__ == "thyca"

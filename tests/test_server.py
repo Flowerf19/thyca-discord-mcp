@@ -16,7 +16,6 @@ real worker elsewhere.
 """
 
 import asyncio
-import hashlib
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -27,14 +26,13 @@ import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
 from config import Settings
-from outbox import (
-    OutboxError,
+from server import create_server
+from store import (
     append_entry,
     get_poll_cursor,
     read_entries,
     set_poll_cursor,
 )
-from server import create_server
 
 BOT_UID = 111
 OWNER_UID = 222
@@ -52,7 +50,6 @@ EXPECTED_TOOLS = [
     "read_outbox",
     "record_no_reply",
     "remove_poll_task",
-    "resolve_uncertain_drop",
     "send_message",
     "start_task",
     "stop_task",
@@ -60,9 +57,9 @@ EXPECTED_TOOLS = [
 ]
 
 # Pre-routing tools: every one of the old 12 must remain with compatible
-# behavior; the 3 additions (read_context, record_no_reply,
-# resolve_uncertain_drop) are covered in
-# tests/test_observation_server.py.
+# behavior; the 2 remaining additions (read_context, record_no_reply) are
+# covered in tests/test_observation_server.py. resolve_uncertain_drop was
+# removed in Phase 2b+3 (15 -> 14 tools): restart auto-fails submitted jobs.
 EXPECTED_LEGACY_TOOLS = [
     "ack_outbox",
     "add_poll_task",
@@ -102,17 +99,49 @@ class FakeMessage:
 
 
 class FakeGuild:
-    def __init__(self, gid, channels=None, member_count=10):
+    def __init__(self, gid, channels=None, member_count=10, members=None):
         self.id = gid
+        self.name = f"guild-{gid}"
         self._channels = dict(channels or {})
         self.member_count = member_count
+        self._members = dict(members or {})
 
     def get_channel(self, cid):
         return self._channels.get(cid)
 
+    def get_member(self, uid):
+        return self._members.get(uid)
+
+    @property
+    def text_channels(self):
+        return list(self._channels.values())
+
+    @property
+    def voice_channels(self):
+        return []
+
+    @property
+    def members(self):
+        return list(self._members.values())
+
+    @property
+    def chunked(self):
+        # SDK-reachable derivation mirroring discord.Guild.chunked:
+        # member_count == len(member cache).
+        return self.member_count == len(self._members)
+
+    async def fetch_members(self, limit=None):
+        for member in list(self._members.values())[:limit]:
+            yield member
+
 
 class FakeBot:
-    """Minimal bot surface used by server.py: login/connect/ready/channels/listeners."""
+    """Minimal bot surface used by server.py: start/ready/channels/event capture.
+
+    Mirrors ``discord.Client`` (no add_listener): realtime capture registers
+    via ``event()`` keyed by function name, startup runs ``start(token)``
+    raced against ``wait_until_ready()``.
+    """
 
     def __init__(
         self,
@@ -120,50 +149,51 @@ class FakeBot:
         *,
         user=None,
         fetch_map=None,
-        connect_exc=None,
-        login_exc=None,
+        start_exc=None,
         ready_exc=None,
         close_exc=None,
     ):
         self.user = user or FakeUser(BOT_UID, "ThycaBot", bot=True)
         self._guild = guild
         self._fetch_map = dict(fetch_map or {})
-        self._connect_exc = connect_exc
-        self._login_exc = login_exc
+        self._start_exc = start_exc
         self._ready_exc = ready_exc
         self._close_exc = close_exc
         self.events: list[str] = []
         self.listeners: dict[str, list] = {}
         self._closed = False
         self._ready = False
+        self._setup = False  # mirrors Client._ready existing after _async_setup_hook
+        # Mirrors the gateway READY dispatch: set only by a successful start.
+        self._ready_event = asyncio.Event()
         self._close_event = asyncio.Event()
 
-    def add_listener(self, func, name):
-        self.events.append("add_listener")
-        self.listeners.setdefault(name, []).append(func)
+    def event(self, func):
+        self.events.append("event")
+        self.listeners.setdefault(func.__name__, []).append(func)
+        return func
 
-    def remove_listener(self, func, name):
-        self.events.append("remove_listener")
-        try:
-            self.listeners.get(name, []).remove(func)
-        except ValueError:
-            pass
-
-    async def login(self, token):  # noqa: ARG002 - signature mirrors discord.py
-        self.events.append("login")
-        if self._login_exc is not None:
-            raise self._login_exc
-
-    async def connect(self):
-        self.events.append("connect")
-        if self._connect_exc is not None:
-            raise self._connect_exc
+    async def start(self, token):  # noqa: ARG002 - signature mirrors discord.py
+        self.events.append("start")
+        self._setup = True  # mirrors _async_setup_hook at login() entry
+        if self._start_exc is not None:
+            raise self._start_exc
+        # Successful gateway connect dispatches READY, then stays open.
+        self._ready_event.set()
         await self._close_event.wait()
 
     async def wait_until_ready(self):
         self.events.append("wait_ready")
+        if not self._setup:
+            # Mirrors the real Client: raises before login() creates _ready.
+            raise RuntimeError(
+                "Client has not been properly initialised. "
+                "Please use the login method before calling this method"
+            )
         if self._ready_exc is not None:
             raise self._ready_exc
+        # Real READY arrives via gateway dispatch while start() connects.
+        await self._ready_event.wait()
         self._ready = True
 
     def is_ready(self):
@@ -234,7 +264,11 @@ def make_text_channel(cid, guild_id=GUILD_ID, history=None):
     channel = MagicMock(spec=discord.TextChannel)
     channel.id = cid
     channel.guild = SimpleNamespace(id=guild_id)
+    channel.name = f"chan-{cid}"
+    channel.topic = None
+    channel.position = 0
     sent: list[FakeMessage] = []
+    sent_kwargs: list[dict] = []
     store: dict = {"deleted": set(), "exc": None, "calls": []}
 
     async def fake_send(content, **kwargs):
@@ -247,6 +281,7 @@ def make_text_channel(cid, guild_id=GUILD_ID, history=None):
             reference=kwargs.get("reference"),
         )
         sent.append(msg)
+        sent_kwargs.append(kwargs)
         return msg
 
     async def fake_fetch(mid):
@@ -268,6 +303,7 @@ def make_text_channel(cid, guild_id=GUILD_ID, history=None):
     channel.fetch_message = fake_fetch
     channel.history = history or make_history()[0]
     channel.sent = sent
+    channel.sent_kwargs = sent_kwargs
     channel.source_store = store
     return channel
 
@@ -309,14 +345,6 @@ class RefusingGuardResponder(FakeResponder):
         raise ValueError("ack beyond safe prefix")
 
 
-class FailingRemoveListenerBot(FakeBot):
-    """FakeBot whose remove_listener fails: teardown-isolation coverage."""
-
-    def remove_listener(self, func, name):
-        self.events.append("remove_listener")
-        raise RuntimeError("remove boom")
-
-
 def _settings_kwargs(tmp_path):
     """Fixture kwargs: tmp/fake-only, immune to ambient .env and env vars."""
     return dict(
@@ -328,13 +356,11 @@ def _settings_kwargs(tmp_path):
         guild_id=GUILD_ID,
         default_channel_id=CHANNEL_ID,
         audit_path=tmp_path / "audit.jsonl",
-        outbox_path=tmp_path / "outbox.jsonl",
-        outbox_state_path=tmp_path / "outbox_state.json",
+        db_path=tmp_path / "state.db",
         watch_channel_ids=[CHANNEL_ID],
         responder_check_seconds=1.0,
         recovery_poll_seconds=30.0,
         # v5 worker paths stay tmp-only even though FakeResponder never reads them.
-        delivery_state_path=tmp_path / "delivery.json",
     )
 
 
@@ -402,8 +428,7 @@ async def add_and_hold(mcp, ctx, name, **kwargs):
 def seed_outbox(settings, *mids):
     for mid in mids:
         append_entry(
-            settings.outbox_path,
-            settings.outbox_state_path,
+            settings.db_path,
             type="message",
             channel_id=CHANNEL_ID,
             message_id=mid,
@@ -437,7 +462,7 @@ async def test_new_tool_descriptions_carry_essentials(settings):
 async def test_identity_policy_visible_in_tool_descriptions(settings):
     mcp = create_server(settings)
     descs = {t.name: t.description or "" for t in await mcp.list_tools()}
-    assert sorted(descs) == EXPECTED_TOOLS  # 15 tools: old 12 intact + 3 additions
+    assert sorted(descs) == EXPECTED_TOOLS  # 14 tools: old 12 intact + 2 additions
     for name in ("whoami", "read_outbox", "send_message"):
         desc = descs[name]
         assert str(settings.owner_uid) in desc  # parameterized owner UID (222 in tests)
@@ -588,17 +613,17 @@ async def test_poll_first_tick_captures_newest20_reversed(settings, monkeypatch)
         assert calls[0]["limit"] == 20
         assert calls[0]["oldest_first"] is False  # never True: would page from channel start
         assert "after" not in calls[0]
-        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        got = read_entries(settings.db_path, unread_only=False)
         assert [e["message_id"] for e in got["entries"]] == list(range(21, 31))
         assert {e["type"] for e in got["entries"]} == {"poll"}
-        assert get_poll_cursor(settings.outbox_state_path, CHANNEL_ID) == 30
+        assert get_poll_cursor(settings.db_path, CHANNEL_ID) == 30
 
 
 async def test_poll_later_tick_pages_after_cursor(settings, monkeypatch):
     hist, calls, hstate = make_history()
     channel = make_text_channel(CHANNEL_ID, history=hist)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    set_poll_cursor(settings.outbox_state_path, CHANNEL_ID, 100)
+    set_poll_cursor(settings.db_path, CHANNEL_ID, 100)
     async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
         _, tick = await add_and_hold(mcp, ctx, "p")
         hstate["messages"] = [FakeMessage(mid, _other(), f"m{mid}") for mid in (101, 102, 103)]
@@ -608,9 +633,9 @@ async def test_poll_later_tick_pages_after_cursor(settings, monkeypatch):
         assert calls[0]["oldest_first"] is True
         after = calls[0]["after"]
         assert isinstance(after, discord.Object) and after.id == 100
-        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        got = read_entries(settings.db_path, unread_only=False)
         assert [e["message_id"] for e in got["entries"]] == [101, 102, 103]
-        assert get_poll_cursor(settings.outbox_state_path, CHANNEL_ID) == 103
+        assert get_poll_cursor(settings.db_path, CHANNEL_ID) == 103
 
 
 async def test_poll_tags_self_owner_other(settings, monkeypatch):
@@ -625,7 +650,7 @@ async def test_poll_tags_self_owner_other(settings, monkeypatch):
             FakeMessage(201, FakeUser(BOT_UID, "ThycaBot", bot=True), "from self"),
         ]
         await tick()
-        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        got = read_entries(settings.db_path, unread_only=False)
         assert [(e["message_id"], e["actor_kind"]) for e in got["entries"]] == [
             (201, "self"),  # poll keeps self, unlike realtime capture
             (202, "owner"),
@@ -637,16 +662,16 @@ async def test_poll_tick_error_audits_and_keeps_cursor(settings, monkeypatch):
     hist, _calls, hstate = make_history()
     channel = make_text_channel(CHANNEL_ID, history=hist)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    set_poll_cursor(settings.outbox_state_path, CHANNEL_ID, 50)
+    set_poll_cursor(settings.db_path, CHANNEL_ID, 50)
     async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
         _, tick = await add_and_hold(mcp, ctx, "p")
         hstate["exc"] = RuntimeError("boom")
         assert await tick() is None  # error audits, loop survives
-        assert get_poll_cursor(settings.outbox_state_path, CHANNEL_ID) == 50
+        assert get_poll_cursor(settings.db_path, CHANNEL_ID) == 50
         hstate["exc"] = None  # next tick retries and succeeds
         hstate["messages"] = [FakeMessage(51, _other(), "m51")]
         await tick()
-        assert get_poll_cursor(settings.outbox_state_path, CHANNEL_ID) == 51
+        assert get_poll_cursor(settings.db_path, CHANNEL_ID) == 51
     recs = find_audit(read_audit(settings), "poll_tick", False)
     assert len(recs) == 1 and recs[0]["args"] == {"channel_id": CHANNEL_ID}
 
@@ -659,14 +684,14 @@ async def test_poll_readd_resumes_cursor(settings, monkeypatch):
         _, tick = await add_and_hold(mcp, ctx, "p")
         hstate["messages"] = [FakeMessage(50, _other(), "m50")]
         await tick()
-        assert get_poll_cursor(settings.outbox_state_path, CHANNEL_ID) == 50
+        assert get_poll_cursor(settings.db_path, CHANNEL_ID) == 50
         assert await call_json(mcp, "remove_poll_task", {"name": "p"}) == {"removed": "p"}
         hstate["messages"] = []  # keep the re-added loop's first tick a no-op
         _, tick2 = await add_and_hold(mcp, ctx, "p")
         hstate["messages"] = [FakeMessage(mid, _other(), f"m{mid}") for mid in (51, 52)]
         await tick2()
         assert calls[-1]["after"].id == 50  # cursor retained across remove/re-add
-        assert get_poll_cursor(settings.outbox_state_path, CHANNEL_ID) == 52
+        assert get_poll_cursor(settings.db_path, CHANNEL_ID) == 52
 
 
 # --- realtime capture --------------------------------------------------------
@@ -685,7 +710,7 @@ async def test_realtime_capture_and_filtering(settings, monkeypatch):
         await handler(FakeMessage(4, _other(), "x", guild_id=999))  # dropped: scope
         await handler(FakeMessage(5, _other(), "x", guild_id=None))  # dropped: DM
         await handler(FakeMessage(6, _other(), "x", channel_id=123))  # dropped: unwatched
-        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        got = read_entries(settings.db_path, unread_only=False)
         rows = [(e["message_id"], e["actor_kind"], e["content"], e["type"]) for e in got["entries"]]
         assert rows == [
             (1, "owner", "do it", "message"),
@@ -698,7 +723,7 @@ async def test_realtime_failure_audited_without_secrets(settings, monkeypatch):
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
         (handler,) = bot.listeners["on_message"]
-        settings.outbox_state_path.write_text("corrupt{", encoding="utf-8")
+        settings.db_path.write_bytes(b"not a database")
         await handler(FakeMessage(1, _owner(), "hi"))  # must not raise; failure is audited
     recs = find_audit(read_audit(settings), "on_message", False)
     assert len(recs) == 1
@@ -771,8 +796,8 @@ async def test_lifespan_startup_order_and_listener(settings, monkeypatch):
     monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
     async with mcp.settings.lifespan(mcp) as ctx:
-        # Listener registered after build, before login/connect; login before connect.
-        assert bot.events[:4] == ["add_listener", "login", "connect", "wait_ready"]
+        # Event registered after build, before start; start raced with ready.
+        assert bot.events[:3] == ["event", "start", "wait_ready"]
         assert "on_message" in bot.listeners
         assert ctx["bot"] is bot
         assert ctx["tasks"].status("heartbeat").running is True
@@ -781,14 +806,14 @@ async def test_lifespan_startup_order_and_listener(settings, monkeypatch):
         assert ctx["tasks"].status("auto-reply").running is True
         assert ctx["tasks"].status("auto-reply-recovery").running is True
     assert ctx["tasks"].status("heartbeat").running is False
-    assert "remove_listener" in bot.events
+    assert bot.events == ["event", "start", "wait_ready", "close"]
     assert bot.is_closed()
 
 
 async def test_lifespan_early_gateway_failure(settings, monkeypatch):
     bot = FakeBot(
         FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}),
-        connect_exc=discord.LoginFailure("bad token"),
+        start_exc=discord.LoginFailure("bad token"),
     )
 
     async def hang_ready():
@@ -802,7 +827,7 @@ async def test_lifespan_early_gateway_failure(settings, monkeypatch):
     with pytest.raises(RuntimeError, match="gateway failed before ready"):
         async with mcp.settings.lifespan(mcp):
             pass  # pragma: no cover - startup must raise first
-    assert "login" in bot.events
+    assert "start" in bot.events
     assert bot.is_closed()
     leftovers = [
         t
@@ -820,20 +845,20 @@ def _leftover_gateway_tasks():
     ]
 
 
-async def test_lifespan_login_failure_closes_bot_and_listener(settings, monkeypatch):
+async def test_lifespan_start_failure_closes_bot(settings, monkeypatch):
     bot = FakeBot(
         FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}),
-        login_exc=discord.LoginFailure("bad token"),
+        start_exc=discord.LoginFailure("bad token"),
     )
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
-    with pytest.raises(discord.LoginFailure, match="bad token"):
+    with pytest.raises(RuntimeError, match="gateway failed before ready"):
         async with mcp.settings.lifespan(mcp):
-            pass  # pragma: no cover - login must raise first
+            pass  # pragma: no cover - start must raise first
     assert bot.is_closed()  # HTTP session owner closed, not leaked
-    assert bot.listeners.get("on_message") == []
-    assert bot.events == ["add_listener", "login", "remove_listener", "close"]
+    assert len(bot.listeners.get("on_message") or []) == 1  # bot discarded with handler
+    assert bot.events == ["event", "start", "wait_ready", "close"]
     assert _leftover_gateway_tasks() == []
 
 
@@ -843,13 +868,13 @@ async def test_lifespan_ready_failure_cleans_gateway(settings, monkeypatch):
         ready_exc=RuntimeError("ready boom"),
     )
     tasks_seen: dict[str, asyncio.Task] = {}
-    orig_connect = bot.connect
+    orig_start = bot.start
 
-    async def spy_connect():
+    async def spy_start(token):  # noqa: ARG002 - signature mirrors discord.py
         tasks_seen["gateway"] = asyncio.current_task()
-        await orig_connect()
+        await orig_start(token)
 
-    bot.connect = spy_connect
+    bot.start = spy_start
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
@@ -857,16 +882,14 @@ async def test_lifespan_ready_failure_cleans_gateway(settings, monkeypatch):
         async with mcp.settings.lifespan(mcp):
             pass  # pragma: no cover - readiness must raise first
     assert bot.is_closed()
-    assert bot.listeners.get("on_message") == []
+    assert len(bot.listeners.get("on_message") or []) == 1  # bot discarded with handler
     assert bot.events == [
-        "add_listener",
-        "login",
-        "connect",
+        "event",
+        "start",
         "wait_ready",
-        "remove_listener",
         "close",
     ]
-    assert tasks_seen["gateway"].done()  # hanging connect settled, not leaked
+    assert tasks_seen["gateway"].done()  # hanging start settled, not leaked
     assert _leftover_gateway_tasks() == []
 
 
@@ -881,14 +904,14 @@ async def test_lifespan_cancel_during_readiness_wait_cleans_all(settings, monkey
         ready_entered.set()  # lifespan is now parked inside asyncio.wait
         await asyncio.sleep(3600)
 
-    orig_connect = bot.connect
+    orig_start = bot.start
 
-    async def spy_connect():
+    async def spy_start(token):  # noqa: ARG002 - signature mirrors discord.py
         tasks_seen["gateway"] = asyncio.current_task()
-        await orig_connect()
+        await orig_start(token)
 
     bot.wait_until_ready = hang_ready
-    bot.connect = spy_connect
+    bot.start = spy_start
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
@@ -903,40 +926,42 @@ async def test_lifespan_cancel_during_readiness_wait_cleans_all(settings, monkey
     with pytest.raises(asyncio.CancelledError):
         await task
     assert bot.is_closed()
-    assert bot.listeners.get("on_message") == []
+    assert len(bot.listeners.get("on_message") or []) == 1  # bot discarded with handler
     assert tasks_seen["gateway"].cancelled()
     assert tasks_seen["ready"].cancelled()
     assert _leftover_gateway_tasks() == []
 
 
-async def test_lifespan_cancel_during_login_cleans_all(settings, monkeypatch):
+async def test_lifespan_cancel_during_start_cleans_all(settings, monkeypatch):
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    login_entered = asyncio.Event()
-    login_release = asyncio.Event()
+    start_entered = asyncio.Event()
+    start_release = asyncio.Event()
 
-    async def gated_login(token):  # noqa: ARG002 - signature mirrors discord.py
-        bot.events.append("login")
-        login_entered.set()  # lifespan is now parked inside login
-        await login_release.wait()
+    async def gated_start(token):  # noqa: ARG002 - signature mirrors discord.py
+        bot.events.append("start")
+        bot._setup = True  # mirror _async_setup_hook; gateway never dispatches READY
+        start_entered.set()  # lifespan is now parked inside start
+        await start_release.wait()
 
-    bot.login = gated_login
+    bot.start = gated_start
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
 
     async def _run():
         async with mcp.settings.lifespan(mcp):
-            pass  # pragma: no cover - cancelled while logging in
+            pass  # pragma: no cover - cancelled while starting
 
     task = asyncio.create_task(_run(), name="lifespan-under-test")
-    await asyncio.wait_for(login_entered.wait(), timeout=5)
+    await asyncio.wait_for(start_entered.wait(), timeout=5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert bot.is_closed()
-    assert bot.listeners.get("on_message") == []
-    # No gateway tasks were ever created on this path.
-    assert bot.events == ["add_listener", "login", "remove_listener", "close"]
+    assert len(bot.listeners.get("on_message") or []) == 1  # bot discarded with handler
+    # Both gateway tasks were created, then cancelled by the shared finally.
+    # The ready task records its wait before the cancellation lands.
+    assert bot.events == ["event", "start", "wait_ready", "close"]
     assert _leftover_gateway_tasks() == []
 
 
@@ -946,75 +971,54 @@ async def test_lifespan_close_error_still_settles_tasks(settings, monkeypatch):
         close_exc=RuntimeError("close boom"),
     )
     tasks_seen: dict[str, asyncio.Task] = {}
-    orig_connect = bot.connect
+    orig_start = bot.start
 
-    async def spy_connect():
+    async def spy_start(token):  # noqa: ARG002 - signature mirrors discord.py
         tasks_seen["gateway"] = asyncio.current_task()
-        await orig_connect()
+        await orig_start(token)
 
-    bot.connect = spy_connect
+    bot.start = spy_start
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
     with pytest.raises(RuntimeError, match="close boom"):
         async with mcp.settings.lifespan(mcp) as ctx:
             assert ctx["bot"] is bot
-    # Listener removal ran before the close attempt; the close error stays visible.
-    assert bot.listeners.get("on_message") == []
+    # No listener removal on a bare Client: the close error stays visible.
+    assert len(bot.listeners.get("on_message") or []) == 1  # bot discarded with handler
     assert bot.events == [
-        "add_listener",
-        "login",
-        "connect",
+        "event",
+        "start",
         "wait_ready",
-        "remove_listener",
         "close",
     ]
     assert tasks_seen["gateway"].done()
     assert _leftover_gateway_tasks() == []
 
 
-async def test_lifespan_startup_refuses_state_behind_log(settings, monkeypatch):
-    seed_outbox(settings, 11, 12)  # log highest seq 2, state seq 2
-    tampered = json.loads(settings.outbox_state_path.read_bytes())
-    tampered["seq"] = 1  # restart with state behind the log
-    settings.outbox_state_path.write_text(json.dumps(tampered), encoding="utf-8")
-    state_before = settings.outbox_state_path.read_bytes()
-    log_before = settings.outbox_path.read_bytes()
+async def test_lifespan_startup_refuses_corrupt_db(settings, monkeypatch):
+    # Phase 2a: the two-file stale-state/malformed-log class is gone. The
+    # single-DB startup gate (quick_check + user_version) fails loudly here.
+    seed_outbox(settings, 11, 12)
+    db_before = settings.db_path.read_bytes()
+    with settings.db_path.open("r+b") as f:
+        f.seek(32)
+        f.write(b"\x00\xff\x00\xff-corrupt-corrupt-corrupt")
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     monkeypatch.setattr("server.core.Responder", FakeResponder)
     mcp = create_server(settings)
-    with pytest.raises(OutboxError, match="behind the log"):
+    with pytest.raises(Exception, match="(?i)corrupt|malform|database|format|file"):
         async with mcp.settings.lifespan(mcp):
             pass  # pragma: no cover - startup guard must raise first
-    # No capture path ran: nothing logged in, no listener, no new writes;
-    # the fresh bot is still closed by the shared finally.
-    assert bot.events == ["remove_listener", "close"]
+    # No capture path ran: nothing logged in, no event registered, no writes;
+    # the fresh bot is still closed by the shared finally. The DB file is
+    # never reset or deleted by the failed open.
+    assert bot.events == ["close"]
     assert bot.listeners.get("on_message") is None
     assert bot.is_closed()
-    assert settings.outbox_state_path.read_bytes() == state_before
-    assert settings.outbox_path.read_bytes() == log_before
-    assert _leftover_gateway_tasks() == []
-
-
-async def test_lifespan_startup_refuses_malformed_log(settings, monkeypatch):
-    seed_outbox(settings, 11)  # valid nonzero state + one good entry
-    with settings.outbox_path.open("a", encoding="utf-8") as f:
-        f.write("oops\n")
-    state_before = settings.outbox_state_path.read_bytes()
-    log_before = settings.outbox_path.read_bytes()
-    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    monkeypatch.setattr("server.core.build_bot", lambda s: bot)
-    monkeypatch.setattr("server.core.Responder", FakeResponder)
-    mcp = create_server(settings)
-    with pytest.raises(OutboxError, match="corrupt outbox log"):
-        async with mcp.settings.lifespan(mcp):
-            pass  # pragma: no cover - startup guard must raise first
-    assert bot.events == ["remove_listener", "close"]
-    assert bot.listeners.get("on_message") is None
-    assert bot.is_closed()
-    assert settings.outbox_state_path.read_bytes() == state_before
-    assert settings.outbox_path.read_bytes() == log_before
+    assert settings.db_path.exists()
+    assert settings.db_path.read_bytes() != db_before[:0]  # still present
     assert _leftover_gateway_tasks() == []
 
 
@@ -1033,93 +1037,48 @@ async def test_lifespan_shutdown_stops_dynamic_loops(settings, monkeypatch):
     assert bot.is_closed()
 
 
-# --- state-loss / corruption consistency guard -------------------------------
-# The guard (_check_outbox_consistent) refuses ack/cursor advances when state
-# and log disagree, instead of resetting state or duplicating seqs. It relies
-# on core read_entries raising for missing/zeroed state next to a non-empty
-# log, acked > seq, and corrupt data (post-review core behavior).
+# --- corruption guard (single-DB) ------------------------------------------
+# Store.open (quick_check + user_version gate) refuses corrupt data on every
+# path instead of resetting or duplicating seqs. The two-file state-loss /
+# stale-state / malformed-log class no longer exists: a missing DB file is a
+# genuinely fresh outbox, and UNIQUE(channel,message) + high-water make seq
+# duplication impossible.
 
 
-async def test_ack_outbox_refuses_state_loss_without_reset(settings):
-    seed_outbox(settings, 11, 12)
-    settings.outbox_state_path.unlink()  # state loss: log intact, state gone
-    mcp = create_server(settings)
-    with pytest.raises(ToolError):  # must refuse even up_to_seq=0 (no fresh reset)
-        await mcp.call_tool("ack_outbox", {"up_to_seq": 0})
-    assert not settings.outbox_state_path.exists()  # no reset write happened
-    assert find_audit(read_audit(settings), "ack_outbox", False)
-
-
-async def test_ack_outbox_refuses_corrupt_state_untouched(settings):
+async def test_ack_outbox_refuses_corrupt_db_untouched(settings):
+    # Phase 2a: state-loss (missing file) is now a fresh empty outbox, not
+    # a refusal -- only genuine corruption fails loudly, without reset.
     seed_outbox(settings, 11)
-    settings.outbox_state_path.write_text("corrupt{", encoding="utf-8")
+    settings.db_path.write_bytes(b"not a database")
     mcp = create_server(settings)
-    with pytest.raises(ToolError, match="corrupt"):
+    with pytest.raises(ToolError, match="(?i)corrupt|database"):
         await mcp.call_tool("ack_outbox", {"up_to_seq": 1})
-    assert settings.outbox_state_path.read_text(encoding="utf-8") == "corrupt{"
+    assert settings.db_path.read_bytes() == b"not a database"  # never reset
     assert find_audit(read_audit(settings), "ack_outbox", False)
 
 
-async def test_ack_outbox_refuses_acked_beyond_seq(settings):
-    seed_outbox(settings, 11)
-    before = settings.outbox_state_path.read_bytes()
-    tampered = json.loads(before)
-    tampered["acked"] = tampered["seq"] + 5  # impossible: acked beyond latest
-    settings.outbox_state_path.write_text(json.dumps(tampered), encoding="utf-8")
-    mcp = create_server(settings)
-    with pytest.raises(ToolError):
-        await mcp.call_tool("ack_outbox", {"up_to_seq": 1})
-    # The guard must reject before ack mutates anything: file keeps the tampered
-    # bytes verbatim (core never silently rewrites it on this path).
-    assert (
-        json.loads(settings.outbox_state_path.read_text(encoding="utf-8"))["acked"]
-        == (tampered["acked"])
-    )
-    assert find_audit(read_audit(settings), "ack_outbox", False)
-
-
-async def test_poll_tick_refuses_state_loss(settings, monkeypatch):
-    hist, calls, hstate = make_history()
-    channel = make_text_channel(CHANNEL_ID, history=hist)
-    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    seed_outbox(settings, 11, 12)
-    log_before = settings.outbox_path.read_bytes()
-    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
-        _, tick = await add_and_hold(mcp, ctx, "p")  # start healthy, then lose state
-        settings.outbox_state_path.unlink()
-        hstate["messages"] = [FakeMessage(50, _other(), "m50")]
-        assert await tick() is None  # guard audits, loop survives
-        assert calls == []  # no history fetch on state loss
-        assert not settings.outbox_state_path.exists()  # no cursor/state write
-        assert settings.outbox_path.read_bytes() == log_before  # no appends
-    recs = find_audit(read_audit(settings), "poll_tick", False)
-    assert len(recs) == 1 and recs[0]["args"] == {"channel_id": CHANNEL_ID}
-
-
-async def test_poll_tick_refuses_corrupt_log(settings, monkeypatch):
+async def test_poll_tick_audits_corrupt_db_and_keeps_loop(settings, monkeypatch):
+    # Phase 2a: corruption (not state loss) audits ok:false and the native
+    # loop survives. A missing DB file is fresh, not corrupt -- no refusal.
     hist, _calls, hstate = make_history()
     channel = make_text_channel(CHANNEL_ID, history=hist)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
     seed_outbox(settings, 11)
     async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
         _, tick = await add_and_hold(mcp, ctx, "p")
-        with settings.outbox_path.open("a", encoding="utf-8") as f:
-            f.write("oops\n")  # corrupt the log after start, before tick
+        settings.db_path.write_bytes(b"not a database")  # corrupt after start
         hstate["messages"] = [FakeMessage(50, _other(), "m50")]
-        assert await tick() is None
-        assert get_poll_cursor(settings.outbox_state_path, CHANNEL_ID) is None
+        assert await tick() is None  # audits, loop survives
     assert find_audit(read_audit(settings), "poll_tick", False)
 
 
-async def test_add_poll_task_refuses_corrupt_state(settings, monkeypatch):
-    # Corruption is injected AFTER a healthy startup: since the lifespan
-    # startup guard validates state/log agreement first, pre-startup corruption
-    # would now fail at boot instead of reaching the tool's runtime guard.
-    # Same assertions as before — still the same runtime-guard coverage.
+async def test_add_poll_task_refuses_corrupt_db(settings, monkeypatch):
+    # Corruption is injected AFTER a healthy startup: pre-startup corruption
+    # fails at boot instead of reaching the tool's runtime open check.
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
     async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
-        settings.outbox_state_path.write_text("corrupt{", encoding="utf-8")
-        with pytest.raises(ToolError, match="corrupt"):
+        settings.db_path.write_bytes(b"not a database")
+        with pytest.raises(ToolError, match="(?i)corrupt|database"):
             await mcp.call_tool("add_poll_task", {"name": "p"})
         # v5: the two protected auto loops are always registered by default.
         assert {t.name for t in ctx["tasks"].list_tasks()} == {
@@ -1130,17 +1089,17 @@ async def test_add_poll_task_refuses_corrupt_state(settings, monkeypatch):
     assert find_audit(read_audit(settings), "add_poll_task", False)
 
 
-async def test_fresh_outbox_unaffected_by_guard(settings, monkeypatch):
-    # Missing state + missing log is a genuinely fresh outbox: guard passes.
+async def test_fresh_outbox_db_missing_file_is_fresh(settings, monkeypatch):
+    # A missing DB file is a genuinely fresh outbox: tick + ack proceed.
     hist, _calls, hstate = make_history()
     channel = make_text_channel(CHANNEL_ID, history=hist)
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
-    assert not settings.outbox_path.exists() and not settings.outbox_state_path.exists()
+    assert not settings.db_path.exists()
     async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
         _, tick = await add_and_hold(mcp, ctx, "p")
         hstate["messages"] = [FakeMessage(5, _owner(), "first")]
         await tick()  # first-tick path, cursor advances from nothing
-        assert get_poll_cursor(settings.outbox_state_path, CHANNEL_ID) == 5
+        assert get_poll_cursor(settings.db_path, CHANNEL_ID) == 5
         assert await call_json(mcp, "ack_outbox", {"up_to_seq": 1}) == {"acked": 1}
 
 
@@ -1158,7 +1117,7 @@ async def test_realtime_other_bot_captured_with_true(settings, monkeypatch):
         await handler(FakeMessage(11, _owner(), "human owner"))
         await handler(FakeMessage(12, _other(), "human other"))
         await handler(FakeMessage(13, _other_bot(), "bot beep"))
-        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        got = read_entries(settings.db_path, unread_only=False)
         rows = [(e["message_id"], e["actor_kind"], e["author_is_bot"]) for e in got["entries"]]
         assert rows == [
             (11, "owner", False),
@@ -1174,7 +1133,7 @@ async def test_realtime_self_excluded_regardless_of_bot_flag(settings, monkeypat
         (handler,) = bot.listeners["on_message"]
         await handler(FakeMessage(21, FakeUser(BOT_UID, "ThycaBot", bot=True), "self"))
         await handler(FakeMessage(22, FakeUser(BOT_UID, "ThycaBot", bot=False), "self"))
-        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        got = read_entries(settings.db_path, unread_only=False)
         assert got["entries"] == []
         assert got["latest"] == 0
 
@@ -1186,7 +1145,7 @@ async def test_realtime_reply_reference_recorded(settings, monkeypatch):
         ref = SimpleNamespace(message_id=31)
         await handler(FakeMessage(32, _other(), "reply", reference=ref))
         await handler(FakeMessage(33, _other(), "top-level"))
-        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        got = read_entries(settings.db_path, unread_only=False)
         assert [(e["message_id"], e["reply_to_message_id"]) for e in got["entries"]] == [
             (32, 31),
             (33, None),
@@ -1206,7 +1165,7 @@ async def test_poll_self_and_other_bots_kept_with_true(settings, monkeypatch):
             FakeMessage(41, FakeUser(BOT_UID, "ThycaBot", bot=True), "self"),
         ]
         await tick()
-        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        got = read_entries(settings.db_path, unread_only=False)
         assert [(e["message_id"], e["actor_kind"], e["author_is_bot"]) for e in got["entries"]] == [
             (41, "self", True),  # poll keeps self, unlike realtime
             (42, "owner", False),
@@ -1225,7 +1184,7 @@ async def test_poll_reply_reference_recorded(settings, monkeypatch):
             FakeMessage(51, _other(), "reply", reference=SimpleNamespace(message_id=50)),
         ]
         await tick()
-        got = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+        got = read_entries(settings.db_path, unread_only=False)
         assert [(e["message_id"], e["reply_to_message_id"]) for e in got["entries"]] == [
             (51, 50),
             (52, None),
@@ -1314,10 +1273,104 @@ async def test_send_message_audit_is_metadata_only(settings, monkeypatch):
     ok_recs = find_audit(read_audit(settings), "send_message", True)
     assert len(ok_recs) == 1
     assert ok_recs[0]["args"]["content_len"] == len("hi SECRET_CANARY_X7")
-    assert (
-        ok_recs[0]["args"]["content_sha256"] == hashlib.sha256(b"hi SECRET_CANARY_X7").hexdigest()
-    )
+    assert "content_sha256" not in ok_recs[0]["args"]  # literal F2: no fingerprints
     assert ok_recs[0]["args"]["channel_id"] == CHANNEL_ID
+
+
+async def test_manual_send_carries_mention_guard(settings, monkeypatch):
+    """Phase 1 deliberate fix: every send passes the mention guard."""
+    channel = make_text_channel(CHANNEL_ID)
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        await call_json(mcp, "send_message", {"content": "hi"})
+    (kwargs,) = channel.sent_kwargs
+    assert kwargs.get("reference") is None
+    assert kwargs["allowed_mentions"].to_dict() == {
+        "replied_user": True,
+        "parse": ["users"],
+    }
+
+
+async def test_whoami_classifies_owner_self_other(settings, monkeypatch):
+    """Minimal payload tests for the previously untested read tools."""
+    guild = FakeGuild(
+        GUILD_ID,
+        {CHANNEL_ID: make_text_channel(CHANNEL_ID)},
+        members={
+            OWNER_UID: FakeUser(OWNER_UID, "Olivia"),
+            999: FakeUser(999, "Rando"),
+            BOT_UID: FakeUser(BOT_UID, "ThycaBot", bot=True),
+        },
+    )
+    bot = FakeBot(guild)
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        owner = await call_json(mcp, "whoami", {"uid": OWNER_UID})
+        assert owner == {"uid": OWNER_UID, "display_name": "Olivia", "kind": "owner"}
+        other = await call_json(mcp, "whoami", {"uid": 999})
+        assert other == {"uid": 999, "display_name": "Rando", "kind": "other"}
+        self = await call_json(mcp, "whoami", {"uid": BOT_UID})
+        assert self["kind"] == "self"
+
+
+async def test_guild_info_and_list_text_channels_payloads(settings, monkeypatch):
+    channel = make_text_channel(CHANNEL_ID)
+    bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}, member_count=7))
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        info = await call_json(mcp, "guild_info", {})
+        assert info == {
+            "id": GUILD_ID,
+            "name": f"guild-{GUILD_ID}",
+            "member_count": 7,
+            "text_channels": 1,
+            "voice_channels": 0,
+        }
+        channels = await call_json(mcp, "list_text_channels", {})
+        assert channels == [
+            {
+                "id": CHANNEL_ID,
+                "name": f"chan-{CHANNEL_ID}",
+                "topic": None,
+                "position": 0,
+            }
+        ]
+
+
+async def test_list_members_chunked_cache_path(settings, monkeypatch):
+    """chunked guild: member cache read, no fetch_members call."""
+    members = {
+        OWNER_UID: FakeUser(OWNER_UID, "Olivia"),
+        999: FakeUser(999, "Rando"),
+        BOT_UID: FakeUser(BOT_UID, "ThycaBot", bot=True),
+    }
+    guild = FakeGuild(
+        GUILD_ID,
+        {CHANNEL_ID: make_text_channel(CHANNEL_ID)},
+        member_count=3,
+        members=members,
+    )
+    assert guild.chunked is True  # member_count == len(cache): SDK-reachable state
+    bot = FakeBot(guild)
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        got = await call_json(mcp, "list_members", {})
+    assert [(m["uid"], m["kind"]) for m in got] == [
+        (BOT_UID, "self"),
+        (OWNER_UID, "owner"),
+        (999, "other"),
+    ]
+    # Cache path sorts ascending-by-id by design (native fetch_members
+    # yields pages reversed/descending).
+    assert all("display_name" in m for m in got)
+
+
+async def test_list_members_unchunked_fetch_path(settings, monkeypatch):
+    """Unchunked guild: REST fetch_members page instead of a partial cache."""
+    members = {OWNER_UID: FakeUser(OWNER_UID, "Olivia")}
+    guild = FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}, members=members)
+    assert guild.chunked is False  # member_count=10 > 1 cached: incomplete cache
+    bot = FakeBot(guild)
+    async with running_server(monkeypatch, settings, bot) as (mcp, ctx, _):
+        got = await call_json(mcp, "list_members", {})
+    assert got == [{"uid": OWNER_UID, "display_name": "Olivia", "kind": "owner"}]
 
 
 @pytest.mark.parametrize(
@@ -1340,28 +1393,29 @@ async def test_send_message_rejects_partial_correlation(settings, monkeypatch, e
 # --- v5 fixes: cleanup never replaces the primary outcome (finding 3) -------
 
 
-async def test_lifespan_cancel_during_login_with_cleanup_failure_stays_cancelled(
+async def test_lifespan_cancel_during_start_with_cleanup_failure_stays_cancelled(
     settings, monkeypatch
 ):
     bot = FakeBot(FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}))
-    login_entered = asyncio.Event()
+    start_entered = asyncio.Event()
 
-    async def gated_login(token):  # noqa: ARG002 - signature mirrors discord.py
-        bot.events.append("login")
-        login_entered.set()  # lifespan is now parked inside login
+    async def gated_start(token):  # noqa: ARG002 - signature mirrors discord.py
+        bot.events.append("start")
+        bot._setup = True  # mirror _async_setup_hook; gateway never dispatches READY
+        start_entered.set()  # lifespan is now parked inside start
         await asyncio.sleep(3600)
 
-    bot.login = gated_login
+    bot.start = gated_start
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     monkeypatch.setattr("server.core.Responder", FailingCloseResponder)
     mcp = create_server(settings)
 
     async def _run():
         async with mcp.settings.lifespan(mcp):
-            pass  # pragma: no cover - cancelled while logging in
+            pass  # pragma: no cover - cancelled while starting
 
     task = asyncio.create_task(_run(), name="lifespan-under-test")
-    await asyncio.wait_for(login_entered.wait(), timeout=5)
+    await asyncio.wait_for(start_entered.wait(), timeout=5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError) as excinfo:
         await task
@@ -1371,49 +1425,55 @@ async def test_lifespan_cancel_during_login_with_cleanup_failure_stays_cancelled
     assert isinstance(secondaries[0], RuntimeError)
     assert "responder close boom" in str(secondaries[0])
     assert bot.is_closed()
-    assert bot.listeners.get("on_message") == []
-    assert bot.events == ["add_listener", "login", "remove_listener", "close"]
+    assert len(bot.listeners.get("on_message") or []) == 1  # bot discarded with handler
+    assert bot.events == ["event", "start", "wait_ready", "close"]
     assert _leftover_gateway_tasks() == []
 
 
 async def test_lifespan_startup_failure_with_cleanup_failures_keeps_primary(settings, monkeypatch):
     bot = FakeBot(
         FakeGuild(GUILD_ID, {CHANNEL_ID: make_text_channel(CHANNEL_ID)}),
-        login_exc=discord.LoginFailure("bad token"),
+        start_exc=discord.LoginFailure("bad token"),
         close_exc=RuntimeError("bot close boom"),
     )
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     monkeypatch.setattr("server.core.Responder", FailingCloseResponder)
     mcp = create_server(settings)
-    with pytest.raises(discord.LoginFailure, match="bad token") as excinfo:
+    with pytest.raises(RuntimeError, match="gateway failed before ready") as excinfo:
         async with mcp.settings.lifespan(mcp):
-            pass  # pragma: no cover - login must raise first
+            pass  # pragma: no cover - start must raise first
     # Both cleanup failures retained as secondary evidence; primary intact.
     secondaries = getattr(excinfo.value, "thyca_cleanup_errors", ())
     assert [str(e) for e in secondaries] == ["responder close boom", "bot close boom"]
     assert bot.is_closed()
-    assert bot.listeners.get("on_message") == []
-    assert bot.events == ["add_listener", "login", "remove_listener", "close"]
+    assert len(bot.listeners.get("on_message") or []) == 1  # bot discarded with handler
+    assert bot.events == ["event", "start", "wait_ready", "close"]
     assert _leftover_gateway_tasks() == []
 
 
 # --- v5 fixes: teardown steps independently protected (finding 4) ------------
 
 
-async def test_lifespan_listener_removal_failure_still_tears_down(settings, monkeypatch):
+async def test_lifespan_close_failure_still_tears_down(settings, monkeypatch):
+    # A failing teardown step (bot close) never skips the rest: no gateway
+    # leaks, and BOTH state entries cleared (send sees no bot, ack sees no
+    # guard). The cleanup failure still surfaces on a clean exit.
     channel = make_text_channel(CHANNEL_ID)
-    bot = FailingRemoveListenerBot(FakeGuild(GUILD_ID, {CHANNEL_ID: channel}))
+    bot = FakeBot(
+        FakeGuild(GUILD_ID, {CHANNEL_ID: channel}),
+        close_exc=RuntimeError("close boom"),
+    )
     monkeypatch.setattr("server.core.build_bot", lambda s: bot)
     monkeypatch.setattr("server.core.Responder", RefusingGuardResponder)
     mcp = create_server(settings)
-    with pytest.raises(RuntimeError, match="remove boom"):
+    with pytest.raises(RuntimeError, match="close boom"):
         async with mcp.settings.lifespan(mcp):
             # Guard active while running: the refusing responder rejects ACK.
             with pytest.raises(ToolError, match="beyond safe prefix"):
                 await mcp.call_tool("ack_outbox", {"up_to_seq": 0})
-    # Removal failed, but every remaining step still ran: bot closed, no
-    # gateway leaks, and BOTH state entries cleared (send sees no bot, ack
-    # sees no guard). The cleanup failure still surfaces on a clean exit.
+    # Close failed, but every remaining step still ran: no gateway leaks,
+    # and BOTH state entries cleared (send sees no bot, ack sees no guard).
+    # The cleanup failure still surfaces on a clean exit.
     assert bot.is_closed()
     assert "close" in bot.events
     assert _leftover_gateway_tasks() == []

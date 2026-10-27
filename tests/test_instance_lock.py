@@ -95,9 +95,9 @@ def test_refuses_symlink_and_missing_parent(tmp_path):
         acquire_service_lock(tmp_path / "no-such-dir" / ".discord_mcp.lock")
 
 
-def test_derive_lock_path_sits_beside_delivery_state(tmp_path):
-    delivery = tmp_path / "sub" / "delivery.json"
-    assert derive_lock_path(delivery) == tmp_path / "sub" / ".discord_mcp.lock"
+def test_derive_lock_path_sits_beside_db_state(tmp_path):
+    db = tmp_path / "sub" / "state.db"
+    assert derive_lock_path(db) == tmp_path / "sub" / ".discord_mcp.lock"
 
 
 def _env_for_settings(monkeypatch, tmp_path):
@@ -105,15 +105,15 @@ def _env_for_settings(monkeypatch, tmp_path):
     monkeypatch.setenv("OWNER_UID", "300000000000000003")
     monkeypatch.setenv("GUILD_ID", "100000000000000001")
     monkeypatch.setenv("DEFAULT_CHANNEL_ID", "200000000000000002")
-    monkeypatch.setenv("DELIVERY_STATE_PATH", str(tmp_path / "delivery.json"))
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "state.db"))
 
 
 def test_main_refuses_second_instance_without_starting_server(tmp_path, monkeypatch, capsys):
     import main as main_mod
 
     _env_for_settings(monkeypatch, tmp_path)
-    (tmp_path / "delivery.json").write_text("{}", encoding="utf-8")
-    first = acquire_service_lock(derive_lock_path(tmp_path / "delivery.json"))
+    (tmp_path / "state.db").write_text("{}", encoding="utf-8")
+    first = acquire_service_lock(derive_lock_path(tmp_path / "state.db"))
     try:
 
         def _must_not_run(settings):
@@ -134,7 +134,7 @@ def test_main_exits_3_on_broken_lock_path(tmp_path, monkeypatch, capsys):
     import main as main_mod
 
     _env_for_settings(monkeypatch, tmp_path)
-    monkeypatch.setenv("DELIVERY_STATE_PATH", str(tmp_path / "no-such-dir" / "d.json"))
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "no-such-dir" / "state.db"))
 
     def _must_not_run(settings):
         raise AssertionError("server must not start on lock error")
@@ -150,7 +150,7 @@ def test_main_releases_lock_on_clean_shutdown(tmp_path, monkeypatch):
     import main as main_mod
 
     _env_for_settings(monkeypatch, tmp_path)
-    (tmp_path / "delivery.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "state.db").write_text("{}", encoding="utf-8")
 
     class _Server:
         def run(self, transport):
@@ -159,6 +159,6 @@ def test_main_releases_lock_on_clean_shutdown(tmp_path, monkeypatch):
     monkeypatch.setattr(main_mod, "create_server", lambda settings: _Server())
     main_mod.main()  # returns normally; finally releases
     # Re-acquirable immediately afterwards (no lingering hold).
-    lock = acquire_service_lock(derive_lock_path(tmp_path / "delivery.json"))
+    lock = acquire_service_lock(derive_lock_path(tmp_path / "state.db"))
     lock.release()
     assert isinstance(Path(str(lock.path)), Path)

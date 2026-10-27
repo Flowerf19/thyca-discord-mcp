@@ -1,4 +1,4 @@
-"""Scoped conversation-context collector for one approved channel (unwired slice).
+"""Scoped conversation-context collector for one approved channel.
 
 Builds one canonical snapshot (``conversation``-compatible) for the
 exact current source message plus recent same-channel context. A future
@@ -13,20 +13,17 @@ Scope contract (checked on every call, no retries, no guessing):
   ``source_messages._resolve_text_channel``): cache-first
   guild/channel lookup with one ``bot.fetch_channel`` fallback, then strict
   ``isinstance(discord.TextChannel)`` plus guild-scope ID checks. Voice and
-  stage channels, threads, and DMs are refused independent of class names
-  (all of them expose ``fetch_message``/``history``, so method presence
-  never proves text-channel scope). Every fetched source/parent/history
-  message must carry ``channel.id``/``guild.id`` equal to the approved
-  scope; every reference ``channel_id``/``guild_id`` is verified the same
-  way.
+  stage channels, threads, and DMs are refused independent of class names.
+  Every fetched source/parent/history message must carry ``channel.id``/
+  ``guild.id`` equal to the approved scope; every reference ``channel_id``/
+  ``guild_id`` is verified the same way.
 - Source proof is one native ``channel.fetch_message`` read for the EXACT
   entry MID: a strict NATIVE ``discord.NotFound`` with status 404 + code
-  10008 (``isinstance`` plus strict-int status/code; same-named spoof
-  classes are rejected) raises the authoritative
+  10008 (``source_messages.is_unknown_message``) raises the authoritative
   ``source_messages.SourceDeleted`` (re-exported here,
   same object -- the router and the existing checker catch that class).
   Every other fetch failure -- Forbidden, 5xx, timeouts, unknown-channel
-  codes, scope mismatch, malformed reads -- raises
+  codes, scope mismatch -- raises
   :class:`ContextUnavailable` and is NEVER treated as deletion.
   Cancellation propagates untouched.
 - The trusted captured ``entry`` (``channel_id``/``message_id``/
@@ -40,29 +37,29 @@ Scope contract (checked on every call, no retries, no guessing):
   page from channel creation via ``after=OLDEST_OBJECT`` and return the
   oldest-ever messages, filtered but wrong). Results are sorted ascending
   locally. Live messages newer than the source are never included. Any
-  history message with an ID ``>=`` source, a duplicate ID, a scope
-  mismatch, or a malformed author/body/timestamp fails
-  :class:`ContextUnavailable` instead of being skipped.
+  history message with an ID ``>=`` source, a duplicate ID, or a scope
+  mismatch fails :class:`ContextUnavailable` instead of being skipped.
 - The current exact reply parent (``message.reference``) is mandatory when
   it is same-channel and visible: it is reused from history when present,
-  otherwise fetched once via ``channel.fetch_message``. A strict
-  404/10008 parent stays explicitly ``missing`` (``reply_to`` preserved,
-  parent absent); permission/network/unknown-channel parent failures raise
-  :class:`ContextUnavailable` (never pretend deleted). A cross-channel
-  reference is never fetched from another channel: ``reply_to`` is
-  preserved as missing. Same-channel parent IDs must precede the child
+  otherwise taken from the resolved payload (``reference.resolved``) or
+  fetched once via ``channel.fetch_message`` when the payload carries no
+  resolved message. A strict 404/10008 parent stays explicitly ``missing``
+  (``reply_to`` preserved, parent absent); permission/network/unknown-channel
+  parent failures raise :class:`ContextUnavailable` (never pretend deleted).
+  A cross-channel reference is never fetched from another channel: ``reply_to``
+  is preserved as missing. Same-channel parent IDs must precede the child
   (``parent < child``); self/future links fail instead of being guessed.
 - Display names are the actual SDK ``author.display_name`` per sender
-  (newest message wins on rename); they never authenticate. No member API
-  fetch is ever called (no ``fetch_member``/``fetch_user``). When
-  ``owner_uid``/``bot_uid`` sent no message in the window, the collector
-  uses the sync cache (``guild.get_member`` then ``bot.get_user``); for the
-  bot itself it then uses the already-available ``bot.user.display_name``
-  (no extra API, no profile read, no guess) before falling back to an
-  explicit ``uid-<uid>`` placeholder that never claims owner auth.
+  (newest message wins on rename); they never authenticate. The snapshot
+  uses the sync cache-only helper (``bot.cached_display_name``: guild
+  member cache, then user cache, then the already-available
+  ``bot.user.display_name``); no member API fetch is ever called. When
+  ``owner_uid``/``bot_uid`` sent no message in the window, the helper
+  result is used before falling back to an explicit ``uid-<uid>``
+  placeholder that never claims owner auth.
 - Timestamps are the native ``created_at.isoformat()`` per message,
-  preserved exactly; a missing/empty/non-string timestamp fails instead of
-  being invented. All chosen bodies are complete (never truncated).
+  preserved exactly (always a datetime on SDK objects). All chosen bodies
+  are complete (never truncated).
 
 Selection policy (explicit, not truncating supplied state):
 - Mandatory: the source plus the visible exact same-channel parent (when
@@ -107,17 +104,16 @@ from typing import Any
 
 import discord
 
-from bot import get_scoped_guild
+from bot import cached_display_name, get_scoped_guild
 from conversation import ConversationError, project_conversation_state
-from source_messages import SourceDeleted, _resolve_text_channel
+from source_messages import SourceDeleted, _resolve_text_channel, is_unknown_message
 from thyca import ThycaPromptError, build_conversation_prompt
+from validate import is_strict_int as _is_strict_int
+from validate import is_strict_positive_int as _is_strict_positive_int
 
 MAX_MESSAGES_LIMIT = 20
 FIT_NONCE = "f" * 32
 FIT_HASH = "f" * 64
-
-_UNKNOWN_MESSAGE_CODE = 10008
-_NOT_FOUND_STATUS = 404
 
 __all__ = [
     "FIT_HASH",
@@ -137,27 +133,6 @@ class ContextUnavailable(ValueError):
 # ``SourceDeleted`` is intentionally NOT redeclared here: the name above is the
 # authoritative ``source_messages.SourceDeleted`` object,
 # re-exported so the router and the existing checker catch the same class.
-
-
-def _is_strict_positive_int(value: Any) -> bool:
-    return type(value) is int and value > 0
-
-
-def _is_not_found_deleted(exc: BaseException) -> bool:
-    """Strict native deletion check: real ``discord.NotFound`` only.
-
-    True only for an actual ``discord.NotFound`` instance with int status 404
-    and int code 10008. Same-named spoof classes are rejected; bool
-    status/code never count (``type(x) is int``).
-    """
-    if not isinstance(exc, discord.NotFound):
-        return False
-    return (
-        type(exc.status) is int
-        and exc.status == _NOT_FOUND_STATUS
-        and type(exc.code) is int
-        and exc.code == _UNKNOWN_MESSAGE_CODE
-    )
 
 
 def _placeholder_name(uid: int) -> str:
@@ -186,7 +161,7 @@ def _validate_builder_ids(
         raise ValueError("context collector requires a strict positive channel_id")
     if not _is_strict_positive_int(owner_uid):
         raise ValueError("context collector requires a strict positive owner_uid")
-    if type(max_messages) is not int or not 1 <= max_messages <= MAX_MESSAGES_LIMIT:
+    if not _is_strict_int(max_messages) or not 1 <= max_messages <= MAX_MESSAGES_LIMIT:
         raise ValueError(f"context collector requires max_messages 1..{MAX_MESSAGES_LIMIT}")
 
 
@@ -207,18 +182,16 @@ def _validate_entry(entry: Any, channel_id: int) -> tuple[int, int, str]:
     return int(entry["message_id"]), int(entry["author_uid"]), content
 
 
-def _resolve_bot_uid(bot: Any) -> int:
-    try:
-        user = getattr(bot, "user", None)
-        uid = getattr(user, "id", None)
-    except Exception:
+def _resolve_bot_uid(bot: discord.Client) -> int:
+    user = bot.user
+    if user is None:
         raise ContextUnavailable("context bot not ready") from None
-    if not _is_strict_positive_int(uid):
-        raise ContextUnavailable("context bot not ready") from None
-    return int(uid)
+    return user.id
 
 
-async def _resolve_channel(bot: Any, guild_id: int, channel_id: int) -> tuple[Any, Any]:
+async def _resolve_channel(
+    bot: discord.Client, guild_id: int, channel_id: int
+) -> tuple[discord.Guild, discord.TextChannel]:
     """Resolve the approved guild/channel via the existing scoped helpers.
 
     Uses ``get_scoped_guild`` + ``source_messages._resolve_text_channel``
@@ -229,12 +202,9 @@ async def _resolve_channel(bot: Any, guild_id: int, channel_id: int) -> tuple[An
     """
     try:
         guild = get_scoped_guild(bot, guild_id)
-        guild_ok = getattr(guild, "id", None) == guild_id
     except asyncio.CancelledError:
         raise
     except Exception:
-        raise ContextUnavailable("context guild unavailable") from None
-    if not guild_ok:
         raise ContextUnavailable("context guild unavailable") from None
     try:
         channel = await _resolve_text_channel(bot, guild, channel_id)
@@ -245,142 +215,73 @@ async def _resolve_channel(bot: Any, guild_id: int, channel_id: int) -> tuple[An
     return guild, channel
 
 
-def _message_scope(message: Any, guild_id: int, channel_id: int) -> tuple[int, int, str, str]:
-    """Validate scope/ids/body/name; return (mid, author_uid, content, name)."""
-    try:
-        mid = getattr(message, "id", None)
-        channel = getattr(message, "channel", None)
-        guild = getattr(message, "guild", None)
-        cid = getattr(channel, "id", None) if channel is not None else None
-        gid = getattr(guild, "id", None) if guild is not None else None
-        author = getattr(message, "author", None)
-        uid = getattr(author, "id", None) if author is not None else None
-        name = getattr(author, "display_name", None) if author is not None else None
-        content = getattr(message, "content", None)
-    except Exception:
-        raise ContextUnavailable("context message unreadable") from None
-    if not _is_strict_positive_int(mid):
-        raise ContextUnavailable("context message has invalid id") from None
-    if cid != channel_id or gid != guild_id:
+def _message_scope(
+    message: discord.Message, guild_id: int, channel_id: int
+) -> tuple[int, int, str, str]:
+    """Check scope; return (mid, author_uid, content, display_name).
+
+    Out-of-scope (wrong channel, missing/different guild) fails; SDK-typed
+    fields are read directly (``Message`` always carries int ids, a str
+    body, and a display name).
+    """
+    if message.channel.id != channel_id or message.guild is None or message.guild.id != guild_id:
         raise ContextUnavailable("context message out of scope") from None
-    if not _is_strict_positive_int(uid):
-        raise ContextUnavailable("context message has invalid author") from None
-    if not isinstance(content, str):
-        raise ContextUnavailable("context message has invalid content") from None
-    if not isinstance(name, str) or name == "":
-        raise ContextUnavailable("context message has invalid name") from None
-    return int(mid), int(uid), content, name
+    return message.id, message.author.id, message.content, message.author.display_name
 
 
-def _message_timestamp(message: Any) -> str:
-    try:
-        created = getattr(message, "created_at", None)
-        iso = created.isoformat() if callable(getattr(created, "isoformat", None)) else None
-    except Exception:
-        raise ContextUnavailable("context message has invalid timestamp") from None
-    if not isinstance(iso, str) or iso == "":
-        raise ContextUnavailable("context message has invalid timestamp") from None
-    return iso
+def _message_timestamp(message: discord.Message) -> str:
+    # ``created_at`` is a snowflake-derived datetime on every SDK message.
+    return message.created_at.isoformat()
 
 
-def _reference_parent(message: Any, channel_id: int, guild_id: int) -> tuple[int | None, bool]:
+def _reference_parent(
+    message: discord.Message, channel_id: int, guild_id: int
+) -> tuple[int | None, bool]:
     """Return (parent_mid or None, is_cross_channel) for ``message.reference``.
 
     ``None`` means no reply link (absent reference or null message_id, as in
-    system messages). A present link must carry strict positive
-    ``message_id``/``channel_id``; any other shape fails instead of being
-    guessed. Cross-channel (or cross-guild) links are reported as
+    system messages). Cross-channel (or cross-guild) links are reported as
     ``(mid, True)`` and must never be fetched from another channel.
     """
-    try:
-        ref = getattr(message, "reference", None)
-    except Exception:
-        raise ContextUnavailable("context reference unreadable") from None
+    ref = message.reference
     if ref is None:
         return None, False
-    try:
-        parent_mid = getattr(ref, "message_id", None)
-    except Exception:
-        raise ContextUnavailable("context reference unreadable") from None
+    parent_mid = ref.message_id
     if parent_mid is None:
         return None, False
-    if not _is_strict_positive_int(parent_mid):
-        raise ContextUnavailable("context reference has invalid id") from None
-    try:
-        ref_channel = getattr(ref, "channel_id", None)
-        ref_guild = getattr(ref, "guild_id", None)
-    except Exception:
-        raise ContextUnavailable("context reference unreadable") from None
-    if not _is_strict_positive_int(ref_channel):
-        raise ContextUnavailable("context reference has invalid channel") from None
-    if ref_guild is not None and not _is_strict_positive_int(ref_guild):
-        raise ContextUnavailable("context reference has invalid guild") from None
-    parent_mid = int(parent_mid)
-    if int(ref_channel) != channel_id:
+    if ref.channel_id != channel_id:
         return parent_mid, True
-    if ref_guild is not None and int(ref_guild) != guild_id:
+    if ref.guild_id is not None and ref.guild_id != guild_id:
         return parent_mid, True
     return parent_mid, False
 
 
-def _cached_display_name(guild: Any, bot: Any, uid: int, bot_uid: int) -> str | None:
-    """Best-effort known name; None when unavailable (placeholder wins).
-
-    Sync cache only (``guild.get_member`` then ``bot.get_user``); for the
-    bot's own UID the already-available ``bot.user.display_name`` is used
-    before giving up (no extra API, no profile read). All lookups are
-    bounded try/except; names never authenticate.
-    """
-    try:
-        getter = getattr(guild, "get_member", None)
-        member = getter(uid) if callable(getter) else None
-        name = getattr(member, "display_name", None) if member is not None else None
-        if isinstance(name, str) and name != "":
-            return name
-    except Exception:
-        pass
-    try:
-        getter = getattr(bot, "get_user", None)
-        user = getter(uid) if callable(getter) else None
-        name = getattr(user, "display_name", None) if user is not None else None
-        if isinstance(name, str) and name != "":
-            return name
-    except Exception:
-        pass
-    if uid == bot_uid:
-        try:
-            self_name = getattr(getattr(bot, "user", None), "display_name", None)
-            if isinstance(self_name, str) and self_name != "":
-                return self_name
-        except Exception:
-            pass
-    return None
-
-
-async def _fetch_source(channel: Any, mid: int) -> Any:
+async def _fetch_source(channel: discord.TextChannel, mid: int) -> discord.Message:
     try:
         return await channel.fetch_message(mid)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        if _is_not_found_deleted(exc):
+        if is_unknown_message(exc):
             raise SourceDeleted("source message deleted") from None
         raise ContextUnavailable("source message unavailable") from None
 
 
-async def _fetch_parent(channel: Any, parent_mid: int) -> Any | None:
+async def _fetch_parent(channel: discord.TextChannel, parent_mid: int) -> discord.Message | None:
     """Fetch the same-channel parent; strict 404/10008 means missing (None)."""
     try:
         return await channel.fetch_message(parent_mid)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        if _is_not_found_deleted(exc):
+        if is_unknown_message(exc):
             return None
         raise ContextUnavailable("context parent unavailable") from None
 
 
-async def _collect_history(channel: Any, source_message: Any, limit: int) -> list[Any]:
+async def _collect_history(
+    channel: discord.TextChannel, source_message: discord.Message, limit: int
+) -> list[discord.Message]:
     if limit <= 0:
         return []
     try:
@@ -389,7 +290,7 @@ async def _collect_history(channel: Any, source_message: Any, limit: int) -> lis
         raise
     except Exception:
         raise ContextUnavailable("context history unavailable") from None
-    collected: list[Any] = []
+    collected: list[discord.Message] = []
     try:
         async for message in iterator:
             collected.append(message)
@@ -401,7 +302,7 @@ async def _collect_history(channel: Any, source_message: Any, limit: int) -> lis
 
 
 def build_context_collector(
-    bot: Any,
+    bot: discord.Client,
     guild_id: int,
     channel_id: int,
     owner_uid: int,
@@ -423,11 +324,10 @@ def build_context_collector(
     carry fixed strings (never raw bodies). Cancellation propagates
     untouched. Exactly one history read plus at most two exact
     ``fetch_message`` reads (source + same-channel parent when outside the
-    window); no retries, no member fetches, no paid calls.
+    window and absent from the resolved payload); no retries, no member
+    fetches, no paid calls.
     """
     _validate_builder_ids(guild_id, channel_id, owner_uid, max_messages)
-    if bot is None or not callable(getattr(bot, "get_guild", None)):
-        raise ValueError("context collector requires a bot with get_guild")
 
     async def collect(entry: Mapping[str, Any]) -> dict[str, Any]:
         mid, author_uid, content = _validate_entry(entry, channel_id)
@@ -453,10 +353,8 @@ def build_context_collector(
                 raise ContextUnavailable("context parent order invalid") from None
 
         history_messages = await _collect_history(channel, source_message, max_messages - 1)
-        if len(history_messages) > max(0, max_messages - 1):
-            raise ContextUnavailable("context history exceeds limit") from None
 
-        # Verify every history message; reject future/dup/scope/malformed.
+        # Verify every history message; reject future/dup/scope.
         seen: dict[int, dict[str, Any]] = {}
         for raw in history_messages:
             hid, huid, htext, hname = _message_scope(raw, guild_id, channel_id)
@@ -484,15 +382,19 @@ def build_context_collector(
             if source_parent in seen:
                 parent_visible = True
             else:
-                fetched = await _fetch_parent(channel, source_parent)
-                if fetched is not None:
-                    pid, puid, ptext, pname = _message_scope(fetched, guild_id, channel_id)
+                resolved = (
+                    source_message.reference.resolved
+                    if source_message.reference is not None
+                    else None
+                )
+                if isinstance(resolved, discord.Message):
+                    pid, puid, ptext, pname = _message_scope(resolved, guild_id, channel_id)
                     if pid != source_parent:
                         raise ContextUnavailable("context parent id mismatch") from None
                     if pid >= mid:
                         raise ContextUnavailable("context parent order invalid") from None
-                    pts = _message_timestamp(fetched)
-                    pparent, pcross = _reference_parent(fetched, channel_id, guild_id)
+                    pts = _message_timestamp(resolved)
+                    pparent, pcross = _reference_parent(resolved, channel_id, guild_id)
                     if pparent is not None and not pcross and pparent >= pid:
                         raise ContextUnavailable("context parent order invalid") from None
                     parent_extra = {
@@ -505,7 +407,29 @@ def build_context_collector(
                         "cross": pcross,
                     }
                     parent_visible = True
-                # else: strict-deleted parent stays missing (reply_to kept).
+                elif resolved is None:
+                    fetched = await _fetch_parent(channel, source_parent)
+                    if fetched is not None:
+                        pid, puid, ptext, pname = _message_scope(fetched, guild_id, channel_id)
+                        if pid != source_parent:
+                            raise ContextUnavailable("context parent id mismatch") from None
+                        if pid >= mid:
+                            raise ContextUnavailable("context parent order invalid") from None
+                        pts = _message_timestamp(fetched)
+                        pparent, pcross = _reference_parent(fetched, channel_id, guild_id)
+                        if pparent is not None and not pcross and pparent >= pid:
+                            raise ContextUnavailable("context parent order invalid") from None
+                        parent_extra = {
+                            "id": pid,
+                            "sender_uid": puid,
+                            "text": ptext,
+                            "name": pname,
+                            "timestamp": pts,
+                            "reply_to": pparent,
+                            "cross": pcross,
+                        }
+                        parent_visible = True
+                # else: DeletedReferencedMessage stays missing (reply_to kept).
 
         # Optional pool: history (ascending) plus the outside-window parent.
         # Mandatory parent displaces the oldest optional when over the cap.
@@ -549,7 +473,7 @@ def build_context_collector(
                 if uid in newest_name:
                     parts.append({"uid": str(uid), "display_name": newest_name[uid]})
                     continue
-                cached = _cached_display_name(guild, bot, uid, bot_uid)
+                cached = cached_display_name(bot, guild, uid)
                 parts.append({"uid": str(uid), "display_name": cached or _placeholder_name(uid)})
             return parts
 

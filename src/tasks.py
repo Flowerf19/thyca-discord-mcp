@@ -29,7 +29,6 @@ class TaskInfo:
 class TaskRegistry:
     def __init__(self) -> None:
         self._loops: dict[str, tasks.Loop] = {}
-        self._intervals: dict[str, float] = {}
         self._protected: dict[str, bool] = {}
 
     def register(
@@ -41,7 +40,6 @@ class TaskRegistry:
             raise KeyError(f"task already registered: {name}")
         loop = tasks.loop(seconds=seconds)(coro_fn)
         self._loops[name] = loop
-        self._intervals[name] = seconds
         self._protected[name] = protected
         return loop
 
@@ -90,14 +88,17 @@ class TaskRegistry:
         """
         await self.stop(name, allow_protected=allow_protected)
         del self._loops[name]
-        del self._intervals[name]
         del self._protected[name]
 
     def status(self, name: str) -> TaskInfo:
         loop = self._get(name)
+        # Registry always passes seconds=, so Loop.seconds is never None
+        # (it is None only for explicit-time loops, which never occur here).
+        seconds = loop.seconds
+        assert seconds is not None
         return TaskInfo(
             name=name,
-            interval_seconds=self._intervals[name],
+            interval_seconds=seconds,
             running=loop.is_running(),
             current_loop=loop.current_loop,
         )

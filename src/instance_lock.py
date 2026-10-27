@@ -1,24 +1,10 @@
-"""Single-instance guard: one writer per delivery state directory.
+"""Single-instance guard: one live holder via a flock lock file.
 
-The MCP server owns its journal files (delivery/outbox/ledger) under
-single-process / single-loop discipline. A second OS process (detached
-daemon + MCP-client auto-spawn + manual terminal run) would corrupt that
-discipline: Discord double-login flapping on one token, journal
-read-modify-write races, duplicate native POSTs, crossed receipts. This
-module enforces one live holder with an advisory ``fcntl.flock``
-exclusive lock held for the whole process lifetime:
-
-- ``acquire_service_lock`` opens (creating 0600) a lock file beside the
-  delivery state and takes ``LOCK_EX | LOCK_NB``. A second holder fails
-  IMMEDIATELY with :class:`InstanceLockBusy` (never waits, never runs
-  degraded) carrying best-effort holder diagnostics (pid + start time).
-- Stale-safe by construction: the kernel releases ``flock`` on ANY
-  process death (crash, SIGKILL, power loss), so a dead holder never
-  blocks the next start. The PID recorded in the file is DIAGNOSTIC
-  ONLY -- lock decisions never consult it.
-- No work happens on import. No network, no clock reads except the
-  holder's own start timestamp. Unix-only (``fcntl``), matching the
-  existing ``O_DIRECTORY`` store code.
+One OS process holds an advisory exclusive lock beside the SQLite store
+for its whole lifetime; a second starter fails immediately with
+:class:`InstanceLockBusy` (never waits). Stale-safe: the kernel releases
+flock on ANY process death. The file payload (PID + start time) is
+diagnostic only; busy messages carry path + PID. Unix-only (fcntl).
 """
 
 from __future__ import annotations
@@ -28,10 +14,8 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 LOCK_BASENAME = ".discord_mcp.lock"
-_CMD_MAX = 200
 
 
 class InstanceLockError(OSError):
@@ -49,37 +33,21 @@ class InstanceLockBusy(InstanceLockError):
         )
 
 
-def derive_lock_path(delivery_state_path: str | Path) -> Path:
-    """Return the lock file beside the delivery state (fixed basename)."""
-    return Path(delivery_state_path).parent / LOCK_BASENAME
+def derive_lock_path(db_path: str | Path) -> Path:
+    """Lock file beside the SQLite store (fixed basename)."""
+    return Path(db_path).parent / LOCK_BASENAME
 
 
 def _describe_holder(raw: bytes) -> str:
-    """Best-effort holder diagnostics; never raises, never dumps secrets."""
+    """Best-effort holder PID; never raises, never dumps secrets."""
     try:
         data = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         return "holder info unreadable"
-    if not isinstance(data, dict):
-        return "holder info unreadable"
-    pid = data.get("pid")
-    started = data.get("started_at")
+    pid = data.get("pid") if isinstance(data, dict) else None
     if not isinstance(pid, int) or pid <= 0:
         return "holder info unreadable"
-    if not isinstance(started, str) or not started or len(started) > 64:
-        return f"pid {pid}"
-    return f"pid {pid} since {started}"
-
-
-def _current_cmd() -> str:
-    """Bounded command description for holder diagnostics (no secrets read)."""
-    import sys
-
-    try:
-        parts = [str(a) for a in sys.argv[:4]]
-    except Exception:
-        return ""
-    return " ".join(parts)[:_CMD_MAX]
+    return f"pid {pid}"
 
 
 class ServiceLock:
@@ -95,7 +63,7 @@ class ServiceLock:
         return self._path
 
     def release(self) -> None:
-        """Release the lock (idempotent; also runs via __exit__/__del__)."""
+        """Release the lock (idempotent; also runs via __exit__)."""
         if self._closed:
             return
         self._closed = True
@@ -107,7 +75,7 @@ class ServiceLock:
     def __enter__(self) -> ServiceLock:
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.release()
 
     def __del__(self) -> None:  # pragma: no cover - interpreter teardown
@@ -118,14 +86,7 @@ class ServiceLock:
 
 
 def acquire_service_lock(lock_path: str | Path) -> ServiceLock:
-    """Take the exclusive service lock or raise :class:`InstanceLockBusy`.
-
-    Refuses symlink lock paths and missing parents (no directory
-    creation). Creates a missing lock file 0600. On contention reads
-    the holder's diagnostics best-effort for the error message. The
-    returned handle MUST stay referenced (and unreleased) for the whole
-    process lifetime; dropping it releases the lock.
-    """
+    """Take the exclusive lock or raise :class:`InstanceLockBusy`."""
     path = Path(lock_path)
     if path.is_symlink():
         raise InstanceLockError(f"service lock {path} must not be a symlink")
@@ -158,12 +119,8 @@ def acquire_service_lock(lock_path: str | Path) -> ServiceLock:
         raise InstanceLockError(f"service lock {path} failed") from exc
     try:
         payload = json.dumps(
-            {
-                "pid": os.getpid(),
-                "started_at": datetime.now(timezone.utc).isoformat(),
-                "cmd": _current_cmd(),
-            }
-        ).encode("utf-8")
+            {"pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat()}
+        ).encode()
         os.ftruncate(fd, 0)
         os.lseek(fd, 0, os.SEEK_SET)
         view = memoryview(payload)

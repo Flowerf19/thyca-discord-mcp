@@ -1,8 +1,7 @@
 # Conversation context and memory
 
-This document describes the implemented Modum source, not the currently running
-backend. The Jev integration is source-reviewed; deployment and the original V5
-live-failure acceptance remain separate. It does not authorize a start, restart,
+This document describes the current simplified source (one SQLite store,
+best-effort delivery). It does not authorize a start, restart,
 paid call, state reset, or ACK of an unresolved job.
 
 ## Two different layers
@@ -15,10 +14,10 @@ paid call, state reset, or ACK of an unresolved job.
 The Discord snapshot is not a replacement for native memory. All Discord activity
 flows into the target bot's fixed DM session (`TARGET_BOT_ID`, default
 `march7th`), resolved live every tick — not a new session per message or
-person. Adoption is automatic and drain-gated (every delivery job must be
-safe-terminal or queued first); a blocked adoption still reconciles the head
-blocker on the old session each tick, while an uncertain job halts adoption
-until the operator resolves it. Old sessions are never deleted.
+person. Adoption is automatic and drain-gated (no `submitted`/`sent` job may be
+mid-flight); a blocked tick still runs one reconcile-only pass for the head
+blocker on the old session and retries adoption next tick. Old sessions are
+never deleted; every adopted day is kept as provenance in the `sessions` table.
 The mutable session title is cosmetic; the audit label is the target bot id.
 Thyca controls its own history/context selection. The Discord message-count limit
 does not limit the native agent's entire context or guarantee that all native
@@ -28,13 +27,13 @@ memory isolation.
 ## End-to-end flow
 
 ```text
-Captured event -> FIFO delivery job -> source/SID checks
+Captured event -> FIFO job -> source/SID checks
                                       |
                                       v
                      Collect, validate and fit a snapshot
                                       |
                                       v
-                  Durable Jev classification or exact cache hit
+                  Jev classification or exact decided-cache hit
                                       |
                                       v
                    Recheck source and snapshot fingerprint
@@ -42,24 +41,26 @@ Captured event -> FIFO delivery job -> source/SID checks
                    +------------------+------------------+
                    |                  |                  |
                 observe            respond          need_context
+                   |                  |            (legacy stored
+             No native POST    Frozen native frame   decisions only)
                    |                  |                  |
-             No native POST    Frozen native frame   Frozen native frame
-                   |                  |                  |
-             Durable proof     Thyca agent MCP send  Scoped read/clarify
-                   |                  |              or explicit no-reply
+             Durable no-send   Thyca agent MCP send  Scoped read/clarify
+             outcome           or explicit no-reply  or explicit no-reply
                    +------------------+------------------+
                                       |
-                         Verified terminal outcome
+                           Terminal job outcome
                                       |
                             Safe-prefix outbox ACK
 ```
 
-Jev decides participation (`respond`/`observe` from current prompts; stored
-`need_context` decisions still execute for delivery compat); it does not
-generate or send Discord replies. The
-native agent owns MCP sends. Classification and delivery records bind the chosen
-route to the exact source and context; receipt absence alone never proves that
-no reply was needed.
+Jev decides participation (`respond`/`observe`; the model is never asked for
+`need_context` anymore, though stored legacy `need_context` decisions still
+execute); it does not generate or send Discord replies. The
+native agent owns MCP sends. Classification decisions and job rows bind the chosen
+route to the exact source and context; a `pending` Jev row found on a later
+tick is an unknown outcome — it gets exactly ONE retry when `attempts < 2`
+(fresh attempt id, one more paid call), and resolves terminally as `observe`
+at `attempts == 2` (see below).
 
 ## Canonical snapshot
 
@@ -145,10 +146,17 @@ ceiling, not a guarantee.
 ## Freshness, caching, and context changes
 
 The selected snapshot is detached from mutable caller data and fingerprinted
-with SHA-256 over its canonical JSON. The classification ledger persists a
-`started` attempt before awaiting the provider, then records the decision and
-reported usage. The delivery journal binds the decision's context fingerprint,
-attempt ID, model, and participation route.
+over its canonical JSON. Before the paid call the responder inserts a `pending`
+Jev row (attempts = 1); after the call it resolves the row to `decided` with
+the validated decision and reported usage. A `pending` row found on a later
+tick means the outcome — and whether money was spent — is unknown: with
+`attempts < 2` the row gets exactly ONE retry (attempts bumped to 2 with a
+fresh attempt id, one more paid call); a still-unknown outcome at
+`attempts == 2` resolves terminally as `observe` — a synthetic owner-ordered
+observe stored as `decided` with the retry attempt's usage/cost (never a third
+paid call for that source). A live `failed_unknown` (e.g. provider timeout)
+gets no retry. Fingerprint/author drift never re-pays: the paid retry only
+runs on an exact fingerprint match.
 
 After classification, the responder checks the source again and recollects the
 context. The refreshed fingerprint and SDK source binding must still match the
@@ -157,15 +165,15 @@ it does not send a stale decision with newly substituted context.
 
 An exact decided cache hit for the same source, author, and fingerprint makes no
 new provider call. A changed fingerprint or non-decided existing attempt is not
-a reason for automatic rebilling. Cancellation/unknown billing also prevents
-blind retry. No job, ledger, or native history is deleted to resolve a mismatch.
+a reason for automatic rebilling. No job or native history is deleted to resolve
+a mismatch.
 
 ## When Jev needs more context
 
 | Route | Behavior |
 |---|---|
-| `respond` | Render the frozen snapshot into the current daily native session; the agent generates a threaded, correlated reply through its own MCP `send_message`. |
-| `observe` | Record a positive durable Jev no-send outcome, without a native POST. It becomes eligible for safe-prefix ACK only through the delivery guards. |
+| `respond` | Render the frozen snapshot into the target bot's fixed DM session; the agent generates a threaded, correlated reply through its own MCP `send_message`. |
+| `observe` | Record a durable Jev no-send outcome, without a native POST. It becomes eligible for safe-prefix ACK through the worker guards. |
 | `need_context` | Stored-decision compat only (no longer emitted): render the same frozen snapshot; the agent may read more scoped context, ask for clarification, or explicitly declare that no reply is needed. |
 
 `read_context` is a read-only MCP tool for an eligible correlated turn. It reads
@@ -174,16 +182,14 @@ the configured channel. Its result is additional **Thyca** context; it is not
 automatically fed back into Jev or used to replace the classified snapshot.
 
 When no reply is needed, `record_no_reply` accepts only `no_reply_needed` or
-`missing_context`. The declaration is nonterminal: the worker must verify the
-matching native SID, turn, first-user input fingerprint, declaration/result
-correlation, reason, error-free trace, and zero sends before completing an
-`observed` outcome. No receipts by itself is not proof. Tool signatures and
+`missing_context` and closes the job `done` (`no_reply`) AT TOOL TIME — no
+worker proof pass. Tool signatures and
 bounds are documented in [TOOLS.md](TOOLS.md).
 
-A source proven deleted before any send evidence may take the guarded
-`source_deleted` skip. It stops all further replies for that source, including
-plain/unthreaded fallback. Existing send evidence or an uncertain outcome is
-not retroactively converted into a no-reply proof.
+A source proven deleted with zero sends takes the durable
+`skipped`/`source_deleted` path. It stops all further replies for that source,
+including plain/unthreaded fallback. Existing send evidence refuses a no-reply
+declaration; a delete discovered after sends fails the job.
 
 ## Privacy and storage boundaries
 
@@ -198,11 +204,12 @@ not retroactively converted into a no-reply proof.
   sender authentication or permission to export the profile. The auto-reply
   frame forbids manual profile/file access and disclosure of owner-private data
   to non-owner senders. This is agent policy, not a per-user sandbox.
-- The Jev ledger stores decision/accounting metadata and a fingerprint, not raw
-  snapshots or message bodies. Delivery proof stores submitted-input hashes and
-  lengths. The existing outbox and native session history remain separate
-  stores; metadata-only ledgers do not erase those stores or promise provider
-  retention behavior.
+- The Jev ledger is the `jev_decisions` table inside `state.db`: decision/
+  accounting metadata and a context fingerprint, not raw snapshots or message
+  bodies. Job rows carry the serving native SID; per-chunk sends live in the
+  `sends` table. `state.db` (plus `-wal`/`-shm` sidecars) is the only state
+  store; `audit.jsonl` stays an append-only text log whose fixed allowlist
+  carries no content, no `job_ref`, and no hashes.
 - `job_ref` correlates a delivery turn; it is not caller authentication. Shared
   MCP access does not provide a per-turn caller ACL or exactly-once delivery.
 
@@ -212,17 +219,17 @@ not retroactively converted into a no-reply proof.
 |---|---|---|
 | `CONVERSATION_MAX_MESSAGES` | `20`, strict integer `1..20` | Maximum total selected messages; mandatory parent and fit rules still apply. |
 | `TYPESAFE_API_KEY` | Required for the real adapter; lazy secret | SDK authentication, never included as a context field or logged. |
-| `JEV_STATE_PATH` | `jev_state.json` beside the delivery state | Private metadata-only classification ledger. |
+| `DB_PATH` | `state.db` under the project root | The only state store (outbox, jobs, Jev decisions, sessions, cursors). Must differ from `AUDIT_PATH`. |
 | `TARGET_BOT_ID` | `march7th`; required, must match bot-id grammar | Bot whose fixed DM session receives auto-reply turns; resolved live every tick. |
 
 Per-call Jev spend has no daily stop (removed by user order); per-day cost is
 reported in the ledger summary for observability only.
 
 The 20-message default was assistant-selected under the user's
-delegation, not a number personally chosen by the user. Unknown/started billing
-blocks new paid attempts across restart/day rollover; exact decided cache hits
-remain possible. Missing/replaced activated ledger identity fails closed without
-reset or rebinding. See [the example configuration](../.env.example) and
+delegation, not a number personally chosen by the user. Unknown billing
+(`pending`/`failed_unknown` anywhere in the table) GLOBALLY blocks all new
+paid calls (`jev_unknown_blocked`) until resolved — cached `decided` rows
+still return; there is no per-source allowlist. See [the example configuration](../.env.example) and
 [README.md](../README.md) for setup and startup restrictions.
 
 ## Implementation and checks
@@ -232,9 +239,9 @@ reset or rebinding. See [the example configuration](../.env.example) and
 | Canonical projection and reply status | [`conversation.py`](../src/conversation.py) |
 | Scoped collection, mandatory parent, fit, fingerprint | [`context.py`](../src/context.py) |
 | Jev participation adapter | [`jev.py`](../src/jev.py) |
-| Durable classification/cache/accounting | [`participation/`](../src/participation/ledger.py) |
-| Prepaid/postpaid guards and routing | [`responder/`](../src/responder/core.py) |
-| Target-bot DM adoption (drain gate, reconcile pass, lazy create) | [`sessions.py`](../src/sessions.py) (SID/day/history validation), [`responder/core.py`](../src/responder/core.py) |
+| Durable classification/cache/accounting | [`participation/ledger.py`](../src/participation/ledger.py) over the `jev_decisions` table in [`store.py`](../src/store.py) |
+| Prepaid/postpaid guards and routing | [`responder/`](../src/responder/core.py), [`responder/submit.py`](../src/responder/submit.py) |
+| Target-bot DM adoption (drain gate, reconcile pass, provenance) | [`responder/core.py`](../src/responder/core.py), `sessions` table in [`store.py`](../src/store.py); native SID/day validation at the Thyca boundary in [`thyca.py`](../src/thyca.py) |
 | Trusted frame and untrusted JSON rendering | [`thyca.py`](../src/thyca.py) |
 | MCP context/declaration tools | [`server/`](../src/server/core.py), [tool contracts](TOOLS.md) |
 
@@ -242,46 +249,33 @@ Relevant source tests run offline with fake identities/providers and owned TMP
 state; synthetic local HTTP loopback is allowed:
 
 ```bash
-uv run --offline pytest -q tests/test_conversation.py tests/test_context.py \
+uv run pytest -q tests/test_conversation.py tests/test_context.py \
   tests/test_thyca_prompt.py tests/test_jev_routing.py \
-  tests/test_observation_delivery.py tests/test_observation_trace.py \
-  tests/test_observation_server.py tests/test_daily_session.py
+  tests/test_observation_server.py tests/test_server_responder.py \
+  tests/test_store.py tests/test_participation.py
 ```
 
 These checks cover selection, reply relations, fit, identity binding, changed
-context/cache holds, routing, and positive no-reply proof. They do not establish
-live-channel quality, current production activation, provider billing caps, or
-atomic Discord/journal transactions. Existing uncertain jobs stay unresolved
-unless separately reconciled with evidence and explicit authorization.
+context/cache holds, routing, and the terminal no-reply path. They do not establish
+live-channel quality, current production activation, or provider billing caps.
 
 ## Target-bot DM adoption recovery
 
 Adoption failures are loud and manual-safe (no silent resume, no auto-reset).
-With the MCP server STOPPED (single-writer rule), compare the two SID
-bindings: `delivery_state.json` (`native_session_id` + `native_sessions`)
-and `jev_state.json` (same two keys). There is no mapping file: the DM is
-resolved live every tick and converged delivery-first, ledger-second.
+There is a single store: the serving native SID and the per-day adoption
+provenance both live in `state.db` (no two-file compare, no half-commit
+repair class). The DM is resolved live every tick.
 
 - Deferred adoption (stderr `target DM adoption deferred for <day> (<kind>)`):
   a transient native blip (retries every tick, no action), or a
-  mid-flight/turn_submitting job blocking the drain gate. While blocked,
+  mid-flight (`submitted`/`sent`) job blocking the drain gate. While blocked,
   each tick still runs one reconcile-only pass for the head blocker on
   the old session (no submits, no classify), so an inflight job drains
-  and adoption converges next tick. An `uncertain` job never auto-drains:
-  resolve it with the operator `resolve_uncertain_drop` tool first,
-  then the next tick adopts. A later `adopted target bot DM session`
+  and adoption converges next tick. A later `adopted target bot DM session`
   line confirms recovery.
 - Pruned serving session: SELF-RECOVERING. A definitive pre-POST 404 on the
   serving SID holds that tick `pending` with zero state mutation; the next
   tick re-resolves the target DM (recreated natively when deleted) and adopts
-  it. No action. Residual case: a 404 between snapshot and POST
-  (millisecond race) holds that one job `uncertain` -- drop it with the
-  operator `resolve_uncertain_drop` tool and the next message adopts.
-  Manual repair is only for an adoption that cannot converge (see
-  half-commit below).
-- Half-commit (startup `delivery native_session_id mismatch` naming the
-  stored SID after a crash between the sync store writes): delivery is the
-  commit record. Copy its `native_session_id` + `native_sessions` map into
-  the lagging ledger file (records keep their classification-day SIDs, so
-  no record edit is needed). Never delete old day entries or old native
-  sessions.
+  it. No action. A 404 between snapshot and POST (millisecond race) fails
+  that one job (best-effort, never a blind re-POST) and the next message
+  adopts. Never delete old day rows or old native sessions.

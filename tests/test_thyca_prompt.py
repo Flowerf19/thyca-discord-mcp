@@ -533,6 +533,7 @@ def test_module_imports_stay_pure():
     tree = ast.parse(path.read_text(encoding="utf-8"))
     allowed = {
         "asyncio",
+        "datetime",
         "hashlib",
         "http.client",
         "ipaddress",
@@ -547,6 +548,9 @@ def test_module_imports_stay_pure():
         "__future__",
         ".conversation",
         "conversation",
+        # Phase 4 item 3: canonical strict-int home (stdlib-only leaf,
+        # no I/O -- same purity property as conversation).
+        "validate",
     }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

@@ -1,21 +1,33 @@
-"""Jev routing integration tests: REAL delivery + REAL ledger, fakes elsewhere.
+"""Jev routing integration tests: REAL store + REAL ledger, fakes elsewhere.
 
-Every test runs the real ``delivery`` journal and the real
-``ParticipationLedger`` (file-backed, tmp paths) with a fake Jev adapter
-(scripted ``JevDecision`` objects, never the network), a fake canonical
-collector (scripted snapshots), a fake native ``ThycaClient``, and a fake
+Every test runs the real SQLite store and the real DB-backed
+``ParticipationLedger`` (tmp paths) with a fake Jev adapter (scripted
+``JevDecision`` objects, never the network), a fake canonical collector
+(scripted snapshots), a fake native ``ThycaClient``, and a fake
 bot/source surface. No live Discord/Thyca/Jev, no real .env (all settings
 use ``_env_file=None``), no paid calls.
 
+Completion is snapshot-driven (no trace proof): after the POST the worker
+reloads the job -- a recorded send or no_reply stands; otherwise the POST
+result itself must prove a clean idle turn, else later ticks poll
+``get_session_snapshot`` until idle and close the same way. A completed
+idle turn with no outcome fails (``turn_no_outcome``); ambiguous
+send/POST outcomes fail; restarts fail ``submitted`` jobs.
+
 Coverage: respond completion with the SAME canonical snapshot feeding Jev
-and the prompt; observe as a durable zero-POST terminal with safe ACK;
-need_context via agent send and via explicit no-op with exact trace proof
-(including two consistent declarations, mixed-reason and missing-result
-holds); zero-receipts-never-observe; restart/cache/409 no-rebill;
-cancellation/unknown/budget/unknown-blocked holds; pre/post-paid deletion;
-edit/context-change holds; FIFO + ACK; nonce/latch races; classifier
-privacy (sender/addressee never identity); full-context 4000 budget with
-no truncation; pre-classify UID binding for ALL routes.
+and the prompt, observe as a durable zero-POST terminal with safe ACK,
+need_context via agent send and via terminal no_reply, 409/restart
+cache reuse with no rebill, the crash-pending retry-once rule at worker
+level, cancellation/unknown/global-block holds, pre/post-paid deletion,
+edit/context-change holds, FIFO + ACK, nonce races, classifier privacy
+(sender/addressee never identity), full-context 4000 budget with no
+truncation, pre-classify UID binding for ALL routes.
+
+Deleted (reasons): the trace-evidence proof block and every
+intent/receipt/trace/nonce-binding assertion, the uncertain-hold and
+retry-latch suites, the ledger<->journal marker/loss-guard/binding
+matrix, and ``uncertain_legacy_never_classifies`` -- those stages and
+concepts no longer exist.
 """
 
 from __future__ import annotations
@@ -24,35 +36,25 @@ import asyncio
 import copy
 import hashlib
 import json
-import os
-import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import discord
 import pytest
 
-import delivery
 from config import Settings
 from context import ContextUnavailable, context_fingerprint
 from conversation import project_conversation_state
-from delivery import (
-    enqueue_job,
-    get_job,
-    initialize_delivery_state,
-    mark_turn_submitting,
-    mark_uncertain,
-    record_send_intent,
-    record_send_receipt,
-)
 from jev import JEV_MODEL, JevDecision, JevError, build_questions
-from outbox import append_entry
-from participation import ParticipationError, ParticipationLedger
+from participation import ParticipationLedger
 from responder import Responder, ResponderError
 from source_messages import SourceDeleted
-from thyca import ThycaBusyError, ThycaProtocolError
+from store import Store, append_entry
+from thyca import ThycaBusyError
 
 SID = "2026-01-02T03-04-05_ab12"
+SID2 = "2026-01-03T04-05-06_cd34"
+DAY = "2026-01-02"
 GUILD = 111000000000000001
 CHANNEL = 222000000000000002
 OWNER = 333000000000000003
@@ -78,25 +80,18 @@ def _settings(tmp_path, **overrides):
         "guild_id": GUILD,
         "default_channel_id": CHANNEL,
         "audit_path": tmp_path / "audit.jsonl",
-        "outbox_path": tmp_path / "outbox.jsonl",
-        "outbox_state_path": tmp_path / "outbox_state.json",
-        "delivery_state_path": tmp_path / "delivery.json",
+        "db_path": tmp_path / "state.db",
         "_env_file": None,
     }
     kwargs.update(overrides)
-    settings = Settings(**kwargs)
-    assert settings.jev_state_path.parent == tmp_path  # derived beside tmp delivery
+    return Settings(**kwargs)
+
+
+def _prepare(tmp_path):
+    settings = _settings(tmp_path)
+    with Store.open(settings.db_path) as store:
+        store.adopt_session(expected_current=None, new_sid=SID, day=DAY)
     return settings
-
-
-def _init_delivery(settings):
-    return initialize_delivery_state(
-        settings.delivery_state_path,
-        native_session_id=SID,
-        baseline_acked=0,
-        historical_message_ids={},
-        authorized_skips=[],
-    )
 
 
 def _entry_fields(**overrides):
@@ -115,9 +110,12 @@ def _entry_fields(**overrides):
 
 
 def _append(settings, **overrides):
-    return append_entry(
-        settings.outbox_path, settings.outbox_state_path, **_entry_fields(**overrides)
-    )
+    return append_entry(settings.db_path, **_entry_fields(**overrides))
+
+
+def _job(settings, mid=SOURCE_MID):
+    with Store.open(settings.db_path) as store:
+        return store.get_job(CHANNEL, mid)
 
 
 # --- fake bot/source surface (reads only, never a send) ----------------------
@@ -189,23 +187,26 @@ class _FakeBot:
         raise LookupError("user not found")
 
 
-# --- fake native client --------------------------------------------------------
+def _delete_source(bot, cid, mid):
+    bot.get_guild(GUILD).get_channel(cid).source_store["deleted"].add(mid)
+
+
+# --- fake native client (snapshot-driven, no trace) ---------------------------
 
 
 class _FakeClient:
     def __init__(self):
         self.snapshot_calls: list = []
         self.submit_calls: list = []
-        self.trace_calls: list = []
         self.dm_calls: list = []
         self.snapshot_fn = None
         self.submit_fn = None
-        self.trace_fn = None
+        self.dm_sid = SID
 
     async def get_bot_dm(self, bot_id):
         self.dm_calls.append(bot_id)
         return {
-            "native_sid": SID,
+            "native_sid": self.dm_sid,
             "running": False,
             "message_count": 0,
             "proof": "bot_dm",
@@ -242,14 +243,6 @@ class _FakeClient:
             "stored_text_match": True,
             "stored_text_len": len(cleaned),
         }
-
-    async def get_trace_evidence(
-        self, sid, idx, *, job_ref, source_message_id, channel_id, guild_id=None
-    ):
-        self.trace_calls.append((sid, idx, job_ref, source_message_id, channel_id, guild_id))
-        if self.trace_fn is not None:
-            return await self.trace_fn(sid, idx, job_ref, source_message_id, channel_id, guild_id)
-        raise ThycaProtocolError(reason="transport")
 
 
 # --- fake Jev adapter (scripted decisions, never the network) ------------------
@@ -358,144 +351,56 @@ class _FakeCollector:
         }
 
 
-# --- realistic trace evidence (mirrors the real client output shape) -----------
+# --- snapshot-driven native turn ----------------------------------------------
 
 
-def _send_item(tool_id, content, sent_mid):
-    return {
-        "tool_call_id": tool_id,
-        "channel_match": True,
-        "source_mid_match": True,
-        "job_ref_match": True,
-        "correlated": True,
-        "result_present": True,
-        "result_message_id": sent_mid,
-        "result_channel_match": True,
-        "jump_present": True,
-        "jump_ids_match": True,
-        "result_ok": True,
-        "content_len": len(content),
-        "content_sha256": _sha(content),
-    }
+def _wire_turn(
+    client, settings, *, source_mid, own_index=0, pre_max=None, agent=None, submit_running=False
+):
+    """Drive FakeClient without trace proof; run the agent sim on POST.
 
-
-def _obs_item(tool_id, reason="no_reply_needed", *, present=True, ok=True):
-    return {
-        "tool_call_id": tool_id,
-        "channel_match": True,
-        "source_mid_match": True,
-        "job_ref_match": True,
-        "reason_valid": True,
-        "reason": reason,
-        "correlated": True,
-        "result_present": present,
-        "result_ids_match": True,
-        "result_reason_match": True,
-        "result_status_declared": True,
-        "result_ok": ok,
-    }
-
-
-def _trace_evidence(sid, idx, job_ref, source_mid, input_sha, input_len, sends=(), observations=()):
-    sends = list(sends)
-    observations = list(observations)
-    return {
-        "native_sid": sid,
-        "requested_turn_index": idx,
-        "returned_turn_index": idx,
-        "trace_session_match": True,
-        "turn_index_match": True,
-        "status": "completed",
-        "status_len": len("completed"),
-        "error_present": False,
-        "error_kind": "none",
-        "request_job_ref_match": True,
-        "request_job_ref_len": len(job_ref),
-        "request_job_ref_sha256": _sha(job_ref),
-        "request_user_count": 1,
-        "request_input_sha256": input_sha,
-        "request_input_len": input_len,
-        "send_call_count": len(sends),
-        "correlated_send_count": len(sends),
-        "legacy_uncorrelated_count": 0,
-        "other_tool_call_count": 0,
-        "other_tool_name_lens": [],
-        "sends": sends,
-        "all_sends_confirmed": bool(sends) and all(s["result_ok"] for s in sends),
-        "observation_calls": observations,
-        "observation_call_count": len(observations),
-        "all_observations_confirmed": bool(observations)
-        and all(o["result_ok"] for o in observations),
-        "proof": "trace_detail",
-    }
-
-
-def _wire_turn(client, settings, *, source_mid, own_index=0, pre_max=None, agent=None):
-    """Drive FakeClient from the submitted text; run the agent sim on POST.
-
-    ``agent`` is ``None`` (no agent action), ``("send", (chunks...))``, or
-    ``("declare", reason)`` / ``("declare2", reason)`` (one/two journaled
-    declarations are simulated by recording once; the trace carries one or
-    two positive calls). Trace observations/sends mirror the agent action.
+    ``agent`` is ``None`` (no agent action), ``("send", (chunks...))``
+    (one store send per chunk, like the MCP tool), or
+    ``("declare", reason)`` (terminal no_reply at tool time, like the MCP
+    tool). ``submit_running`` returns a still-running POST result so later
+    ticks must poll the snapshot; the snapshot reports idle unless
+    ``snapshot_running`` scripted otherwise.
     """
     seen: dict = {"texts": [], "turns": [], "declares": []}
     pre_indices = [] if pre_max is None else list(range(pre_max + 1))
+    running_flags: list = []
 
     async def snapshot(sid, expected_title):
         done = [t for t in seen["turns"] if t["done"]]
         indices = sorted({*pre_indices, *(t["index"] for t in done)})
+        running = running_flags.pop(0) if running_flags else False
         return {
             "native_sid": sid,
             "native_id_match": True,
             "title_match": True if expected_title else None,
-            "running": False,
+            "running": running,
             "turn_count": len(indices),
             "turn_indices": indices,
             "pre_max_turn_index": (max(indices) if indices else None),
         }
 
     async def submit(sid, text, model=None, effort=None):
-        job = get_job(settings.delivery_state_path, CHANNEL, source_mid)
-        ref = job["job_ref"]
+        with Store.open(settings.db_path) as store:
+            job = store.get_job(CHANNEL, source_mid)
+            ref = job["job_ref"]
         seen["texts"].append(text)
         turn = {"index": own_index + len(seen["texts"]) - 1, "text": text, "done": False}
         seen["turns"].append(turn)
-        sends: list = []
-        observations: list = []
         if agent is not None and agent[0] == "send":
-            for i, chunk in enumerate(agent[1]):
-                send_ref = f"send-{len(seen['texts'])}-{i}"
-                record_send_intent(
-                    settings.delivery_state_path,
-                    CHANNEL,
-                    source_mid,
-                    send_ref=send_ref,
-                    content_len=len(chunk),
-                    content_hash=_sha(chunk),
-                )
-                sent_mid = SENT_BASE + i
-                record_send_receipt(
-                    settings.delivery_state_path,
-                    CHANNEL,
-                    source_mid,
-                    send_ref=send_ref,
-                    sent_message_id=sent_mid,
-                    delivered_channel_id=CHANNEL,
-                    jump_url=_jump(sent_mid),
-                    reply_to_message_id=source_mid,
-                )
-                sends.append(_send_item(f"call_send_{i}", chunk, sent_mid))
-        elif agent is not None and agent[0] in ("declare", "declare2"):
-            reason = agent[1]
-            delivery.record_no_reply(
-                settings.delivery_state_path, CHANNEL, source_mid, job_ref=ref, reason=reason
-            )
-            seen["declares"].append(reason)
-            observations.append(_obs_item("call_obs_0", reason))
-            if agent[0] == "declare2":
-                observations.append(_obs_item("call_obs_1", reason))
-        turn["sends"] = sends
-        turn["observations"] = observations
+            for i, _chunk in enumerate(agent[1]):
+                with Store.open(settings.db_path) as store:
+                    store.record_send(
+                        CHANNEL, source_mid, job_ref=ref, sent_message_id=SENT_BASE + i
+                    )
+        elif agent is not None and agent[0] == "declare":
+            with Store.open(settings.db_path) as store:
+                store.complete_job(CHANNEL, source_mid, outcome="no_reply")
+            seen["declares"].append(agent[1])
         turn["done"] = True
         return {
             "completed": True,
@@ -503,39 +408,16 @@ def _wire_turn(client, settings, *, source_mid, own_index=0, pre_max=None, agent
             "native_id_match": True,
             "turn_index": turn["index"],
             "turn_count": len(seen["turns"]),
-            "running": False,
+            "running": submit_running,
             "submitted_text_len": len(text),
             "submitted_text_sha256": _sha(text),
             "stored_text_match": True,
             "stored_text_len": len(text),
         }
 
-    async def trace(sid, idx, job_ref, source_mid_arg, channel_id, guild_id=None):
-        rec = next((t for t in seen["turns"] if t["done"] and t["index"] == idx), None)
-        if rec is None:
-            manual = f"manual-turn-{idx}"
-            return _trace_evidence(sid, idx, job_ref, source_mid_arg, _sha(manual), len(manual))
-        return _trace_evidence(
-            sid,
-            idx,
-            job_ref,
-            source_mid_arg,
-            _sha(rec["text"]),
-            len(rec["text"]),
-            sends=rec.get("sends", ()),
-            observations=rec.get("observations", ()),
-        )
-
     client.snapshot_fn = snapshot
     client.submit_fn = submit
-    client.trace_fn = trace
-    return seen
-
-
-def _prepare(tmp_path):
-    settings = _settings(tmp_path)
-    _init_delivery(settings)
-    return settings
+    return seen, running_flags
 
 
 def _responder(settings, bot=None, client=None, adapter=None, collector=None, ledger=None):
@@ -544,7 +426,7 @@ def _responder(settings, bot=None, client=None, adapter=None, collector=None, le
     adapter = adapter if adapter is not None else _FakeAdapter("respond")
     collector = collector if collector is not None else _FakeCollector()
     if ledger is None:
-        ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
+        ledger = ParticipationLedger(settings.db_path)
     return Responder(
         settings,
         bot,
@@ -562,994 +444,627 @@ def _prompt_json(prompt):
     return json.loads("\n".join(lines[start + 1 : end]))
 
 
-# --- respond ------------------------------------------------------------------
+# --- respond route -------------------------------------------------------------
 
 
 async def test_respond_same_snapshot_completes_and_acks(tmp_path):
     settings = _prepare(tmp_path)
+    entry = _append(settings)
     client = _FakeClient()
     adapter = _FakeAdapter("respond")
-    history = [
-        (701, OWNER, "Olivia", "kickoff at noon", None),
-        (702, BOT, "HelperBot", "noted", 701),
-    ]
-    collector = _FakeCollector(history=history)
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    inst = _responder(settings, client=client, adapter=adapter, collector=collector, ledger=ledger)
-    _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("On it!",)))
-    _append(settings)
-    result = await inst.tick()
-    assert result["status"] == "completed"
-    assert result["acked"] == 1
-    assert len(adapter.calls) == 1  # one paid call
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("reply-body",)))
+    responder = _responder(settings, client=client, adapter=adapter)
+    outcome = await responder.tick()
+    assert outcome["status"] == "sent"
+    assert outcome["acked"] == entry["seq"]
     assert len(client.submit_calls) == 1
+    sid, text, _, _ = client.submit_calls[0]
+    assert sid == SID
     # SAME canonical snapshot feeds Jev and the prompt.
-    fed = project_conversation_state(adapter.calls[0])
-    rendered = _prompt_json(client.submit_calls[0][1])
-    assert rendered == fed
-    assert [m["id"] for m in rendered["messages"]] == ["701", "702", str(SOURCE_MID)]
-    prompt = client.submit_calls[0][1]
-    assert "ROUTED respond" in prompt
-    assert "send_message" in prompt
-    assert len(prompt) <= 4000
-    job = get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)
-    assert job["stage"] == "completed"
-    assert job["jev_decision"]["participation"] == "respond"
-    assert job["jev_decision"]["context_sha256"] == context_fingerprint(fed)
-    record = ledger.get(CHANNEL, SOURCE_MID)
-    assert record["status"] == "decided" and record["participation"] == "respond"
-    assert re.fullmatch(r"[0-9a-f]{32}", record["attempt_id"])  # 32-hex, not dashed
+    assert len(adapter.calls) == 1
+    projected = project_conversation_state(adapter.calls[0])
+    prompt = _prompt_json(text)
+    assert prompt == projected
+    job = _job(settings)
+    assert (job["stage"], job["outcome"]) == ("done", "sent")
+    assert job["send_count"] == 1
+    assert job["sent_message_ids"] == [SENT_BASE]
 
 
 async def test_respond_prompt_carries_stop_guards(tmp_path):
-    """The routed respond prompt includes exact stop/no-plain/threaded guards."""
     settings = _prepare(tmp_path)
-    client = _FakeClient()
-    adapter = _FakeAdapter(["respond", "respond"])
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    inst = _responder(settings, client=client, adapter=adapter, ledger=ledger)
-    mid2 = SOURCE_MID + 1
-    _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("R1",)))
     _append(settings)
-    _append(settings, message_id=mid2, content="second question")
-    result1 = await inst.tick()
-    assert result1["status"] == "completed"
-    # Rewire the agent sim for the second source, then tick again.
-    _wire_turn(client, settings, source_mid=mid2, agent=("send", ("R2",)))
-    result2 = await inst.tick()
-    assert result2["status"] == "completed"
-    assert len(client.submit_calls) == 2
-    for text in (client.submit_calls[0][1], client.submit_calls[1][1]):
-        assert "SourceDeleted" in text
-        assert "no plain fallback" in text
-        assert "threaded" in text
-        assert "ROUTED respond" in text
+    client = _FakeClient()
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("x",)))
+    responder = _responder(settings, client=client)
+    await responder.tick()
+    _, text, _, _ = client.submit_calls[0]
+    assert "TRUSTED_METADATA" in text
+    assert "UNTRUSTED_CONVERSATION" in text
+    assert "NEVER read/write" in text
+    assert "NEVER disclose" in text
+    assert "whoami(sender_uid)" in text
 
 
 async def test_full_context_preserved_no_truncation(tmp_path):
     settings = _prepare(tmp_path)
-    client = _FakeClient()
-    history = [
-        (600 + i, OTHER if i % 2 else OWNER, "R" if i % 2 else "O", f"history line {i} — ok", None)
-        for i in range(6)
-    ]
-    collector = _FakeCollector(history=history)
-    inst = _responder(settings, client=client, collector=collector)
-    _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("ack",)))
+    history = tuple((900 + i, OTHER, f"User{OTHER}", f"filler {i}", None) for i in range(5))
     _append(settings)
-    result = await inst.tick()
-    assert result["status"] == "completed"
-    prompt = client.submit_calls[0][1]
-    body = _prompt_json(prompt)
-    assert len(body["messages"]) == 7
-    for i in range(6):
-        assert f"history line {i} — ok" in prompt  # every line exact, none dropped
-    assert len(prompt) <= 4000
+    client = _FakeClient()
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("x",)))
+    responder = _responder(settings, client=client, collector=_FakeCollector(history=history))
+    outcome = await responder.tick()
+    assert outcome["status"] == "sent"
+    _, text, _, _ = client.submit_calls[0]
+    prompt = _prompt_json(text)
+    assert len(prompt["messages"]) == 6  # 5 history + source, nothing truncated
 
 
 async def test_jev_answers_never_identity(tmp_path):
-    """A wrong classifier addressee never overrides SDK identity."""
+    """Classifier sender/addressee answers never authenticate the sender."""
     settings = _prepare(tmp_path)
+    _append(settings)
     client = _FakeClient()
-    adapter = _FakeAdapter("respond", addressee=str(OWNER))  # Jev misreads the target
-    inst = _responder(settings, client=client, adapter=adapter)
-    _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("hi",)))
-    _append(settings)  # actual sender is OTHER
-    result = await inst.tick()
-    assert result["status"] == "completed"
-    header = client.submit_calls[0][1].splitlines()[0]
-    assert f"sender_uid={OTHER}" in header
-    assert "sender_kind=other" in header
-    assert "whoami(sender_uid)" in client.submit_calls[0][1]
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("x",)))
+    adapter = _FakeAdapter("respond", addressee="channel", noul=0.0)
+    responder = _responder(settings, client=client, adapter=adapter)
+    outcome = await responder.tick()
+    assert outcome["status"] == "sent"
+    assert len(client.submit_calls) == 1
 
 
-# --- observe ------------------------------------------------------------------
+async def test_multi_chunk_two_sends_complete(tmp_path):
+    settings = _prepare(tmp_path)
+    _append(settings)
+    client = _FakeClient()
+    seen, _ = _wire_turn(
+        client, settings, source_mid=SOURCE_MID, agent=("send", ("part-one ", "part-two"))
+    )
+    responder = _responder(settings, client=client)
+    outcome = await responder.tick()
+    assert outcome["status"] == "sent"
+    job = _job(settings)
+    assert (job["stage"], job["outcome"]) == ("done", "sent")
+    assert job["send_count"] == 2
+    assert job["sent_message_ids"] == [SENT_BASE, SENT_BASE + 1]
+
+
+# --- observe / no_reply routes --------------------------------------------------
 
 
 async def test_observe_zero_post_terminal_ack(tmp_path):
     settings = _prepare(tmp_path)
+    entry = _append(settings)
     client = _FakeClient()
     adapter = _FakeAdapter("observe")
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    inst = _responder(settings, client=client, adapter=adapter, ledger=ledger)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
-    _append(settings)
-    result = await inst.tick()
-    assert result["status"] == "observed"
-    assert result["acked"] == 1
-    assert len(adapter.calls) == 1
-    assert client.submit_calls == []  # zero POST
-    assert client.trace_calls == []  # zero trace reads
-    assert len(client.snapshot_calls) == 1  # gate snapshot only, no POST snapshot
-    job = get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)
-    assert job["stage"] == "observed"
-    assert job["jev_decision"]["participation"] == "observe"
-    assert job["observation"]["origin"] == "jev"
-    assert job["send_intents"] == [] and job["send_receipts"] == [] and job["job_ref"] is None
-    record = ledger.get(CHANNEL, SOURCE_MID)
-    assert record["participation"] == "observe" and record["status"] == "decided"
+    responder = _responder(settings, client=client, adapter=adapter)
+    outcome = await responder.tick()
+    assert outcome["status"] == "observed"
+    assert outcome["acked"] == entry["seq"]
+    assert client.submit_calls == []
+    job = _job(settings)
+    assert (job["stage"], job["outcome"]) == ("done", "observed")
 
 
-async def test_zero_receipts_never_observe(tmp_path):
-    """An agent no-op WITHOUT a declaration holds uncertain; receipts-absence proves nothing."""
+async def test_zero_sends_completed_turn_fails_no_outcome(tmp_path):
+    """A completed idle turn with no send and no record_no_reply fails."""
     settings = _prepare(tmp_path)
-    client = _FakeClient()
-    inst = _responder(settings, client=client, adapter=_FakeAdapter("respond"))
-    _wire_turn(client, settings, source_mid=SOURCE_MID, agent=None)  # agent sends nothing
     _append(settings)
-    result = await inst.tick()
-    assert result["status"] == "uncertain"
-    job = get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)
-    assert job["stage"] == "uncertain"
-    assert result["acked"] == 0
+    client = _FakeClient()
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=None)
+    responder = _responder(settings, client=client)
+    outcome = await responder.tick()
+    assert outcome["status"] == "failed"
+    assert outcome["reason"] == "turn_no_outcome"
+    job = _job(settings)
+    assert job["stage"] == "failed"
+    assert job["fail_kind"] == "turn_no_outcome"
 
 
-# --- cache / restart / rebill ---------------------------------------------------
+async def test_need_context_agent_send_completes(tmp_path):
+    settings = _prepare(tmp_path)
+    _append(settings)
+    client = _FakeClient()
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("ctx",)))
+    responder = _responder(settings, client=client, adapter=_FakeAdapter("respond"))
+    outcome = await responder.tick()
+    assert outcome["status"] == "sent"
+    assert _job(settings)["outcome"] == "sent"
+
+
+async def test_need_context_declare_terminal_at_tool_time(tmp_path):
+    settings = _prepare(tmp_path)
+    entry = _append(settings)
+    client = _FakeClient()
+    seen, _ = _wire_turn(
+        client, settings, source_mid=SOURCE_MID, agent=("declare", "no_reply_needed")
+    )
+    responder = _responder(settings, client=client)
+    outcome = await responder.tick()
+    assert outcome["status"] == "no_reply"
+    assert outcome["acked"] == entry["seq"]
+    assert _job(settings)["outcome"] == "no_reply"
+
+
+# --- restart / reuse --------------------------------------------------------------
 
 
 async def test_409_reuses_cached_no_rebill(tmp_path):
     settings = _prepare(tmp_path)
+    _append(settings)
     client = _FakeClient()
     adapter = _FakeAdapter("respond")
-    inst = _responder(settings, client=client, adapter=adapter)
-    _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("done",)))
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("x",)))
 
-    orig_submit = client.submit_fn
-    attempts = {"n": 0}
+    busy_first = True
+    real_submit = client.submit_fn
 
-    async def flaky_submit(sid, text, model=None, effort=None):
-        attempts["n"] += 1
-        if attempts["n"] == 1:
-            # Definitive 409 BEFORE any agent action: zero evidence.
-            raise ThycaBusyError()
-        return await orig_submit(sid, text, model, effort)
+    async def busy_then_ok(sid, text, model=None, effort=None):
+        nonlocal busy_first
+        if busy_first:
+            busy_first = False
+            raise ThycaBusyError(status_code=409)
+        return await real_submit(sid, text, model, effort)
 
-    client.submit_fn = flaky_submit
-    _append(settings)
-    result1 = await inst.tick()
-    assert result1["status"] == "pending" and result1["reason"] == "busy_requeued"
+    client.submit_fn = busy_then_ok
+    responder = _responder(settings, client=client, adapter=adapter)
+    first = await responder.tick()
+    assert first["status"] == "pending"
+    assert first["reason"] == "busy_requeued"
     assert len(adapter.calls) == 1
-    job = get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)
-    assert job["stage"] == "queued" and job["job_ref"] is None
-    assert job["jev_decision"]["participation"] == "respond"  # binding survives 409
-    attempt1 = job["jev_decision"]["attempt_id"]
-    result2 = await inst.tick()
-    assert result2["status"] == "completed"
-    assert len(adapter.calls) == 1  # cached: no rebill, no provider recall
-    job2 = get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)
-    assert job2["jev_decision"]["attempt_id"] == attempt1  # idempotent rebind
-    [job["job_ref"], job2["job_ref"]]
-    assert len(client.submit_calls) == 2
+    job = _job(settings)
+    assert job["stage"] == "queued"
+    assert job["job_ref"] is None
+    second = await responder.tick()
+    assert second["status"] == "sent"
+    assert len(adapter.calls) == 1  # cached decision reused, no rebill
+    assert len(seen["texts"]) == 1
 
 
 async def test_restart_reuses_cache_no_rebill(tmp_path):
     settings = _prepare(tmp_path)
-    client = _FakeClient()
-    adapter = _FakeAdapter("observe")
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    inst = _responder(settings, client=client, adapter=adapter, ledger=ledger)
-    _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("r",)))
-    snaps = {"n": 0}
-    orig_snapshot = client.snapshot_fn
-
-    async def running_once(sid, expected_title):
-        snaps["n"] += 1
-        snap = await orig_snapshot(sid, expected_title)
-        if snaps["n"] == 2:  # POST-time snapshot sees native busy (bound already)
-            snap["running"] = True
-        return snap
-
-    client.snapshot_fn = running_once
     _append(settings)
-    # Observe path never takes the POST snapshot; use respond to reach it.
-    adapter.script = ["respond"]
-    result1 = await inst.tick()
-    assert result1["status"] == "pending" and result1["reason"] == "native_running"
+    client = _FakeClient()
+    adapter = _FakeAdapter("respond")
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID)
+
+    async def busy_once(sid, text, model=None, effort=None):
+        raise ThycaBusyError(status_code=409)
+
+    client.submit_fn = busy_once
+    responder = _responder(settings, client=client, adapter=adapter)
+    outcome = await responder.tick()
+    assert outcome["reason"] == "busy_requeued"
     assert len(adapter.calls) == 1
-    # Simulate a process restart: brand-new Responder + ledger, same files.
-    ledger2 = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    assert ledger2.get(CHANNEL, SOURCE_MID)["status"] == "decided"  # durable
-    inst2 = _responder(settings, client=client, adapter=adapter, ledger=ledger2)
-    result2 = await inst2.tick()
-    assert result2["status"] == "completed"
-    assert len(adapter.calls) == 1  # cache hit across restart: no rebill
+    # Restart: a fresh Responder over the same DB sweeps nothing (queued)
+    # and resumes with the cached decision -- zero new provider calls.
+    client2 = _FakeClient()
+    seen2, _ = _wire_turn(client2, settings, source_mid=SOURCE_MID, agent=("send", ("x",)))
+    responder2 = _responder(settings, client=client2, adapter=adapter)
+    outcome2 = await responder2.tick()
+    assert outcome2["status"] == "sent"
+    assert len(adapter.calls) == 1
+    assert len(seen2["texts"]) == 1
+
+
+async def test_restart_submitted_failed_queued_resumes(tmp_path):
+    settings = _prepare(tmp_path)
+    _append(settings)
+    mid2 = SOURCE_MID + 1
+    _append(settings, message_id=mid2)
+    client = _FakeClient()
+    # First job's POST reports a still-running turn: it stays submitted.
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=None, submit_running=True)
+    responder = _responder(settings, client=client)
+    outcome = await responder.tick()
+    assert outcome["status"] == "pending"
+    assert outcome["reason"] == "turn_running"
+    assert _job(settings)["stage"] == "submitted"
+    # Restart fails the submitted job; the queued job resumes normally.
+    _responder(settings, client=_FakeClient())  # construction runs the sweep
+    failed = _job(settings)
+    assert failed["stage"] == "failed"
+    assert failed["fail_kind"] == "restart"
+    assert _job(settings, mid2)["stage"] == "queued"
+
+
+async def test_running_turn_closes_on_later_idle_tick(tmp_path):
+    settings = _prepare(tmp_path)
+    _append(settings)
+    client = _FakeClient()
+    seen, _running = _wire_turn(
+        client, settings, source_mid=SOURCE_MID, agent=None, submit_running=True
+    )
+    responder = _responder(settings, client=client)
+    first = await responder.tick()
+    # POST reported a still-running turn: the job stays submitted.
+    assert first["status"] == "pending"
+    assert first["reason"] == "turn_running"
+    assert _job(settings)["stage"] == "submitted"
+    second = await responder.tick()
+    assert second["status"] == "failed"
+    assert second["reason"] == "turn_no_outcome"
 
 
 async def test_cancellation_unknown_blocks_retry(tmp_path):
     settings = _prepare(tmp_path)
-    client = _FakeClient()
-    adapter = _FakeAdapter("respond")
-    adapter.block_event = asyncio.Event()
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    inst = _responder(settings, client=client, adapter=adapter, ledger=ledger)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
     _append(settings)
-    task = asyncio.create_task(inst.tick())
-    await asyncio.sleep(0.05)
-    task.cancel()
+    adapter = _FakeAdapter("respond")
+    adapter.raise_exc = asyncio.CancelledError()
+    responder = _responder(settings, adapter=adapter)
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await responder.tick()
+    # The cancelled classification persists failed_unknown; the next tick
+    # fails the job instead of retrying the provider call.
+    adapter.raise_exc = None
+    outcome = await responder.tick()
+    assert outcome["status"] == "failed"
+    assert outcome["reason"] == "classification_unknown"
     assert len(adapter.calls) == 1
-    record = ledger.get(CHANNEL, SOURCE_MID)
-    assert record["status"] == "failed_unknown"  # persistent started/unknown
-    job = get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)
-    assert job["stage"] == "queued"  # responder propagates; job stays queued
-    adapter.block_event = None
-    result = await inst.tick()
-    assert result["status"] == "uncertain"
-    assert result["reason"] == "classification_unknown"
-    assert len(adapter.calls) == 1  # blocked retry: no provider recall, no rebill
 
 
 async def test_no_daily_stop_both_classify_same_day(tmp_path):
     settings = _prepare(tmp_path)
-    client = _FakeClient()
-    mid2 = SOURCE_MID + 1
-    ledger = ParticipationLedger(
-        settings.jev_state_path,
-        native_sid=SID,
-        day_provider=lambda: "2026-10-05",
-    )
-    adapter = _FakeAdapter(["observe", "observe"])
-    inst = _responder(settings, client=client, adapter=adapter, ledger=ledger)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
     _append(settings)
-    _append(settings, message_id=mid2, content="second")
-    result1 = await inst.tick()
-    assert result1["status"] == "observed"
-    assert len(adapter.calls) == 1
-    # Same UTC day, cost already accumulated: the second job still classifies.
-    _wire_turn(client, settings, source_mid=mid2)
-    result2 = await inst.tick()
-    assert result2["status"] == "observed"
+    mid2 = SOURCE_MID + 1
+    _append(settings, message_id=mid2)
+    client = _FakeClient()
+    adapter = _FakeAdapter("respond")
+    ledger = ParticipationLedger(settings.db_path, day_provider=lambda: DAY)
+    responder = _responder(settings, client=client, adapter=adapter, ledger=ledger)
+    # No daily spend stop: both sources classify and complete the same day.
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("a",)))
+    first = await responder.tick()
+    assert first["status"] == "sent"
+    _append(settings, message_id=mid2)
+    seen2, _ = _wire_turn(client, settings, source_mid=mid2, agent=("send", ("b",)))
+    second = await responder.tick()
+    assert second["status"] == "sent"
     assert len(adapter.calls) == 2
-    assert get_job(settings.delivery_state_path, CHANNEL, mid2)["stage"] == "observed"
+    with Store.open(settings.db_path) as store:
+        assert store.jev_cost_for_day(DAY) == "0.00000084"
 
 
 async def test_unknown_blocked_preserves_innocent_job(tmp_path):
     settings = _prepare(tmp_path)
-    client = _FakeClient()
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    # Pre-seed a failed_unknown record for ANOTHER key via the real ledger.
-    other_state = {
-        "assistant_uid": str(BOT),
-        "owner_uid": str(OWNER),
-        "participants": [
-            {"uid": str(OWNER), "display_name": "O"},
-            {"uid": str(BOT), "display_name": "B"},
-            {"uid": str(THIRD), "display_name": "T"},
-        ],
-        "messages": [{"id": "900", "sender_uid": str(THIRD), "text": "seed"}],
-        "new_message_id": "900",
-    }
-    failing = _FakeAdapter("respond")
-    failing.raise_exc = JevError("network", detail="boom", unknown_billing=True)
-    with pytest.raises(Exception, match="participation pending"):
-        await ledger.classify(
-            failing, other_state, channel_id=CHANNEL, message_id=900, author_uid=THIRD
-        )
-    assert ledger.get(CHANNEL, 900)["status"] == "failed_unknown"
-    # The innocent job is held pending (queued, unmarked), never terminalized.
-    adapter = _FakeAdapter("observe")
-    inst = _responder(settings, client=client, adapter=adapter, ledger=ledger)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
     _append(settings)
-    result = await inst.tick()
-    assert result["status"] == "pending"
-    assert result["reason"] == "unknown_blocked"
-    assert len(adapter.calls) == 0
-    assert get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)["stage"] == "queued"
+    adapter = _FakeAdapter("respond")
+    adapter.raise_exc = JevError(kind="timeout", unknown_billing=True)
+    responder = _responder(settings, adapter=adapter)
+    outcome = await responder.tick()
+    assert outcome["status"] == "failed"
+    assert outcome["reason"] == "classification_unknown"
+    # A second source stays queued (preserved, never terminalized) while
+    # the FIFO visibly halts for operator resolution.
+    mid2 = SOURCE_MID + 1
+    _append(settings, message_id=mid2)
+    responder2 = _responder(settings)
+    outcome2 = await responder2.tick()
+    assert outcome2["status"] == "pending"
+    assert outcome2["reason"] == "unknown_blocked"
+    assert _job(settings, mid2)["stage"] == "queued"
 
 
-# --- guards: deletion, edits, races, FIFO, binding -------------------------------
-
-
-async def test_uncertain_legacy_never_classifies(tmp_path):
-    """A seq-66-like uncertain job (1 intent, 0 receipts) never reclassifies."""
+async def test_crashed_pending_worker_retries_once_then_decides(tmp_path):
     settings = _prepare(tmp_path)
+    entry = _append(settings)
+    with Store.open(settings.db_path) as store:
+        store.enqueue_job(CHANNEL, SOURCE_MID, entry["seq"])
+    # Crash between the Jev pending insert and its resolve.
+    from conversation import project_conversation_state as _project
+
+    collector = _FakeCollector()
+    snapshot = await collector(_entry_fields())
+    projected = _project(snapshot)
+    fingerprint = context_fingerprint(projected)
+    with Store.open(settings.db_path) as store:
+        store.insert_jev_pending(
+            CHANNEL,
+            SOURCE_MID,
+            context_sha256=fingerprint,
+            attempt_id="att1",
+            author_uid=OTHER,
+            attempted_day=DAY,
+        )
+    client = _FakeClient()
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("x",)))
+    adapter = _FakeAdapter("respond")
+    responder = _responder(settings, client=client, adapter=adapter)
+    outcome = await responder.tick()
+    assert outcome["status"] == "sent"
+    assert len(adapter.calls) == 1  # exactly the one retry
+    with Store.open(settings.db_path) as store:
+        assert store.get_jev(CHANNEL, SOURCE_MID)["attempts"] == 2
+
+
+async def test_crashed_pending_attempts_two_resolves_observe(tmp_path):
+    settings = _prepare(tmp_path)
+    entry = _append(settings)
+    with Store.open(settings.db_path) as store:
+        store.enqueue_job(CHANNEL, SOURCE_MID, entry["seq"])
+    collector = _FakeCollector()
+    snapshot = await collector(_entry_fields())
+    projected = project_conversation_state(snapshot)
+    fingerprint = context_fingerprint(projected)
+    with Store.open(settings.db_path) as store:
+        store.insert_jev_pending(
+            CHANNEL,
+            SOURCE_MID,
+            context_sha256=fingerprint,
+            attempt_id="att1",
+            author_uid=OTHER,
+            attempted_day=DAY,
+        )
+        store.bump_jev_retry(
+            CHANNEL,
+            SOURCE_MID,
+            old_attempt_id="att1",
+            new_attempt_id="att2",
+            attempted_day=DAY,
+        )
     client = _FakeClient()
     adapter = _FakeAdapter("respond")
-    inst = _responder(settings, client=client, adapter=adapter)
-    _append(settings)
-    enqueue_job(
-        settings.delivery_state_path,
-        channel_id=CHANNEL,
-        message_id=SOURCE_MID,
-        author_uid=OTHER,
-        actor_kind="other",
-        seq=1,
-    )
-    mark_turn_submitting(
-        settings.delivery_state_path,
-        CHANNEL,
-        SOURCE_MID,
-        job_ref="job-66",
-        pre_turn_index=0,
-        submitted_text_sha256=_sha("old"),
-        submitted_text_len=3,
-    )
-    record_send_intent(
-        settings.delivery_state_path,
-        CHANNEL,
-        SOURCE_MID,
-        send_ref="s66",
-        content_len=2,
-        content_hash=_sha("hi"),
-    )
-    mark_uncertain(settings.delivery_state_path, CHANNEL, SOURCE_MID, kind="timeout")
-    result = await inst.tick()
-    assert len(adapter.calls) == 0  # never classifies
-    job = get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)
-    assert job["stage"] == "uncertain"  # never skips, never force-completes
-    assert job["error"]["kind"] == "timeout"  # original error preserved
-    assert result["acked"] == 0  # never ACKs past it
+    responder = _responder(settings, client=client, adapter=adapter)
+    outcome = await responder.tick()
+    assert outcome["status"] == "observed"
+    assert len(adapter.calls) == 0  # never a third paid call
+    assert client.submit_calls == []  # observe never POSTs
+
+
+# --- source / snapshot guards ---------------------------------------------------
 
 
 async def test_source_deleted_before_paid_skips_zero_provider(tmp_path):
     settings = _prepare(tmp_path)
-    client = _FakeClient()
-    adapter = _FakeAdapter("respond")
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-
-    async def gone(cid, mid):
-        raise SourceDeleted("gone")
-
-    inst = Responder(
-        settings,
-        _FakeBot(),
-        client=client,
-        source_checker=gone,
-        jev_adapter=adapter,
-        context_collector=_FakeCollector(),
-        participation_ledger=ledger,
-    )
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
+    bot = _FakeBot()
     _append(settings)
-    result = await inst.tick()
-    assert result["status"] == "skipped" and result["reason"] == "source_deleted"
+    _delete_source(bot, CHANNEL, SOURCE_MID)
+    adapter = _FakeAdapter("respond")
+    responder = _responder(settings, bot=bot, adapter=adapter)
+    outcome = await responder.tick()
+    assert outcome == {
+        "status": "skipped",
+        "reason": "source_deleted",
+        "safe_prefix": 1,
+        "acked": 1,
+        "latest": 1,
+    }
     assert len(adapter.calls) == 0
-    assert ledger.get(CHANNEL, SOURCE_MID) is None  # no ledger record before paid
-    assert client.submit_calls == []
+    job = _job(settings)
+    assert job["stage"] == "skipped"
 
 
 async def test_source_deleted_during_paid_skips_sunk_no_post(tmp_path):
     settings = _prepare(tmp_path)
+    bot = _FakeBot()
+    _append(settings)
     client = _FakeClient()
     adapter = _FakeAdapter("respond")
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    calls = {"n": 0}
 
-    async def gone_second(cid, mid):
-        calls["n"] += 1
-        if calls["n"] >= 2:
-            raise SourceDeleted("gone after paid")
-        return None
+    def _delete_during_decide():
+        _delete_source(bot, CHANNEL, SOURCE_MID)
 
-    inst = Responder(
-        settings,
-        _FakeBot(),
-        client=client,
-        source_checker=gone_second,
-        jev_adapter=adapter,
-        context_collector=_FakeCollector(),
-        participation_ledger=ledger,
-    )
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
-    _append(settings)
-    result = await inst.tick()
-    assert result["status"] == "skipped" and result["reason"] == "source_deleted"
-    assert len(adapter.calls) == 1  # paid spend is sunk
-    assert ledger.get(CHANNEL, SOURCE_MID)["status"] == "decided"
-    job = get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)
-    assert job.get("jev_decision") is None  # deleted before bind: no bind
-    assert client.submit_calls == []  # zero native work
+    adapter.hook = _delete_during_decide
+    responder = _responder(settings, bot=bot, client=client, adapter=adapter)
+    outcome = await responder.tick()
+    assert outcome["status"] == "skipped"
+    assert outcome["reason"] == "source_deleted"
+    assert client.submit_calls == []  # classification spend sunk, zero native POST
 
 
 async def test_collector_deletion_during_collect_skips(tmp_path):
-    """The source can become deleted DURING collection: exact 404 skips, never generic hold."""
     settings = _prepare(tmp_path)
-    client = _FakeClient()
-    adapter = _FakeAdapter("respond")
+    _append(settings)
     collector = _FakeCollector()
     collector.script = ["deleted"]
-    inst = _responder(settings, client=client, adapter=adapter, collector=collector)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
-    _append(settings)
-    result = await inst.tick()
-    assert result["status"] == "skipped" and result["reason"] == "source_deleted"
+    adapter = _FakeAdapter("respond")
+    responder = _responder(settings, adapter=adapter, collector=collector)
+    outcome = await responder.tick()
+    assert outcome["status"] == "skipped"
     assert len(adapter.calls) == 0
 
 
 async def test_collector_unavailable_holds_zero_paid(tmp_path):
     settings = _prepare(tmp_path)
-    client = _FakeClient()
-    adapter = _FakeAdapter("respond")
+    _append(settings)
     collector = _FakeCollector()
     collector.script = ["unavailable"]
-    inst = _responder(settings, client=client, adapter=adapter, collector=collector)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
-    _append(settings)
-    result = await inst.tick()
-    assert result["status"] == "pending" and result["reason"] == "context_unavailable"
+    adapter = _FakeAdapter("respond")
+    responder = _responder(settings, adapter=adapter, collector=collector)
+    outcome = await responder.tick()
+    assert outcome == {
+        "status": "pending",
+        "reason": "context_unavailable",
+        "safe_prefix": 0,
+        "acked": 0,
+        "latest": 1,
+    }
     assert len(adapter.calls) == 0
-    assert get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)["stage"] == "queued"
 
 
 async def test_edit_fp_mismatch_proven_skips_no_bind_no_post(tmp_path):
-    """E4 owner policy: proven post-classify edit skips, never binds/POSTs.
-
-    The refresh text differs from the classified text (same id + sender):
-    proven edit, so the stranded job converges to the terminal skip
-    instead of pending forever. The one paid call is sunk; the frozen
-    frame is never bound and nothing is posted."""
     settings = _prepare(tmp_path)
+    _append(settings)
+    collector = _FakeCollector()
+    collector.script = [None, ("edit", "edited after capture")]
     client = _FakeClient()
     adapter = _FakeAdapter("respond")
-    collector = _FakeCollector()
-    collector.script = [None, ("edit", "silently edited text")]
-    inst = _responder(settings, client=client, adapter=adapter, collector=collector)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
-    _append(settings)
-    result = await inst.tick()
-    assert result["status"] == "skipped" and result["reason"] == "source_edited_after_classify"
-    assert len(adapter.calls) == 1
-    job = get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)
-    assert job.get("jev_decision") is None  # frozen frame never bound under an edit
-    assert job["stage"] == "skipped" and job["skip_reason"] == "source_edited_after_classify"
+    responder = _responder(settings, client=client, adapter=adapter, collector=collector)
+    outcome = await responder.tick()
+    assert outcome["status"] == "skipped"
+    assert outcome["reason"] == "source_edited_after_classify"
     assert client.submit_calls == []
 
 
 @pytest.mark.parametrize("action", ["sender", "owner", "assistant"])
 async def test_wrong_uid_snapshot_rejected_all_routes(tmp_path, action):
-    """Pre-classify binding holds for owner/assistant/sender mismatches (all routes)."""
     settings = _prepare(tmp_path)
-    client = _FakeClient()
-    adapter = _FakeAdapter("observe")  # observe never renders: binding still enforced
+    _append(settings)
     collector = _FakeCollector()
-    bad = THIRD if action == "sender" else (BOT if action == "owner" else OWNER)
-    collector.script = [(action, bad)]
-    inst = _responder(settings, client=client, adapter=adapter, collector=collector)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
-    _append(settings)
-    result = await inst.tick()
-    assert result["status"] == "pending" and result["reason"] == "context_mismatch"
-    assert len(adapter.calls) == 0  # bad collector cannot trigger paid observe
-
-
-async def test_snapshot_oversize_holds_zero_paid_no_truncate(tmp_path):
-    settings = _prepare(tmp_path)
-    client = _FakeClient()
+    collector.script = [(action, 424242)]
     adapter = _FakeAdapter("respond")
-    history = [(600 + i, OTHER, "Ramon", "w" * 150, None) for i in range(19)]
-    collector = _FakeCollector(history=history)
-    inst = _responder(settings, client=client, adapter=adapter, collector=collector)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
-    _append(settings)
-    result = await inst.tick()
-    assert result["status"] == "uncertain" and result["reason"] == "snapshot_oversize"
-    assert len(adapter.calls) == 0  # fit gate uses the actual renderer pre-paid
-    assert client.submit_calls == []
-    assert get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)["stage"] == "uncertain"
+    responder = _responder(settings, adapter=adapter, collector=collector)
+    outcome = await responder.tick()
+    assert outcome["status"] == "pending"
+    assert outcome["reason"] == "context_mismatch"
+    assert len(adapter.calls) == 0
+
+
+async def test_snapshot_oversize_fails_zero_paid_no_truncate(tmp_path):
+    settings = _prepare(tmp_path)
+    _append(settings, content="x" * 2000)
+    collector = _FakeCollector(history=tuple((i, THIRD, "T", "y" * 250, None) for i in range(19)))
+    adapter = _FakeAdapter("respond")
+    responder = _responder(settings, adapter=adapter, collector=collector)
+    outcome = await responder.tick()
+    assert outcome["status"] == "failed"
+    assert outcome["reason"] == "snapshot_oversize"
+    assert len(adapter.calls) == 0
 
 
 async def test_fifo_observe_then_respond_ack_prefix(tmp_path):
     settings = _prepare(tmp_path)
-    client = _FakeClient()
+    _append(settings)
     mid2 = SOURCE_MID + 1
+    _append(settings, message_id=mid2)
+    client = _FakeClient()
     adapter = _FakeAdapter(["observe", "respond"])
-    inst = _responder(settings, client=client, adapter=adapter)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
-    _append(settings)
-    _append(settings, message_id=mid2, content="second")
-    result1 = await inst.tick()
-    assert result1["status"] == "observed"
-    assert result1["acked"] == 1
-    assert client.submit_calls == []  # observe first: no POST before it
-    _wire_turn(client, settings, source_mid=mid2, agent=("send", ("r2",)))
-    result2 = await inst.tick()
-    assert result2["status"] == "completed"
-    assert result2["acked"] == 2
-    assert len(client.submit_calls) == 1
-    assert len(adapter.calls) == 2
+    seen, _ = _wire_turn(client, settings, source_mid=mid2, agent=("send", ("x",)))
+    responder = _responder(settings, client=client, adapter=adapter)
+    first = await responder.tick()
+    assert first["status"] == "observed"
+    assert first["acked"] == 1
+    second = await responder.tick()
+    assert second["status"] == "sent"
+    assert second["acked"] == 2
 
 
-async def test_midflight_gate_race_respected_no_bind_no_post(tmp_path):
-    """A gate terminal landing during classification wins: no bind, no POST."""
+async def test_midflight_guard_race_respected_no_double_post(tmp_path):
     settings = _prepare(tmp_path)
+    _append(settings)
     client = _FakeClient()
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=None)
+    real_submit = client.submit_fn
+
+    async def _complete_during_post(sid, text, model=None, effort=None):
+        # The MCP tool completes no_reply during the POST await; the
+        # worker respects the terminal instead of closing over it.
+        with Store.open(settings.db_path) as store:
+            store.complete_job(CHANNEL, SOURCE_MID, outcome="no_reply")
+        return await real_submit(sid, text, model, effort)
+
+    client.submit_fn = _complete_during_post
+    responder = _responder(settings, client=client)
+    outcome = await responder.tick()
+    assert outcome["status"] == "no_reply"
+    assert len(client.submit_calls) == 1  # exactly one POST, never a second
+
+
+async def test_pre_classify_uid_binding(tmp_path):
+    settings = _prepare(tmp_path)
+    _append(settings, author_uid=THIRD, actor_kind="other")
+    client = _FakeClient()
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("x",)))
     adapter = _FakeAdapter("respond")
+    responder = _responder(settings, client=client, adapter=adapter)
+    outcome = await responder.tick()
+    assert outcome["status"] == "sent"
+    with Store.open(settings.db_path) as store:
+        record = store.get_jev(CHANNEL, SOURCE_MID)
+    assert record is not None
+    assert record["author_uid"] == THIRD
 
-    def gate_race():
-        mark_uncertain(settings.delivery_state_path, CHANNEL, SOURCE_MID, kind="timeout")
 
-    adapter.hook = gate_race
-    inst = _responder(settings, client=client, adapter=adapter)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
+async def test_out_of_scope_and_self_filtered_idle(tmp_path):
+    settings = _prepare(tmp_path)
+    _append(settings, channel_id=999999)
+    _append(
+        settings, message_id=SOURCE_MID + 1, author_uid=BOT, author_name="Bot", actor_kind="self"
+    )
+    responder = _responder(settings)
+    outcome = await responder.tick()
+    assert outcome["status"] == "idle"
+    assert outcome["acked"] == 2
+    with Store.open(settings.db_path) as store:
+        assert store.get_job(999999, SOURCE_MID)["skip_reason"] == "out_of_scope"
+        assert store.get_job(CHANNEL, SOURCE_MID + 1)["skip_reason"] == "bot_filtered"
+
+
+async def test_guard_ack_prefix_rejects_beyond_terminal(tmp_path):
+    settings = _prepare(tmp_path)
     _append(settings)
-    result = await inst.tick()
-    assert result["status"] == "uncertain"
-    job = get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)
-    assert job.get("jev_decision") is None
-    assert client.submit_calls == []
+    responder = _responder(settings)
+    with pytest.raises(ResponderError):
+        responder.guard_ack(1)
+    responder.guard_ack(0)
 
 
-async def test_ledger_attempt_id_is_32hex_and_binds(tmp_path):
-    """Regression: real ledger attempts bind to real delivery (32-hex, resolved conflict)."""
+async def test_correlated_job_accepts_only_inflight(tmp_path):
     settings = _prepare(tmp_path)
-    adapter = _FakeAdapter("observe")
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    collector = _FakeCollector()
-    entry = _entry_fields()
-    snapshot = await collector(entry)
-    record = await ledger.classify(
-        adapter, snapshot, channel_id=CHANNEL, message_id=SOURCE_MID, author_uid=OTHER
-    )
-    assert re.fullmatch(r"[0-9a-f]{32}", record["attempt_id"])
-    assert record["model"] == "jev-1.13.0"
-    enqueue_job(
-        settings.delivery_state_path,
-        channel_id=CHANNEL,
-        message_id=SOURCE_MID,
-        author_uid=OTHER,
-        actor_kind="other",
-        seq=1,
-    )
-    bound = delivery.bind_jev_decision(
-        settings.delivery_state_path,
-        CHANNEL,
-        SOURCE_MID,
-        context_sha256=record["fingerprint"],
-        attempt_id=record["attempt_id"],
-        model=record["model"],
-        participation=record["participation"],
-    )
-    assert bound["jev_decision"]["attempt_id"] == record["attempt_id"]
-
-
-# --- T3 loss guard --------------------------------------------------------------
-
-
-def test_loss_guard_proven_journal_missing_file_fails_before_create(tmp_path):
-    """A proven journal with a deleted ledger file FAILS construction (no reset/rebill)."""
-    import os
-
-    settings = _prepare(tmp_path)
-    enqueue_job(
-        settings.delivery_state_path,
-        channel_id=CHANNEL,
-        message_id=SOURCE_MID,
-        author_uid=OTHER,
-        actor_kind="other",
-        seq=1,
-    )
-    delivery.bind_jev_decision(
-        settings.delivery_state_path,
-        CHANNEL,
-        SOURCE_MID,
-        context_sha256="ab" * 32,
-        attempt_id="cd" * 16,
-        model="jev-1.13.0",
-        participation="respond",
-    )
-    assert not os.path.lexists(settings.jev_state_path)  # never created
-    with pytest.raises(ResponderError, match="refusing auto-create"):
-        Responder(
-            settings,
-            _FakeBot(),
-            client=_FakeClient(),
-            jev_adapter=_FakeAdapter("respond"),
-            context_collector=_FakeCollector(),
-            participation_ledger=None,  # real path: guard runs before auto-create
+    entry = _append(settings)
+    responder = _responder(settings)
+    with pytest.raises(ResponderError):
+        responder.correlated_job(SOURCE_MID, "ref", CHANNEL)
+    with Store.open(settings.db_path) as store:
+        store.enqueue_job(CHANNEL, SOURCE_MID, entry["seq"])
+        store.mark_submitted(
+            CHANNEL, SOURCE_MID, job_ref="ref", native_sid=SID, pre_turn_index=None
         )
-    assert not os.path.lexists(settings.jev_state_path)  # still missing: no reset file
+    meta = responder.correlated_job(SOURCE_MID, "ref", CHANNEL)
+    assert meta["stage"] == "submitted"
+    with pytest.raises(ResponderError):
+        responder.correlated_job(SOURCE_MID, "stale", CHANNEL)
 
 
-def test_fresh_install_inits_ledger_zero_calls(tmp_path):
-    """Fresh installs exclusively init the ledger with zero provider/SDK/POST work."""
-    import os
-    import stat
-
+async def test_close_fails_midflight_keeps_queued(tmp_path):
     settings = _prepare(tmp_path)
-    adapter = _FakeAdapter("respond")
-    inst = Responder(
-        settings,
-        _FakeBot(),
-        client=_FakeClient(),
-        jev_adapter=adapter,
-        context_collector=_FakeCollector(),
-        participation_ledger=None,
-    )
-    assert os.path.lexists(settings.jev_state_path)
-    assert stat.S_IMODE(os.stat(settings.jev_state_path).st_mode) == 0o600
-    assert len(adapter.calls) == 0
-    # The initialized file reopens as the same ledger (durable, exclusive).
-    reopened = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    assert reopened.get(CHANNEL, SOURCE_MID) is None
-    assert inst._participation_ledger is not None
-
-
-# --- T4 ledger activation binding (constructor marker + runtime guard) ---------
-
-
-def test_marker_fresh_bind_durable_zero_calls(tmp_path):
-    """Fresh installs bind the ledger marker with zero provider/SDK/POST work."""
-    import os
-    import stat
-
-    settings = _prepare(tmp_path)
-    # Seed an unknown top-level field to prove the bind preserves it.
-    raw = json.loads(settings.delivery_state_path.read_text(encoding="utf-8"))
-    raw["operator_note"] = "keep-me"
-    settings.delivery_state_path.write_text(json.dumps(raw), encoding="utf-8")
-    adapter = _FakeAdapter("respond")
-    client = _FakeClient()
-    inst = Responder(
-        settings,
-        _FakeBot(),
-        client=client,
-        jev_adapter=adapter,
-        context_collector=_FakeCollector(),
-        participation_ledger=None,
-    )
-    ledger_id = inst._participation_ledger.ledger_id
-    assert re.fullmatch(r"[0-9a-f]{32}", ledger_id)
-    assert os.path.lexists(settings.jev_state_path)
-    assert stat.S_IMODE(os.stat(settings.jev_state_path).st_mode) == 0o600
-    state = delivery.load_delivery_state(settings.delivery_state_path)
-    assert state["jev_ledger_id"] == ledger_id
-    assert state["native_session_id"] == SID
-    assert state["baseline_acked"] == 0 and state["jobs"] == {}
-    assert state["operator_note"] == "keep-me"
-    assert len(adapter.calls) == 0
-    assert client.snapshot_calls == [] and client.submit_calls == []
-    assert client.trace_calls == []
-    # The committed ledger reopens as the same identity (durable order).
-    assert ParticipationLedger(settings.jev_state_path, native_sid=SID).ledger_id == ledger_id
-
-
-def test_marker_bind_order_ledger_committed_first(tmp_path, monkeypatch):
-    """The marker bind observes an already-committed readable ledger file."""
-    settings = _prepare(tmp_path)
-    seen: dict = {}
-    orig_bind = delivery.bind_jev_ledger
-
-    def spy_bind(path, *, ledger_id):
-        seen["ledger_exists"] = os.path.lexists(settings.jev_state_path)
-        seen["file_id"] = ParticipationLedger(settings.jev_state_path, native_sid=SID).ledger_id
-        seen["arg"] = ledger_id
-        return orig_bind(path, ledger_id=ledger_id)
-
-    monkeypatch.setattr(delivery, "bind_jev_ledger", spy_bind)
-    Responder(
-        settings,
-        _FakeBot(),
-        client=_FakeClient(),
-        jev_adapter=_FakeAdapter("respond"),
-        context_collector=_FakeCollector(),
-        participation_ledger=None,
-    )
-    assert seen["ledger_exists"] is True
-    assert seen["file_id"] == seen["arg"]
-    assert (
-        delivery.load_delivery_state(settings.delivery_state_path)["jev_ledger_id"] == seen["arg"]
-    )
-
-
-async def test_marker_repeat_restart_no_rewrite_retains_cost(tmp_path):
-    """Exact-repeat restarts rebind idempotently: no rewrite, spend retained."""
-    settings = _prepare(tmp_path)
-    collector = _FakeCollector()
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    # Seed one decided record (known cost) before any Responder exists.
-    snapshot = await collector(_entry_fields())
-    record = await ledger.classify(
-        _FakeAdapter("observe"),
-        snapshot,
-        channel_id=CHANNEL,
-        message_id=SOURCE_MID,
-        author_uid=OTHER,
-    )
-    assert record["status"] == "decided"
-    before_summary = ledger.summary()
-    _responder(settings, client=_FakeClient(), adapter=_FakeAdapter("observe"), ledger=ledger)
-    assert (
-        delivery.load_delivery_state(settings.delivery_state_path)["jev_ledger_id"]
-        == ledger.ledger_id
-    )
-    delivery_bytes = settings.delivery_state_path.read_bytes()
-    ledger_bytes = settings.jev_state_path.read_bytes()
-    # Restart: brand-new Responder + reopened ledger, same files.
-    ledger2 = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    _responder(settings, client=_FakeClient(), adapter=_FakeAdapter("observe"), ledger=ledger2)
-    assert settings.delivery_state_path.read_bytes() == delivery_bytes  # no rewrite
-    assert settings.jev_state_path.read_bytes() == ledger_bytes
-    assert ledger2.summary() == before_summary  # spend retained, never reset
-    assert ledger2.get(CHANNEL, SOURCE_MID)["attempt_id"] == record["attempt_id"]
-
-
-def test_loss_guard_marked_missing_fails_before_create(tmp_path):
-    """A marked journal with a missing ledger file FAILS before auto-create."""
-    settings = _prepare(tmp_path)
-    marker = "ab" * 16
-    delivery.bind_jev_ledger(settings.delivery_state_path, ledger_id=marker)
-    assert not os.path.lexists(settings.jev_state_path)  # never created
-    with pytest.raises(ResponderError, match="refusing auto-create"):
-        Responder(
-            settings,
-            _FakeBot(),
-            client=_FakeClient(),
-            jev_adapter=_FakeAdapter("respond"),
-            context_collector=_FakeCollector(),
-            participation_ledger=None,  # real path: guard runs before auto-create
+    entry = _append(settings)
+    mid2 = SOURCE_MID + 1
+    entry2 = _append(settings, message_id=mid2)
+    # Construct the responder FIRST (constructor sweeps submitted -> failed),
+    # then drive the job to submitted, then close.
+    responder = _responder(settings)
+    with Store.open(settings.db_path) as store:
+        store.enqueue_job(CHANNEL, SOURCE_MID, entry["seq"])
+        store.enqueue_job(CHANNEL, mid2, entry2["seq"])
+        store.mark_submitted(
+            CHANNEL, SOURCE_MID, job_ref="ref", native_sid=SID, pre_turn_index=None
         )
-    assert not os.path.lexists(settings.jev_state_path)  # still missing: no reset file
-    assert delivery.load_delivery_state(settings.delivery_state_path)["jev_ledger_id"] == marker
+    await responder.close()
+    assert _job(settings)["stage"] == "failed"
+    assert _job(settings)["fail_kind"] == "shutdown"
+    assert _job(settings, mid2)["stage"] == "queued"
 
 
-async def test_same_sid_different_id_fails_no_overwrite_no_rebill(tmp_path):
-    """Same SID + different file ID fails with both files preserved, no rebill."""
+async def test_target_dm_adoption_single_transaction(tmp_path):
     settings = _prepare(tmp_path)
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    snapshot = await _FakeCollector()(_entry_fields())
-    record = await ledger.classify(
-        _FakeAdapter("observe"),
-        snapshot,
-        channel_id=CHANNEL,
-        message_id=SOURCE_MID,
-        author_uid=OTHER,
-    )
-    assert record["status"] == "decided"
-    other_id = "cd" * 16
-    assert other_id != ledger.ledger_id
-    delivery.bind_jev_ledger(settings.delivery_state_path, ledger_id=other_id)
-    delivery_bytes = settings.delivery_state_path.read_bytes()
-    ledger_bytes = settings.jev_state_path.read_bytes()
-    adapter = _FakeAdapter("respond")
-    with pytest.raises(delivery.DeliveryError, match="jev ledger conflict"):
-        Responder(
-            settings,
-            _FakeBot(),
-            client=_FakeClient(),
-            jev_adapter=adapter,
-            context_collector=_FakeCollector(),
-            participation_ledger=None,
-        )
-    assert settings.delivery_state_path.read_bytes() == delivery_bytes  # no overwrite
-    assert settings.jev_state_path.read_bytes() == ledger_bytes  # committed, no rollback
-    assert len(adapter.calls) == 0
-    assert ledger.get(CHANNEL, SOURCE_MID)["attempt_id"] == record["attempt_id"]  # no rebill
-    assert delivery.load_delivery_state(settings.delivery_state_path)["jev_ledger_id"] == other_id
-
-
-def test_injected_real_wrong_id_fails(tmp_path):
-    """An injected REAL ledger with the wrong ID fails; marker + file preserved."""
-    settings = _prepare(tmp_path)
-    dir_a = tmp_path / "a"
-    dir_a.mkdir()
-    dir_b = tmp_path / "b"
-    dir_b.mkdir()
-    ledger_a = ParticipationLedger(dir_a / "jev.json", native_sid=SID)
-    delivery.bind_jev_ledger(settings.delivery_state_path, ledger_id=ledger_a.ledger_id)
-    ledger_b = ParticipationLedger(dir_b / "jev.json", native_sid=SID)
-    assert ledger_b.ledger_id != ledger_a.ledger_id
-    before_delivery = settings.delivery_state_path.read_bytes()
-    before_b = (dir_b / "jev.json").read_bytes()
-    with pytest.raises(delivery.DeliveryError, match="jev ledger conflict"):
-        _responder(settings, ledger=ledger_b)
-    assert settings.delivery_state_path.read_bytes() == before_delivery
-    assert (dir_b / "jev.json").read_bytes() == before_b
-    assert (
-        delivery.load_delivery_state(settings.delivery_state_path)["jev_ledger_id"]
-        == ledger_a.ledger_id
-    )
-
-
-def test_injected_ledger_id_contract_strict(tmp_path):
-    """Injected ledgers must expose strict 32 lower hex; nothing is bound else."""
-
-    class _NoId:
-        async def classify(self, *args, **kwargs):
-            raise AssertionError("never classify")
-
-    class _BadId:
-        def __init__(self, value):
-            self._value = value
-
-        @property
-        def ledger_id(self):
-            return self._value
-
-        async def classify(self, *args, **kwargs):
-            raise AssertionError("never classify")
-
-    settings = _prepare(tmp_path)
-    with pytest.raises(ResponderError, match="must provide ledger_id"):
-        _responder(settings, ledger=_NoId())
-    for bad in ("AB" * 16, "ab" * 15 + "AB", "zz" * 16, "abc", "", None, 1234):
-        with pytest.raises(ResponderError, match="jev ledger id invalid"):
-            _responder(settings, ledger=_BadId(bad))
-    assert delivery.load_delivery_state(settings.delivery_state_path)["jev_ledger_id"] is None
-
-
-async def test_runtime_ledger_loss_raises_zero_provider(tmp_path):
-    """A ledger file lost mid-runtime raises naturally with zero new paid work."""
-    settings = _prepare(tmp_path)
-    client = _FakeClient()
-    adapter = _FakeAdapter("respond")
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    inst = _responder(settings, client=client, adapter=adapter, ledger=ledger)
-    marker = delivery.load_delivery_state(settings.delivery_state_path)["jev_ledger_id"]
-    assert marker == ledger.ledger_id
-    _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("hi",)))
     _append(settings)
-    settings.jev_state_path.unlink()  # file lost while the process is alive
-    with pytest.raises(ParticipationError, match="missing"):
-        await inst.tick()
-    assert len(adapter.calls) == 0
-    assert client.submit_calls == []
-    assert not settings.jev_state_path.exists()  # never auto-recreated
-    job = get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)
-    assert job["stage"] == "queued" and job.get("jev_decision") is None
-    assert delivery.load_delivery_state(settings.delivery_state_path)["jev_ledger_id"] == marker
+    client = _FakeClient()
+    client.dm_sid = SID2
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("x",)))
+    responder = _responder(settings, client=client)
+    outcome = await responder.tick()
+    assert outcome["status"] == "sent"
+    assert responder.native_sid == SID2
+    with Store.open(settings.db_path) as store:
+        assert store.get_native_sid() == SID2
+        days = {r[0] for r in store._conn.execute("SELECT day FROM sessions;").fetchall()}
+        assert DAY in days
 
 
-async def test_runtime_ledger_replaced_id_halts_zero_provider(tmp_path):
-    """A replaced ledger file (same SID, new ID) halts before classification."""
+async def test_target_dm_blocked_by_midflight_reconciles(tmp_path):
     settings = _prepare(tmp_path)
-    client = _FakeClient()
-    adapter = _FakeAdapter("respond")
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    inst = _responder(settings, client=client, adapter=adapter, ledger=ledger)
-    original_id = ledger.ledger_id
-    _wire_turn(client, settings, source_mid=SOURCE_MID, agent=("send", ("hi",)))
     _append(settings)
-    other = tmp_path / "replacement.json"
-    ParticipationLedger(other, native_sid=SID)
-    replacement_id = ParticipationLedger(other, native_sid=SID).ledger_id
-    assert replacement_id != original_id
-    settings.jev_state_path.write_bytes(other.read_bytes())
-    assert ledger.ledger_id == replacement_id  # property reloads: sees the new file ID
-    with pytest.raises(ResponderError, match="binding mismatch"):
-        await inst.tick()
-    assert len(adapter.calls) == 0
-    assert client.submit_calls == []
-    assert ledger.get(CHANNEL, SOURCE_MID) is None  # guard ran before started persist
-    raw = json.loads(settings.jev_state_path.read_text(encoding="utf-8"))
-    assert raw["attempts"] == {} and raw["ledger_id"] == replacement_id
-    assert (
-        delivery.load_delivery_state(settings.delivery_state_path)["jev_ledger_id"] == original_id
-    )
-
-
-async def test_runtime_delivery_marker_replaced_halts(tmp_path):
-    """A replaced journal marker (same SID, new ID) halts before classification."""
-    settings = _prepare(tmp_path)
     client = _FakeClient()
-    adapter = _FakeAdapter("observe")
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    inst = _responder(settings, client=client, adapter=adapter, ledger=ledger)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
-    _append(settings)
-    raw = json.loads(settings.delivery_state_path.read_text(encoding="utf-8"))
-    raw["jev_ledger_id"] = "ff" * 16
-    settings.delivery_state_path.write_text(json.dumps(raw), encoding="utf-8")
-    with pytest.raises(ResponderError, match="binding mismatch"):
-        await inst.tick()
-    assert len(adapter.calls) == 0
-    assert ledger.get(CHANNEL, SOURCE_MID) is None
-    job = get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)
-    assert job["stage"] == "queued" and job.get("jev_decision") is None
-
-
-async def test_runtime_delivery_unmarked_halts_no_rebind(tmp_path):
-    """A marker lost mid-runtime fails closed; the runtime path never rebinds."""
-    settings = _prepare(tmp_path)
-    client = _FakeClient()
-    adapter = _FakeAdapter("observe")
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    inst = _responder(settings, client=client, adapter=adapter, ledger=ledger)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
-    _append(settings)
-    raw = json.loads(settings.delivery_state_path.read_text(encoding="utf-8"))
-    raw["jev_ledger_id"] = None
-    settings.delivery_state_path.write_text(json.dumps(raw), encoding="utf-8")
-    with pytest.raises(ResponderError, match="binding missing"):
-        await inst.tick()
-    assert len(adapter.calls) == 0
-    assert ledger.get(CHANNEL, SOURCE_MID) is None
-    assert delivery.load_delivery_state(settings.delivery_state_path)["jev_ledger_id"] is None
-
-
-async def test_runtime_orphan_started_preserved_no_reset(tmp_path):
-    """An orphan unknown halt survives a binding hold; restore keeps blocking."""
-    settings = _prepare(tmp_path)
-    client = _FakeClient()
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    # Seed an orphan failed_unknown for ANOTHER key (global unknown halt).
-    other_state = {
-        "assistant_uid": str(BOT),
-        "owner_uid": str(OWNER),
-        "participants": [
-            {"uid": str(OWNER), "display_name": "O"},
-            {"uid": str(BOT), "display_name": "B"},
-            {"uid": str(THIRD), "display_name": "T"},
-        ],
-        "messages": [{"id": "900", "sender_uid": str(THIRD), "text": "seed"}],
-        "new_message_id": "900",
-    }
-    failing = _FakeAdapter("respond")
-    failing.raise_exc = JevError("network", detail="boom", unknown_billing=True)
-    with pytest.raises(Exception, match="participation pending"):
-        await ledger.classify(
-            failing, other_state, channel_id=CHANNEL, message_id=900, author_uid=THIRD
-        )
-    assert ledger.get(CHANNEL, 900)["status"] == "failed_unknown"
-    adapter = _FakeAdapter("observe")
-    inst = _responder(settings, client=client, adapter=adapter, ledger=ledger)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
-    _append(settings)
-    delivery_bytes = settings.delivery_state_path.read_bytes()
-    raw = json.loads(delivery_bytes.decode("utf-8"))
-    raw["jev_ledger_id"] = "ee" * 16
-    settings.delivery_state_path.write_text(json.dumps(raw), encoding="utf-8")
-    with pytest.raises(ResponderError, match="binding mismatch"):
-        await inst.tick()
-    assert len(adapter.calls) == 0
-    assert ledger.get(CHANNEL, 900)["status"] == "failed_unknown"  # orphan preserved
-    # Restore the journal: the original unknown halt still blocks, no rebill.
-    settings.delivery_state_path.write_bytes(delivery_bytes)
-    result = await inst.tick()
-    assert result["status"] == "pending" and result["reason"] == "unknown_blocked"
-    assert len(adapter.calls) == 0
-    assert get_job(settings.delivery_state_path, CHANNEL, SOURCE_MID)["stage"] == "queued"
-
-
-async def test_binding_errors_disclose_nothing(tmp_path):
-    """Binding failures carry no source text, IDs, marker values, or keys."""
-    settings = _settings(tmp_path, typesafe_api_key="sk-fake-secret-key")
-    _init_delivery(settings)
-    secret = "SECRET-CONTENT-58291-private"
-    client = _FakeClient()
-    adapter = _FakeAdapter("respond")
-    ledger = ParticipationLedger(settings.jev_state_path, native_sid=SID)
-    real_id = ledger.ledger_id
-    inst = _responder(settings, client=client, adapter=adapter, ledger=ledger)
-    _wire_turn(client, settings, source_mid=SOURCE_MID)
-    _append(settings, content=secret)
-    raw = json.loads(settings.delivery_state_path.read_text(encoding="utf-8"))
-    raw["jev_ledger_id"] = "dd" * 16
-    settings.delivery_state_path.write_text(json.dumps(raw), encoding="utf-8")
-    with pytest.raises(ResponderError, match="binding mismatch") as excinfo:
-        await inst.tick()
-    text = str(excinfo.value)
-    assert secret not in text
-    assert real_id not in text and "dd" * 16 not in text
-    assert "sk-fake-secret-key" not in text
-    assert str(OTHER) not in text and str(SOURCE_MID) not in text
-    # The constructor conflict is equally coarse (path + kind only).
-    other = tmp_path / "other.json"
-    ParticipationLedger(other, native_sid=SID)
-    with pytest.raises(delivery.DeliveryError) as excinfo2:
-        _responder(settings, ledger=ParticipationLedger(other, native_sid=SID))
-    text2 = str(excinfo2.value)
-    assert secret not in text2 and "sk-fake-secret-key" not in text2
+    seen, _ = _wire_turn(client, settings, source_mid=SOURCE_MID, agent=None, submit_running=True)
+    responder = _responder(settings, client=client)
+    first = await responder.tick()
+    assert first["status"] == "pending"
+    assert first["reason"] == "turn_running"
+    assert _job(settings)["stage"] == "submitted"
+    # DM changes while a job is mid-flight: adoption defers with a
+    # reconcile-only pass on the old SID (no submit, no re-adopt).
+    client.dm_sid = SID2
+    second = await responder.tick()
+    assert second["reason"] == "target_dm_blocked"
+    assert responder.native_sid == SID  # still on the old SID

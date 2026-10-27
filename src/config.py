@@ -5,7 +5,6 @@ then the project-local ``.env`` file. Env names match field names
 case-insensitively, e.g. ``DISCORD_TOKEN``.
 """
 
-import math
 import os
 import re
 from pathlib import Path
@@ -42,56 +41,43 @@ class Settings(BaseSettings):
         "Required-effective: empty or invalid values fail Settings construction.",
     )
     audit_path: Path = Field(default=PROJECT_ROOT / "audit.jsonl")
-    outbox_path: Path = Field(
-        default=PROJECT_ROOT / "outbox.jsonl",
-        description="Append-only JSONL outbox of captured Discord messages.",
-    )
-    outbox_state_path: Path = Field(
-        default=PROJECT_ROOT / "outbox_state.json",
-        description="Outbox cursors (seq/acked/poll). Saved atomically.",
+    db_path: Path = Field(
+        default=PROJECT_ROOT / "state.db",
+        description="SQLite store (outbox in Phase 2a; jobs/Jev follow).",
     )
     watch_channel_ids: list[int] = Field(
         default_factory=list,
         description="Channels captured into the outbox. Empty means [default_channel_id].",
     )
-    command_prefix: str = "!"
     intent_message_content: bool = True
     intent_members: bool = True
-    chunk_guilds_at_startup: bool = False
+    chunk_guilds_at_startup: bool = True
     thyca_base_url: str = Field(
         default="http://127.0.0.1:8765",
         description="Thyca agent HTTP base URL (loopback). Validated by the native client.",
     )
-    delivery_state_path: Path = Field(
-        default=PROJECT_ROOT / "delivery_state.json",
-        description="Responder delivery cursors. Saved atomically by the delivery module.",
-    )
     responder_check_seconds: float = Field(
         default=1.0,
         gt=0,
+        allow_inf_nan=False,
         description="Operational poll tick for the responder loop. Must be finite and > 0.",
     )
     thyca_request_timeout_seconds: float = Field(
         default=900.0,
         gt=0,
+        allow_inf_nan=False,
         description="Technical upper bound for one Thyca agent request. Must be finite and > 0.",
     )
     recovery_poll_seconds: float = Field(
         default=30.0,
         ge=30,
+        allow_inf_nan=False,
         description="Native recovery poll interval floor. Must be finite and >= 30.",
     )
     typesafe_api_key: SecretStr | None = Field(
         default=None,
         description="TypeSafe Jev API key for paid classification. Lazy: only read when "
         "the responder builds its real Jev adapter. Never log or echo.",
-    )
-    jev_state_path: Path | None = Field(
-        default=None,
-        description="Jev participation ledger state. Defaults beside the configured "
-        "delivery state (same parent, jev_state.json) so tmp delivery paths "
-        "never leak ledger writes to the repo root. Must not collide with "
-        "delivery/outbox/audit paths.",
     )
     conversation_max_messages: int = Field(
         default=20,
@@ -113,19 +99,6 @@ class Settings(BaseSettings):
         """Reject bools: pydantic lax mode would coerce True -> 1.0, hiding config errors."""
         if isinstance(value, bool):
             raise ValueError("must be a number, not a bool")
-        return value
-
-    @field_validator(
-        "responder_check_seconds",
-        "thyca_request_timeout_seconds",
-        "recovery_poll_seconds",
-        mode="after",
-    )
-    @classmethod
-    def _require_finite_numeric(cls, value: float) -> float:
-        """Reject NaN/Inf: bounds checks alone would let Inf through (Inf > 0)."""
-        if not math.isfinite(value):
-            raise ValueError("must be finite")
         return value
 
     @field_validator("conversation_max_messages", mode="before")
@@ -162,29 +135,15 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _default_jev_state_path(self) -> "Settings":
-        """Derive the ledger path beside delivery state; reject owned collisions.
+    def _guard_db_audit_distinct(self) -> "Settings":
+        """One-line lexical guard: the store and the audit log must differ.
 
-        Runs after ``_default_watch_channels``. An explicit ``jev_state_path``
-        is kept; otherwise it defaults to the delivery parent joined with
-        ``jev_state.json`` so tmp delivery paths never leak ledger writes to
-        the repo root. The pure-lexically-normalized path (``os.path.abspath``
-        + ``os.path.normpath``, no filesystem access) must not equal delivery,
-        "delivery/outbox/outbox-state/audit paths by the same normalization.
-        Chosen values are preserved exactly; only canonical lexical identities
-        are compared. Symlink/hardlink aliases remain the ledger store's
-        fail-closed responsibility; this guard claims no physical alias detection.
+        Runs after ``_default_watch_channels``. Pure lexical identity
+        (``os.path.abspath`` + ``os.path.normpath``, no filesystem access);
+        chosen values are preserved exactly. The store holds durable job
+        state while the audit log stays an append-only text log -- pointing
+        both at one file would corrupt both.
         """
-        if self.jev_state_path is None:
-            self.jev_state_path = self.delivery_state_path.parent / "jev_state.json"
-        assert self.jev_state_path is not None
-        jev_key = _lexical_path_key(self.jev_state_path)
-        for name in (
-            "delivery_state_path",
-            "outbox_path",
-            "outbox_state_path",
-            "audit_path",
-        ):
-            if jev_key == _lexical_path_key(getattr(self, name)):
-                raise ValueError(f"jev_state_path collides with {name}")
+        if _lexical_path_key(self.db_path) == _lexical_path_key(self.audit_path):
+            raise ValueError("db_path collides with audit_path")
         return self

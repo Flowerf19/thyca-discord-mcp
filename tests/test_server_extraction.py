@@ -20,14 +20,14 @@ import discord
 import pytest
 
 from config import Settings
-from delivery import DeliveryError
-from outbox import get_poll_cursor, read_entries
 from server import create_server
 from server_ticks import (
     make_auto_reply_tick,
     make_heartbeat_tick,
     make_poll_tick,
 )
+from store import StoreError, get_poll_cursor, read_entries
+from tasks import TaskRegistry
 
 BOT_UID = 111
 OWNER_UID = 222
@@ -67,7 +67,7 @@ class FakeGuild:
 
 
 class FakeBot:
-    """Minimal bot surface: ready flag, guild lookup, listener no-ops."""
+    """Minimal bot surface: ready flag, guild lookup, event capture."""
 
     def __init__(self, guild, *, user=None, fetch_map=None):
         self.user = user or FakeUser(BOT_UID, "ThycaBot", bot=True)
@@ -77,28 +77,32 @@ class FakeBot:
         self.listeners: dict[str, list] = {}
         self._closed = False
         self._ready = False
+        self._setup = False  # mirrors Client._ready existing after _async_setup_hook
+        # Mirrors the gateway READY dispatch: set only by a successful start.
+        self._ready_event = asyncio.Event()
         self._close_event = asyncio.Event()
 
-    def add_listener(self, func, name):
-        self.events.append("add_listener")
-        self.listeners.setdefault(name, []).append(func)
+    def event(self, func):
+        self.events.append("event")
+        self.listeners.setdefault(func.__name__, []).append(func)
+        return func
 
-    def remove_listener(self, func, name):
-        self.events.append("remove_listener")
-        try:
-            self.listeners.get(name, []).remove(func)
-        except ValueError:
-            pass
-
-    async def login(self, token):  # noqa: ARG002 - signature mirrors discord.py
-        self.events.append("login")
-
-    async def connect(self):
-        self.events.append("connect")
+    async def start(self, token):  # noqa: ARG002 - signature mirrors discord.py
+        self.events.append("start")
+        self._setup = True  # mirrors _async_setup_hook at login() entry
+        # Successful gateway connect dispatches READY, then stays open.
+        self._ready_event.set()
         await self._close_event.wait()
 
     async def wait_until_ready(self):
         self.events.append("wait_ready")
+        if not self._setup:
+            # Mirrors the real Client: raises before login() creates _ready.
+            raise RuntimeError(
+                "Client has not been properly initialised. "
+                "Please use the login method before calling this method"
+            )
+        await self._ready_event.wait()
         self._ready = True
 
     def is_ready(self):
@@ -181,12 +185,10 @@ def _settings_kwargs(tmp_path):
         guild_id=GUILD_ID,
         default_channel_id=CHANNEL_ID,
         audit_path=tmp_path / "audit.jsonl",
-        outbox_path=tmp_path / "outbox.jsonl",
-        outbox_state_path=tmp_path / "outbox_state.json",
+        db_path=tmp_path / "state.db",
         watch_channel_ids=[CHANNEL_ID],
         responder_check_seconds=0.05,
         recovery_poll_seconds=30.0,
-        delivery_state_path=tmp_path / "delivery_state.json",
     )
 
 
@@ -292,17 +294,17 @@ async def test_poll_first_tick_captures_newest20_reversed(settings):
     tick = make_poll_tick(settings, CHANNEL_ID, lambda: bot, sink)
     assert await tick() is None
     assert calls[0] == {"limit": 20, "oldest_first": False}
-    data = read_entries(settings.outbox_path, settings.outbox_state_path, unread_only=False)
+    data = read_entries(settings.db_path, unread_only=False)
     assert [e["message_id"] for e in data["entries"]] == [101, 102, 103]
     assert [e["actor_kind"] for e in data["entries"]] == ["self", "other", "owner"]
-    assert get_poll_cursor(settings.outbox_state_path, CHANNEL_ID) == 103
+    assert get_poll_cursor(settings.db_path, CHANNEL_ID) == 103
     assert audits == []
 
 
 async def test_poll_later_tick_pages_after_cursor(settings):
-    from outbox import set_poll_cursor as _set
+    from store import set_poll_cursor as _set
 
-    _set(settings.outbox_state_path, CHANNEL_ID, 200)
+    _set(settings.db_path, CHANNEL_ID, 200)
     msgs = [FakeMessage(201, FakeUser(OWNER_UID, "Owner"), "next")]
     history, calls, _ = make_history(msgs)
     channel = make_text_channel(CHANNEL_ID, history=history)
@@ -313,7 +315,7 @@ async def test_poll_later_tick_pages_after_cursor(settings):
     assert calls[0]["limit"] == 100
     assert calls[0]["oldest_first"] is True
     assert calls[0]["after"].id == 200
-    assert get_poll_cursor(settings.outbox_state_path, CHANNEL_ID) == 201
+    assert get_poll_cursor(settings.db_path, CHANNEL_ID) == 201
     assert audits == []
 
 
@@ -329,7 +331,7 @@ async def test_poll_error_audits_and_leaves_cursor(settings):
     assert audits[0]["ok"] is False
     assert audits[0]["args"] == {"channel_id": CHANNEL_ID}
     assert "history boom" in audits[0]["error"]
-    assert get_poll_cursor(settings.outbox_state_path, CHANNEL_ID) is None
+    assert get_poll_cursor(settings.db_path, CHANNEL_ID) is None
 
 
 async def test_poll_cancel_propagates_without_audit(settings):
@@ -351,7 +353,7 @@ async def test_poll_factory_no_io_until_tick(settings):
     tick = make_poll_tick(settings, CHANNEL_ID, lambda: bot, sink)
     assert calls == []
     assert audits == []
-    assert not settings.outbox_path.exists()
+    assert not settings.db_path.exists()
     assert not settings.audit_path.exists()
     await tick()
     assert len(calls) == 1
@@ -360,36 +362,27 @@ async def test_poll_factory_no_io_until_tick(settings):
 # --- auto-reply factory -----------------------------------------------------
 
 
-class _FakeLoop:
-    def __init__(self):
-        self.stops = 0
-
-    def stop(self):
-        self.stops += 1
-
-
-async def test_auto_success_no_audit_no_stop(settings):
+async def test_auto_success_no_audit(settings):
     responder = FakeResponder()
     sink, audits = _audit_spy()
-    tick, holder = make_auto_reply_tick(settings, responder, sink)
-    assert type(holder) is dict
-    assert holder == {}
+    tick, on_error = make_auto_reply_tick(settings, responder, sink)
+    assert callable(on_error)  # native Loop error handler, registered by the lifespan
     assert await tick() is None
     assert responder.ticks == 1
     assert audits == []
 
 
-async def test_auto_failure_audits_coarse_and_stops_loop(settings):
+async def test_auto_failure_propagates_and_handler_audits_coarse(settings):
     class Failing:
         async def tick(self):
-            raise DeliveryError("journal exploded CANARY_A1")
+            raise StoreError("store exploded CANARY_A1")
 
-    loop = _FakeLoop()
     sink, audits = _audit_spy()
-    tick, holder = make_auto_reply_tick(settings, Failing(), sink)
-    holder["loop"] = loop
-    assert await tick() is None  # contained, never raised
-    assert loop.stops == 1
+    tick, on_error = make_auto_reply_tick(settings, Failing(), sink)
+    with pytest.raises(StoreError, match="store exploded"):
+        await tick()  # propagates: the native Loop ends failed, never retries
+    assert audits == []  # the tick itself never audits; the handler does
+    await on_error(StoreError("store exploded CANARY_A1"))
     assert len(audits) == 1
     assert audits[0]["tool"] == "auto_reply_tick"
     assert audits[0]["ok"] is False
@@ -398,7 +391,7 @@ async def test_auto_failure_audits_coarse_and_stops_loop(settings):
     assert "CANARY_A1" not in str(audits)
 
 
-async def test_auto_audit_sink_failure_still_stops_fixed_stderr(settings, capsys):
+async def test_auto_error_handler_dead_sink_signals_without_raise(settings, capsys):
     poison = "POISON_CANARY_B2"
     sink_canary = "SINK_CANARY_B2"
 
@@ -409,41 +402,73 @@ async def test_auto_audit_sink_failure_still_stops_fixed_stderr(settings, capsys
     def _dead_sink(*args, **kwargs):  # noqa: ARG001 - signature mirrors append_audit
         raise OSError(f"audit sink dead {sink_canary}")
 
-    loop = _FakeLoop()
-    tick, holder = make_auto_reply_tick(settings, Failing(), _dead_sink)
-    holder["loop"] = loop
-    assert await tick() is None
-    assert loop.stops == 1  # unconditional stop despite the dead sink
+    tick, on_error = make_auto_reply_tick(settings, Failing(), _dead_sink)
+    with pytest.raises(RuntimeError, match="native poison"):
+        await tick()
+    await on_error(RuntimeError(f"native poison {poison}"))  # must not raise
     err = capsys.readouterr().err
     assert err.count("thyca-discord-mcp: auto_reply_tick audit failed") == 1
     assert poison not in err
     assert sink_canary not in err
 
 
-async def test_auto_cancel_propagates_without_stop_or_audit(settings):
+async def test_auto_cancel_propagates_without_audit(settings):
     class Cancelling:
         async def tick(self):
             raise asyncio.CancelledError
 
-    loop = _FakeLoop()
     sink, audits = _audit_spy()
-    tick, holder = make_auto_reply_tick(settings, Cancelling(), sink)
-    holder["loop"] = loop
+    tick, _on_error = make_auto_reply_tick(settings, Cancelling(), sink)
     with pytest.raises(asyncio.CancelledError):
         await tick()
     assert audits == []
-    assert loop.stops == 0
 
 
 async def test_auto_factory_no_io_until_tick(settings):
     responder = FakeResponder()
     sink, audits = _audit_spy()
-    tick, holder = make_auto_reply_tick(settings, responder, sink)
+    tick, on_error = make_auto_reply_tick(settings, responder, sink)
     assert responder.ticks == 0
     assert audits == []
-    assert holder == {}
+    assert callable(on_error)
     await tick()
     assert responder.ticks == 1
+
+
+async def test_oserror_tick_failure_reaches_handler_and_stops_loop(settings):
+    """Regression: OSError must reach @loop.error, not backoff-retry forever.
+
+    Without ``loop.clear_exception_types()`` (lifespan wiring) the native Loop
+    retries OSError/GatewayNotFound/aiohttp errors with backoff and never
+    calls the error handler, breaking fail-closed stopping. With it, the
+    failure audits coarse exactly once and the task ends failed.
+    """
+
+    class FailingOSError:
+        async def tick(self):
+            raise OSError("gateway reset CANARY_OS1")
+
+    sink, audits = _audit_spy()
+    tick, on_error = make_auto_reply_tick(settings, FailingOSError(), sink)
+    registry = TaskRegistry()
+    loop = registry.register("auto-reply", tick, seconds=60.0, protected=True)
+    # Lifespan wiring under test: handler + cleared retry set.
+    loop.error(on_error)
+    loop.clear_exception_types()
+    registry.start("auto-reply")
+    try:
+        for _ in range(100):
+            if loop.failed():
+                break
+            await asyncio.sleep(0.05)
+        assert loop.failed() is True
+        assert registry.status("auto-reply").running is False
+        assert len(audits) == 1  # exactly one handler call: no retry
+        assert audits[0]["tool"] == "auto_reply_tick"
+        assert audits[0]["args"] == {"error_kind": "unknown"}
+        assert "CANARY_OS1" not in str(audits)
+    finally:
+        await registry.stop("auto-reply", allow_protected=True)
 
 
 # --- root late-patch proof ----------------------------------------------------
@@ -482,17 +507,15 @@ async def test_root_late_audit_patch_reroutes_all_ticks(settings, monkeypatch):
 
         ctx["responder"].tick = _boom
         loop = ctx["tasks"]._loops["auto-reply"]
-        stops: list[int] = []
-        orig_stop = loop.stop
-
-        def spy_stop(*args, **kwargs):
-            stops.append(1)
-            return orig_stop(*args, **kwargs)
-
-        loop.stop = spy_stop
-        await loop.coro()
+        try:
+            await loop.coro()
+        except ValueError as exc:
+            failure = exc
+        else:
+            pytest.fail("failing auto tick must propagate, never contain")
+        # Native wiring: the Loop routes the failure to the registered handler.
+        await loop._error(failure)
         assert {"tool": "auto_reply_tick", "ok": False} in late
-        assert stops == [1]
 
 
 async def test_root_registers_heartbeat_before_worker_loops(settings, monkeypatch):

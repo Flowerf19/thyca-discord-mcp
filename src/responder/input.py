@@ -14,20 +14,14 @@ from __future__ import annotations
 from typing import Any
 
 from identity import classify_actor
+from validate import is_strict_int as _is_strict_int  # noqa: F401 - re-exported via responder
+from validate import is_strict_positive_int as _is_strict_positive_int
 
 ID_MAX = 128
 
 
 class ResponderError(ValueError):
     """Coarse responder failure (never carries raw bodies or provider text)."""
-
-
-def _is_strict_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _is_strict_positive_int(value: Any) -> bool:
-    return _is_strict_int(value) and value > 0
 
 
 def _validate_id_string(value: Any) -> str | None:
@@ -41,34 +35,6 @@ def _validate_id_string(value: Any) -> str | None:
         if ch.isspace():
             return None
     return value
-
-
-def _is_strict_ledger_id(value: Any) -> bool:
-    """Strict canonical ledger activation identity: exactly 32 lower hex."""
-    if not isinstance(value, str) or len(value) != 32:
-        return False
-    for ch in value:
-        if ch not in "0123456789abcdef":
-            return False
-    return True
-
-
-def historical_pairs(historical: Any) -> set[tuple[int, int]]:
-    """Pure historical (channel_id, message_id) set (no Root fields)."""
-    pairs: set[tuple[int, int]] = set()
-    if not isinstance(historical, dict):
-        return pairs
-    for key, mids in historical.items():
-        try:
-            channel_id = int(key)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(mids, list):
-            continue
-        for mid in mids:
-            if _is_strict_positive_int(mid) and _is_strict_positive_int(channel_id):
-                pairs.add((channel_id, mid))
-    return pairs
 
 
 def validate_entry(entry: Any, *, bot_uid: int, owner_uid: int) -> dict[str, Any]:

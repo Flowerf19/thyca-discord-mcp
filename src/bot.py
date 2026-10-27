@@ -5,7 +5,6 @@ from __future__ import annotations
 import sys
 
 import discord
-from discord.ext import commands
 
 from config import Settings
 
@@ -17,9 +16,13 @@ def build_intents(settings: Settings) -> discord.Intents:
     return intents
 
 
-def build_bot(settings: Settings) -> commands.Bot:
-    bot = commands.Bot(
-        command_prefix=settings.command_prefix,
+def build_bot(settings: Settings) -> discord.Client:
+    # Chunking defaults on: the gateway fills the member cache before ready,
+    # so guild.members reads are complete. NOTE: intent_members=False with
+    # chunking raises ValueError at construction (enforced by discord.py);
+    # such a config fails loudly at startup instead of running on an
+    # empty member cache.
+    bot = discord.Client(
         intents=build_intents(settings),
         chunk_guilds_at_startup=settings.chunk_guilds_at_startup,
     )
@@ -33,7 +36,7 @@ def build_bot(settings: Settings) -> commands.Bot:
     return bot
 
 
-def get_scoped_guild(bot: commands.Bot, guild_id: int) -> discord.Guild:
+def get_scoped_guild(bot: discord.Client, guild_id: int) -> discord.Guild:
     """Return the configured guild from cache; fail loudly if absent."""
     guild = bot.get_guild(guild_id)
     if guild is None:
@@ -41,7 +44,26 @@ def get_scoped_guild(bot: commands.Bot, guild_id: int) -> discord.Guild:
     return guild
 
 
-async def resolve_display_name(bot: commands.Bot, guild: discord.Guild, uid: int) -> str:
+def cached_display_name(bot: discord.Client, guild: discord.Guild, uid: int) -> str | None:
+    """Sync cache-only display name; None when unknown (caller placeholders).
+
+    No API fetch is ever performed: guild member cache, then the user cache,
+    then the already-available ``bot.user`` for the bot's own UID. Context
+    snapshots must use this (never the async fetch version) so participant
+    names stay stable across snapshots.
+    """
+    member = guild.get_member(uid)
+    if member is not None:
+        return member.display_name
+    user = bot.get_user(uid)
+    if user is not None:
+        return user.display_name
+    if bot.user is not None and uid == bot.user.id:
+        return bot.user.display_name
+    return None
+
+
+async def resolve_display_name(bot: discord.Client, guild: discord.Guild, uid: int) -> str:
     """Best-effort display name: guild member first, global user fallback."""
     member = guild.get_member(uid)
     if member is not None:
