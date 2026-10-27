@@ -1,4 +1,4 @@
-# MCP tools — 14 implemented (v1 + v4 + correlated turns); v2/v3 proposed
+# MCP tools — 31 implemented (v1 + v4 + correlated turns + v2/v3 admin)
 
 Scope guard (all tools): operate only on the configured `GUILD_ID`.
 Every call is audited to `audit.jsonl`. Destructive tools run without confirm
@@ -108,8 +108,8 @@ summarizing is the agent's job when it reads the outbox.
 
 ## Auto-reply correlation + guards (current: best-effort, no journal)
 
-The surface is 14 tools (12 v1/v4 names plus `read_context` and
-`record_no_reply` below). What changes versus v4 is how
+The surface is 31 tools (12 v1/v4 names plus `read_context` and
+`record_no_reply` plus the 17 v2/v3 admin tools). What changes versus v4 is how
 `send_message` correlates, how `ack_outbox` guards, and which tasks are
 protected. Delivery is best-effort: no intent journal, no receipt or trace
 verification, no uncertainty holds. A crash exactly between a Discord send /
@@ -196,10 +196,11 @@ while `queued` jobs resume normally.
 - Reply policy only: replies use `MessageReference(fail_if_not_exists=True)`.
   No AI-history/message-body deletion.
 
-## Correlated-turn tools: `read_context` + `record_no_reply` (14 total)
+## Correlated-turn tools: `read_context` + `record_no_reply` (31 total)
 
-Current source surface is 14 tools: the 12 v1/v4 names above are preserved
-with the correlation/guards, plus the 2 correlated-turn tools below.
+Current source surface is 31 tools: the 12 v1/v4 names above are preserved
+with the correlation/guards, plus the 2 correlated-turn tools below and the
+17 v2/v3 admin tools above.
 Both are verified in `src/server/core.py` (`create_server` scope) with
 `StrictInt` IDs and `responder.correlated_job` gating over the single store;
 this section states actual function contracts, not guesses.
@@ -271,30 +272,47 @@ replace the frozen Jev snapshot or automatically trigger another classification.
   evidence present), channel unavailable, source unavailable. The correlation
   nonce is NOT caller ACL; no exactly-once claim.
 
-## v2 — proposed: messages & channels
+## v2 — implemented: messages & channels
 
-| Tool | Args | Discord perm | Note |
+| Tool | Args | Returns | Discord perm |
 |---|---|---|---|
-| `read_history` | `channel_id?`, `limit?` (≤100) | Read Messages | newest-first, with author uid/kind + timestamps |
-| `edit_message` | `channel_id`, `message_id`, `content` | — (own msgs) | bot can only edit its own messages |
-| `delete_message` | `channel_id`, `message_id` | Manage Messages | single delete; audit content snippet |
-| `purge` | `channel_id`, `limit?` | Manage Messages | bulk delete; record count only, not contents |
-| `create_text_channel` | `name`, `category_id?`, `topic?` | Manage Channels | |
-| `delete_channel` | `channel_id` | Manage Channels | destructive; audit name + id |
-| `create_voice_channel` | `name`, `category_id?` | Manage Channels | |
+| `read_history` | `channel_id?` (default channel), `limit?` (1..100, default 20) | newest-first `[{message_id, author_uid, author_name, kind, content, timestamp, reply_to_message_id}]` | Read Messages |
+| `edit_message` | `message_id`, `content` (1..2000), `channel_id?` (default channel) | `{message_id, channel_id}` | — (own msgs: the bot can only edit its own messages) |
+| `delete_message` | `message_id`, `channel_id?` (default channel) | `{deleted: message_id, channel_id}` | Manage Messages |
+| `purge` | `channel_id` (required), `limit?` (1..100, default 20) | `{deleted: count}` ONLY (never contents) | Manage Messages |
+| `create_text_channel` | `name`, `category_id?`, `topic?` | `{id, name, category_id, topic, position}` | Manage Channels |
+| `create_voice_channel` | `name`, `category_id?` | `{id, name, category_id, position}` | Manage Channels |
+| `delete_channel` | `channel_id` (required; text/voice/category in the guild) | `{deleted: channel_id}` | Manage Channels |
 
-## v3 — proposed: members & roles
+`category_id`, when given, must resolve to a `CategoryChannel` in the scoped
+guild (cache lookup; anything else is a bounded error). `delete_channel`
+accepts exactly text, voice, and category channels — unlike the text-only
+scope resolver — and refuses forum/stage channels, threads, DMs, and other
+guilds' channels.
+Every description carries the identity policy; audit args are metadata only
+(ids, counts, name lengths — never message content).
 
-| Tool | Args | Discord perm | Note |
+## v3 — implemented: members & roles
+
+| Tool | Args | Returns | Discord perm |
 |---|---|---|---|
-| `get_member` | `uid` | — | nick, roles, joined_at, kind |
-| `set_nick` | `uid`, `nick?` | Manage Nicknames | empty clears |
-| `add_role` / `remove_role` | `uid`, `role_id` | Manage Roles | bot role must outrank target |
-| `create_role` | `name`, `permissions?`, `colour?`, `mentionable?` | Manage Roles | permissions as int or names — TBD |
-| `list_roles` | — | — | id/name/position/members count |
-| `timeout` | `uid`, `minutes` (0 clears) | Moderate Members | |
-| `kick` | `uid`, `reason?` | Kick Members | destructive |
-| `ban` / `unban` | `uid`, `reason?` / `uid` | Ban Members | destructive |
+| `get_member` | `uid` | `{uid, display_name, nick, kind, roles: [{id, name, position}], joined_at (ISO-8601 or null), bot}` | — |
+| `set_nick` | `uid`, `nick?` (default `""`; empty clears) | updated member payload | Manage Nicknames |
+| `add_role` / `remove_role` | `uid`, `role_id` (must exist) | updated member payload | Manage Roles |
+| `create_role` | `name`, `permissions?` (int bit field, default 0), `colour?` (int), `mentionable?` (default false) | `{id, name, position}` | Manage Roles |
+| `list_roles` | — | `[{id, name, position, member_count, mentionable}]` in position order, including @everyone | — |
+| `timeout` | `uid`, `minutes` (0 clears), `reason?` | `{uid, minutes}` | Moderate Members |
+| `kick` | `uid`, `reason?` | `{uid, kicked: true}` | Kick Members |
+| `ban` | `uid`, `reason?` (no message deletion: `delete_message_seconds=0`) | `{uid, banned: true}` | Ban Members |
+| `unban` | `uid`, `reason?` | `{uid, unbanned: true}` | Ban Members |
+
+Member lookups reuse the cache→fetch cascade (`guild.get_member`, then
+`guild.fetch_member`); unknown members and roles are bounded errors.
+`ban`/`unban` act on the user ID directly (`guild.ban`/`guild.unban` with
+a `discord.Object`) — no member resolution, so already-left users can be
+banned. `ban` never deletes message history (`delete_message_seconds=0`). Every description carries the identity
+policy; audit args are metadata only (ids, `reason_len` — never raw reason
+text). `discord.Forbidden`/`NotFound` propagate as bounded errors.
 
 ## Open questions / deferred
 
@@ -315,6 +333,8 @@ replace the frozen Jev snapshot or automatically trigger another classification.
   message appears exactly once, store-deduped), then acks. An always-on worker
   automatically POSTs a native turn per eligible event; see the correlation
   section above. This server sends no MCP push/notifications.
-- v2 (messages/channels) and v3 (members/roles) remain PROPOSED drafts —
-  v2/v3 mutation/admin/destructive operations remain proposed and untested.
-  Current source is 14 tools (12 v1/v4 + `read_context` + `record_no_reply`).
+- v2 (messages/channels) and v3 (members/roles) are IMPLEMENTED — 17 admin
+  tools verified in `src/server/admin_tools.py` (registered from
+  `src/server/core.py`) with offline fake-bot tests
+  (happy path + refusal/error per tool, purge count-only, audit
+  metadata-only). Current source is 31 tools.

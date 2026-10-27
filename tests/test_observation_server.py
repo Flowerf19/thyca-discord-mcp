@@ -406,11 +406,11 @@ def _seed_submitted(settings, mid=SOURCE_MID, job_ref="job-need-1"):
 # --- tool surface -----------------------------------------------------------------
 
 
-async def test_tool_count_14_old_12_unchanged(settings):
+async def test_tool_count_31_old_14_unchanged(settings):
     mcp = create_server(settings)
     tools = await mcp.list_tools()
     names = sorted(t.name for t in tools)
-    assert len(names) == 14
+    assert len(names) == 31
     for old in OLD_TOOLS:
         assert old in names
     assert "read_context" in names and "record_no_reply" in names

@@ -30,6 +30,7 @@ from bot import build_bot, get_scoped_guild, resolve_display_name
 from config import Settings
 from identity import ActorKind, classify_actor
 from responder import Responder
+from server.admin_tools import register_admin_tools
 from server_helpers import _coarse_error_kind, _resolve_text_channel
 from server_ticks import ErrorFn, make_auto_reply_tick, make_heartbeat_tick, make_poll_tick
 from source_messages import (
@@ -1013,6 +1014,17 @@ def create_server(settings: Settings) -> FastMCP:
             return _ok("list_members", {"limit": limit}, members)
         except Exception as exc:
             _fail("list_members", {"limit": limit}, exc)
+
+    # Admin surface (v2/v3 guild management) lives in server/admin_tools.py;
+    # registered here so MCP tool registration order is unchanged.
+    register_admin_tools(
+        mcp,
+        settings=settings,
+        bot_fn=_bot,
+        ok_fn=_ok,
+        fail_fn=_fail,
+        identity_policy=identity_policy,
+    )
 
     @mcp.tool()
     async def list_tasks() -> str:

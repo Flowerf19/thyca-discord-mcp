@@ -36,12 +36,12 @@ the distribution and CLI remain
   left `submitted` become `failed` (never resumed or re-POSTed) while
   `queued` jobs resume normally. No exactly-once or caller-ACL guarantee
   is claimed.
-- **14 MCP tools:** guild/member inspection, messages, outbox, background tasks,
-  scoped context reads, and explicit no-reply declarations. The proposed v2/v3
-  destructive/admin tool set is not implemented.
+- **31 MCP tools:** guild/member inspection, messages, outbox, background tasks,
+  scoped context reads, explicit no-reply declarations, plus the v2/v3 admin
+  set (messages/channels, members/roles).
 
 **Current scope:** the simplified source (one SQLite store, typed discord.py
-boundary, best-effort delivery) is implemented offline: `uv run pytest` 844
+boundary, best-effort delivery) is implemented offline: `uv run pytest` 899
 passed, `uv run ruff check src tests` and `ruff format --check src tests` clean.
 Do not start or restart the service without separate operational approval (deploy
 gate: archive old JSON state, seed `state.db` past current history). The V4/V5/Modum sections below preserve dated
@@ -533,13 +533,22 @@ pre-ready gateway failure surfaces instead of hanging, and tools
 | `ack_outbox` | mark entries up to a seq as read (rejects beyond latest; auto jobs additionally guarded by the worker's processed prefix) |
 | `read_context` | read approved-channel context for a correlated turn (≤20, before source) |
 | `record_no_reply` | terminally declare no reply for a correlated turn (closes the job `done` at tool time) |
+| `read_history` | newest-first channel messages with author uid/kind + timestamps |
+| `edit_message` / `delete_message` | edit own message / delete one message (default channel) |
+| `purge` | bulk delete; returns deleted count only |
+| `create_text_channel` / `create_voice_channel` / `delete_channel` | manage guild channels |
+| `get_member` / `set_nick` | member payload (nick/roles/joined_at/kind); set or clear nick |
+| `add_role` / `remove_role` / `create_role` / `list_roles` | manage and list guild roles |
+| `timeout` / `kick` / `ban` / `unban` | moderate members (ban deletes no messages) |
 
-v2 (messages/channels) and v3 (members/roles) in [docs/TOOLS.md](docs/TOOLS.md) stay
-proposed; v4 (outbox + poll tasks) is implemented. The V4 historical snapshot
-above was 12 tools; the current source is 14 tools (12 preserved +
-`read_context` and `record_no_reply`; `resolve_uncertain_drop` was removed
-with the uncertain machinery). No
-v2/v3 mutation/admin/destructive behavior is implemented or tested.
+v2 (messages/channels) and v3 (members/roles) in [docs/TOOLS.md](docs/TOOLS.md) are
+implemented. The V4 historical snapshot
+above was 12 tools; the current source is 31 tools (12 preserved +
+`read_context` and `record_no_reply` plus 17 v2/v3 admin tools;
+`resolve_uncertain_drop` was removed
+with the uncertain machinery). v2/v3 admin behavior
+is implemented and offline-tested (fake-bot happy path + refusal/error per
+tool).
 `send_message`
 gains optional `source_message_id` + `job_ref` as a both-or-neither pair
 for agent-owned auto replies (unpaired manual sends work exactly as before and are

@@ -42,17 +42,34 @@ CHANNEL_ID = 444
 EXPECTED_TOOLS = [
     "ack_outbox",
     "add_poll_task",
+    "add_role",
+    "ban",
+    "create_role",
+    "create_text_channel",
+    "create_voice_channel",
+    "delete_channel",
+    "delete_message",
+    "edit_message",
+    "get_member",
     "guild_info",
+    "kick",
     "list_members",
+    "list_roles",
     "list_tasks",
     "list_text_channels",
+    "purge",
     "read_context",
+    "read_history",
     "read_outbox",
     "record_no_reply",
     "remove_poll_task",
+    "remove_role",
     "send_message",
+    "set_nick",
     "start_task",
     "stop_task",
+    "timeout",
+    "unban",
     "whoami",
 ]
 
@@ -462,7 +479,7 @@ async def test_new_tool_descriptions_carry_essentials(settings):
 async def test_identity_policy_visible_in_tool_descriptions(settings):
     mcp = create_server(settings)
     descs = {t.name: t.description or "" for t in await mcp.list_tools()}
-    assert sorted(descs) == EXPECTED_TOOLS  # 14 tools: old 12 intact + 2 additions
+    assert sorted(descs) == EXPECTED_TOOLS  # 31 tools: 14 v1/v4 + 17 v2/v3 admin
     for name in ("whoami", "read_outbox", "send_message"):
         desc = descs[name]
         assert str(settings.owner_uid) in desc  # parameterized owner UID (222 in tests)

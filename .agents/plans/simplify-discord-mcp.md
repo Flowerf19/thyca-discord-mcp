@@ -705,6 +705,27 @@ dirty files (`participation/ledger.py`, `responder/submit.py`,
   collected** (all reductions itemized per phase above and in test-file
   headers; behavior kernels preserved per two independent reviews);
   15 -> 14 MCP tools (only `resolve_uncertain_drop`, §5.3).
+- **Deploy prep executed (owner order 2026-10-27, "seed sẵn, bạn tự
+  start Thyca"):** old state archived to `archive-20261027-pre-sqlite/`
+  (4 JSON files, originals moved, restorable); `state.db` seeded via a
+  rehearsed one-off procedure (rehearsal on `/tmp/rehearsal.db` first:
+  seed + idempotent-refusal + Responder construction gate all passed).
+  Seed values: `native_sid=2026-10-26T14-34-15_d6b3` (last live SID from
+  old delivery state), `acked=seq_high_water=612` (old latest),
+  poll cursor = newest channel message from one `history(limit=1)`
+  Discord REST read = `1564199602301960243` — identical to the old
+  cursor, proving zero messages arrived during downtime. Verified on
+  the real DB: `quick_check=ok`, `user_version=2`, mode 0600,
+  `Responder` construction with real `.env` settings passes the
+  startup gate, `git check-ignore state.db` OK. `.env` carries only 6
+  keys (no stale removed keys to purge). **Not yet started:** Thyca
+  daemon is down; the owner starts it as usual and Thyca will spawn
+  `.venv/bin/thyca-discord-mcp` (PYTHONPATH=src + editable .pth) running
+  the new build. Remaining at first start (owner-observed smoke):
+  first tick adopts the live DM SID if it has moved (drain-gated,
+  tested behavior), owner message -> one threaded reply, restart once
+  -> no duplicate. Rollback: stop, checkout `a309191`, restore the 4
+  archived files, remove `state.db*`, restart old flow.
 - Per-phase line counts and test counts: _record at each gate_
 
 ## 7. Status of this plan
