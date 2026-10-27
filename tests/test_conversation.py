@@ -22,9 +22,7 @@ from conversation import (
     project_conversation_state,
 )
 
-FIXTURE_PATH = (
-    Path(__file__).resolve().parent.parent / "experiments" / "jev_conversation" / "cases.json"
-)
+FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "jev_conversation_cases.json"
 RUNNER_PATH = (
     Path(__file__).resolve().parent.parent / "experiments" / "jev_conversation" / "run_eval.py"
 )

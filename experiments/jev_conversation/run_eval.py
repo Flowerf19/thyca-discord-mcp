@@ -99,7 +99,7 @@ def project_root() -> Path:
 
 
 def default_cases_path() -> Path:
-    return script_dir() / "cases.json"
+    return project_root() / "tests" / "fixtures" / "jev_conversation_cases.json"
 
 
 # ---------------------------------------------------------------------------
