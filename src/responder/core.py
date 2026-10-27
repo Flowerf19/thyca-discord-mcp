@@ -67,8 +67,11 @@ from .input import (
     _validate_id_string,
     validate_entry,
 )
-from .submit import (  # noqa: F401 - intentional canonical re-exports
+from .routing import (  # noqa: F401 - intentional canonical re-exports
     _VALID_PARTICIPATIONS,
+    ResponderRoutingMixin,
+)
+from .submit import (  # noqa: F401 - intentional canonical re-exports
     ResponderSubmitMixin,
     _sha256_hex,
 )
@@ -87,7 +90,7 @@ _SAFE_TERMINAL = _ALL_TERMINAL
 # Jev routing: participation values that POST to native Thyca. ``observe``
 # never POSTs (durable zero-send terminal instead).
 _ROUTED_POST_PARTICIPATIONS = frozenset({"respond", "need_context"})
-# _VALID_PARTICIPATIONS canonical in responder_submit; _sha256_hex canonical
+# _VALID_PARTICIPATIONS canonical in responder.routing; _sha256_hex canonical
 # in validate (both imported above for internal use).
 
 
@@ -124,7 +127,7 @@ def _is_native_not_found(exc: ThycaClientError) -> bool:
     return isinstance(exc, ThycaPreconditionError) and exc.status_code == 404
 
 
-class Responder(ResponderSubmitMixin):
+class Responder(ResponderSubmitMixin, ResponderRoutingMixin):
     """FIFO worker + ACK controller (no sends, no scheduler, no session mgmt)."""
 
     def __init__(

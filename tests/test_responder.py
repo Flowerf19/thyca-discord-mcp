@@ -341,6 +341,7 @@ def test_import_has_no_side_effects(tmp_path):
         "responder",
         "responder.core",
         "responder.submit",
+        "responder.routing",
         "responder.input",
     }
 

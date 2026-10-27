@@ -97,59 +97,17 @@ collector, exactly once per dependency (no retries).
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 import discord
 
 from bot import cached_display_name, get_scoped_guild
-from conversation import ConversationError, project_conversation_state
 from source_messages import SourceDeleted, _resolve_text_channel, is_unknown_message
-from thyca import ThycaPromptError, build_conversation_prompt
 from validate import is_strict_int as _is_strict_int
 from validate import is_strict_positive_int as _is_strict_positive_int
 
-MAX_MESSAGES_LIMIT = 20
-FIT_NONCE = "f" * 32
-FIT_HASH = "f" * 64
-
-__all__ = [
-    "FIT_HASH",
-    "FIT_NONCE",
-    "MAX_MESSAGES_LIMIT",
-    "ContextUnavailable",
-    "SourceDeleted",
-    "build_context_collector",
-    "context_fingerprint",
-]
-
-
-class ContextUnavailable(ValueError):
-    """Bounded context failure (never carries raw bodies or provider text)."""
-
-
-# ``SourceDeleted`` is intentionally NOT redeclared here: the name above is the
-# authoritative ``source_messages.SourceDeleted`` object,
-# re-exported so the router and the existing checker catch the same class.
-
-
-def _placeholder_name(uid: int) -> str:
-    return f"uid-{uid}"
-
-
-def context_fingerprint(state: Mapping[str, Any]) -> str:
-    """Return the SHA-256 hex of the canonical projected JSON for ``state``.
-
-    Accepts raw caller state or an already-projected snapshot; the state is
-    validated through :func:`conversation.project_conversation_state`
-    (unknown/gold keys dropped, :class:`ConversationError` on violations).
-    The input is never mutated; the hash covers the detached snapshot only.
-    """
-    snapshot = project_conversation_state(state)
-    canonical = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+from .snapshot import MAX_MESSAGES_LIMIT, ContextUnavailable, fit_and_project
 
 
 def _validate_builder_ids(
@@ -256,6 +214,28 @@ def _reference_parent(
     return parent_mid, False
 
 
+def _message_record(message: discord.Message, channel_id: int, guild_id: int) -> dict[str, Any]:
+    """Assemble one pool record for ``message`` (scope-checked).
+
+    Single construction site for the history, resolved-parent, and
+    fetched-parent records (same fields). Scope failures raise
+    :class:`ContextUnavailable`; future/duplicate/mismatch/order checks
+    stay at the call sites, in their original sequencing.
+    """
+    mid, author_uid, text, name = _message_scope(message, guild_id, channel_id)
+    timestamp = _message_timestamp(message)
+    reply_to, cross = _reference_parent(message, channel_id, guild_id)
+    return {
+        "id": mid,
+        "sender_uid": author_uid,
+        "text": text,
+        "name": name,
+        "timestamp": timestamp,
+        "reply_to": reply_to,
+        "cross": cross,
+    }
+
+
 async def _fetch_source(channel: discord.TextChannel, mid: int) -> discord.Message:
     try:
         return await channel.fetch_message(mid)
@@ -357,24 +337,16 @@ def build_context_collector(
         # Verify every history message; reject future/dup/scope.
         seen: dict[int, dict[str, Any]] = {}
         for raw in history_messages:
-            hid, huid, htext, hname = _message_scope(raw, guild_id, channel_id)
+            item = _message_record(raw, channel_id, guild_id)
+            hid = item["id"]
             if hid >= mid:
                 raise ContextUnavailable("context history holds future message") from None
             if hid in seen:
                 raise ContextUnavailable("context history holds duplicate") from None
-            hts = _message_timestamp(raw)
-            hparent, hcross = _reference_parent(raw, channel_id, guild_id)
+            hparent, hcross = item["reply_to"], item["cross"]
             if hparent is not None and not hcross and hparent >= hid:
                 raise ContextUnavailable("context history parent order invalid") from None
-            seen[hid] = {
-                "id": hid,
-                "sender_uid": huid,
-                "text": htext,
-                "name": hname,
-                "timestamp": hts,
-                "reply_to": hparent,
-                "cross": hcross,
-            }
+            seen[hid] = item
 
         parent_extra: dict[str, Any] | None = None
         parent_visible = False
@@ -388,46 +360,30 @@ def build_context_collector(
                     else None
                 )
                 if isinstance(resolved, discord.Message):
-                    pid, puid, ptext, pname = _message_scope(resolved, guild_id, channel_id)
+                    record = _message_record(resolved, channel_id, guild_id)
+                    pid = record["id"]
                     if pid != source_parent:
                         raise ContextUnavailable("context parent id mismatch") from None
                     if pid >= mid:
                         raise ContextUnavailable("context parent order invalid") from None
-                    pts = _message_timestamp(resolved)
-                    pparent, pcross = _reference_parent(resolved, channel_id, guild_id)
+                    pparent, pcross = record["reply_to"], record["cross"]
                     if pparent is not None and not pcross and pparent >= pid:
                         raise ContextUnavailable("context parent order invalid") from None
-                    parent_extra = {
-                        "id": pid,
-                        "sender_uid": puid,
-                        "text": ptext,
-                        "name": pname,
-                        "timestamp": pts,
-                        "reply_to": pparent,
-                        "cross": pcross,
-                    }
+                    parent_extra = record
                     parent_visible = True
                 elif resolved is None:
                     fetched = await _fetch_parent(channel, source_parent)
                     if fetched is not None:
-                        pid, puid, ptext, pname = _message_scope(fetched, guild_id, channel_id)
+                        record = _message_record(fetched, channel_id, guild_id)
+                        pid = record["id"]
                         if pid != source_parent:
                             raise ContextUnavailable("context parent id mismatch") from None
                         if pid >= mid:
                             raise ContextUnavailable("context parent order invalid") from None
-                        pts = _message_timestamp(fetched)
-                        pparent, pcross = _reference_parent(fetched, channel_id, guild_id)
+                        pparent, pcross = record["reply_to"], record["cross"]
                         if pparent is not None and not pcross and pparent >= pid:
                             raise ContextUnavailable("context parent order invalid") from None
-                        parent_extra = {
-                            "id": pid,
-                            "sender_uid": puid,
-                            "text": ptext,
-                            "name": pname,
-                            "timestamp": pts,
-                            "reply_to": pparent,
-                            "cross": pcross,
-                        }
+                        parent_extra = record
                         parent_visible = True
                 # else: DeletedReferencedMessage stays missing (reply_to kept).
 
@@ -456,101 +412,30 @@ def build_context_collector(
                 raise ContextUnavailable("context mandatory pair exceeds cap") from None
             del optional[drop_at]
 
-        # Newest display name wins per UID (rename-safe, still exact SDK text).
-        def _participants_for(pool: list[dict[str, Any]]) -> list[dict[str, str]]:
-            newest_name: dict[int, str] = {}
-            # Pool is ascending; later (newer) overwrites older.
-            for item in pool:
-                newest_name[item["sender_uid"]] = item["name"]
-            # Source is newest overall.
-            newest_name[author_uid] = got_name
-            uids: set[int] = {item["sender_uid"] for item in pool}
-            uids.add(author_uid)
-            uids.add(owner_uid)
-            uids.add(bot_uid)
-            parts: list[dict[str, str]] = []
-            for uid in sorted(uids):
-                if uid in newest_name:
-                    parts.append({"uid": str(uid), "display_name": newest_name[uid]})
-                    continue
-                cached = cached_display_name(bot, guild, uid)
-                parts.append({"uid": str(uid), "display_name": cached or _placeholder_name(uid)})
-            return parts
-
-        def _messages_for(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            ordered = sorted(pool, key=lambda item: item["id"])
-            out: list[dict[str, Any]] = []
-            for item in ordered:
-                msg: dict[str, Any] = {
-                    "id": str(item["id"]),
-                    "sender_uid": str(item["sender_uid"]),
-                    "text": item["text"],
-                }
-                if item["reply_to"] is not None:
-                    msg["reply_to"] = str(item["reply_to"])
-                msg["timestamp"] = item["timestamp"]
-                out.append(msg)
-            current: dict[str, Any] = {
-                "id": str(mid),
-                "sender_uid": str(author_uid),
-                "text": content,
-            }
-            if source_parent is not None:
-                current["reply_to"] = str(source_parent)
-            current["timestamp"] = source_ts
-            out.append(current)
-            return out
-
         renderer_entry = {
             "channel_id": channel_id,
             "message_id": mid,
             "author_uid": author_uid,
             "content": content,
         }
-        # Fit loop: full newest-first candidate, then drop the oldest
-        # OPTIONAL only until BOTH actual routed prompts (respond and
-        # need_context) render via the real renderer. Bodies are never
-        # truncated; mandatory pair never drops. No guessed reserve.
-        pool = list(optional)
-        while True:
-            candidate = {
-                "assistant_uid": str(bot_uid),
-                "owner_uid": str(owner_uid),
-                "participants": _participants_for(pool),
-                "messages": _messages_for(pool),
-                "new_message_id": str(mid),
-            }
-            try:
-                for participation in ("respond", "need_context"):
-                    build_conversation_prompt(
-                        candidate,
-                        dict(renderer_entry),
-                        FIT_NONCE,
-                        owner_uid=owner_uid,
-                        guild_id=guild_id,
-                        bot_uid=bot_uid,
-                        participation=participation,
-                        context_sha256=FIT_HASH,
-                    )
-            except ConversationError:
-                raise ContextUnavailable("context snapshot invalid") from None
-            except ThycaPromptError as exc:
-                message = str(exc)
-                if "exceeds limit" not in message:
-                    raise ContextUnavailable("context snapshot invalid") from None
-                drop_at = None
-                for item in sorted(pool, key=lambda i: i["id"]):
-                    if item["id"] not in mandatory_ids:
-                        # Map back to pool order (pool stays ascending).
-                        drop_at = pool.index(item)
-                        break
-                if drop_at is None:
-                    raise ContextUnavailable("context mandatory pair oversize") from None
-                del pool[drop_at]
-                continue
-            try:
-                return project_conversation_state(candidate)
-            except ConversationError:
-                raise ContextUnavailable("context snapshot invalid") from None
+
+        def _fallback_name(uid: int) -> str | None:
+            return cached_display_name(bot, guild, uid)
+
+        return fit_and_project(
+            optional,
+            mandatory_ids=mandatory_ids,
+            renderer_entry=renderer_entry,
+            owner_uid=owner_uid,
+            guild_id=guild_id,
+            bot_uid=bot_uid,
+            author_uid=author_uid,
+            author_name=got_name,
+            message_id=mid,
+            content=content,
+            reply_to=source_parent,
+            timestamp=source_ts,
+            fallback_name=_fallback_name,
+        )
 
     return collect

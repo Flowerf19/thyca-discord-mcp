@@ -3,6 +3,7 @@
 Canonical re-exports of the previous :mod:`responder` surface.
 Internal layout: :mod:`responder.core` (orchestrator),
 :mod:`responder.submit` (pre-POST submit mixin),
+:mod:`responder.routing` (routing-validation mixin),
 :mod:`responder.input` (pure input validation).
 """
 

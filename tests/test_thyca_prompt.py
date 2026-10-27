@@ -529,8 +529,8 @@ def test_oversize_error_never_echoes_raw_body():
 
 
 def test_module_imports_stay_pure():
-    path = Path(__file__).resolve().parent.parent / "src" / "thyca.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    paths = sorted((Path(__file__).resolve().parent.parent / "src" / "thyca").glob("*.py"))
+    assert paths, "thyca package modules missing"
     allowed = {
         "asyncio",
         "datetime",
@@ -552,31 +552,33 @@ def test_module_imports_stay_pure():
         # no I/O -- same purity property as conversation).
         "validate",
     }
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                assert alias.name in {
-                    "asyncio",
-                    "hashlib",
-                    "http.client",
-                    "ipaddress",
-                    "json",
-                    "math",
-                    "re",
-                    "urllib.error",
-                    "urllib.parse",
-                    "urllib.request",
-                    "collections",
-                    "typing",
-                }, alias.name
-        elif isinstance(node, ast.ImportFrom):
-            assert node.level > 0 or node.module in allowed, node.module
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if stripped.startswith(("import ", "from ")):
-            for forbidden in ("typesafe", " os", "os.", "sys", "socket"):
-                assert forbidden not in stripped, stripped
-            # Package backstop (the AST allowlist above is authoritative): the
-            # module is flat under src/ now, so only the canonical absolute
-            # projection import may name it.
-            assert "modum" not in stripped, stripped
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name in {
+                        "asyncio",
+                        "hashlib",
+                        "http.client",
+                        "ipaddress",
+                        "json",
+                        "math",
+                        "re",
+                        "urllib.error",
+                        "urllib.parse",
+                        "urllib.request",
+                        "collections",
+                        "typing",
+                    }, (path.name, alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                assert node.level > 0 or node.module in allowed, (path.name, node.module)
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("import ", "from ")):
+                for forbidden in ("typesafe", " os", "os.", "sys", "socket"):
+                    assert forbidden not in stripped, (path.name, stripped)
+                # Package backstop (the AST allowlist above is authoritative):
+                # only relative intra-package imports plus the canonical
+                # absolute projection import may name a module.
+                assert "modum" not in stripped, (path.name, stripped)

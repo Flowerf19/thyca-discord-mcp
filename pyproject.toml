@@ -26,24 +26,21 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/participation", "src/responder", "src/server"]
+packages = ["src/context", "src/jev", "src/participation", "src/responder", "src/server", "src/thyca"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/audit.py" = "audit.py"
 "src/bot.py" = "bot.py"
 "src/config.py" = "config.py"
-"src/context.py" = "context.py"
 "src/conversation.py" = "conversation.py"
 "src/identity.py" = "identity.py"
 "src/instance_lock.py" = "instance_lock.py"
-"src/jev.py" = "jev.py"
 "src/main.py" = "main.py"
 "src/store.py" = "store.py"
 "src/server_helpers.py" = "server_helpers.py"
 "src/server_ticks.py" = "server_ticks.py"
 "src/source_messages.py" = "source_messages.py"
 "src/tasks.py" = "tasks.py"
-"src/thyca.py" = "thyca.py"
 "src/validate.py" = "validate.py"
 
 [tool.pytest.ini_options]
