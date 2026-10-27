@@ -41,7 +41,7 @@ the distribution and CLI remain
   set (messages/channels, members/roles).
 
 **Current scope:** the simplified source (one SQLite store, typed discord.py
-boundary, best-effort delivery) is implemented offline: `uv run pytest` 899
+boundary, best-effort delivery) is implemented offline: `uv run pytest` 910
 passed, `uv run ruff check src tests` and `ruff format --check src tests` clean.
 Do not start or restart the service without separate operational approval (deploy
 gate: archive old JSON state, seed `state.db` past current history). The V4/V5/Modum sections below preserve dated

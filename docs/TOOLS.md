@@ -201,8 +201,9 @@ while `queued` jobs resume normally.
 Current source surface is 31 tools: the 12 v1/v4 names above are preserved
 with the correlation/guards, plus the 2 correlated-turn tools below and the
 17 v2/v3 admin tools above.
-Both are verified in `src/server/core.py` (`create_server` scope) with
-`StrictInt` IDs and `responder.correlated_job` gating over the single store;
+Both are verified in `src/server/correlated.py` (registered from
+`src/server/core.py`'s `create_server` scope) with `StrictInt` IDs and
+`responder.correlated_job` gating over the single store;
 this section states actual function contracts, not guesses.
 (`resolve_uncertain_drop` was removed with the uncertain machinery: restart
 auto-fails `submitted` jobs, so the operator-drop tool has no purpose.)

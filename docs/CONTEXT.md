@@ -239,11 +239,11 @@ still return; there is no per-source allowlist. See [the example configuration](
 | Canonical projection and reply status | [`conversation.py`](../src/conversation.py) |
 | Scoped collection, mandatory parent, fit, fingerprint | [`context/`](../src/context/collector.py), [`context/snapshot.py`](../src/context/snapshot.py) |
 | Jev participation adapter | [`jev/`](../src/jev/adapter.py) |
-| Durable classification/cache/accounting | [`participation/ledger.py`](../src/participation/ledger.py) over the `jev_decisions` table in [`store.py`](../src/store.py) |
+| Durable classification/cache/accounting | [`participation/ledger.py`](../src/participation/ledger.py) over the `jev_decisions` table in [`store/`](../src/store/) |
 | Prepaid/postpaid guards and routing | [`responder/`](../src/responder/core.py), [`responder/submit.py`](../src/responder/submit.py), [`responder/routing.py`](../src/responder/routing.py) |
-| Target-bot DM adoption (drain gate, reconcile pass, provenance) | [`responder/core.py`](../src/responder/core.py), `sessions` table in [`store.py`](../src/store.py); native SID/day validation at the Thyca boundary in [`thyca/validation.py`](../src/thyca/validation.py) |
+| Target-bot DM adoption (drain gate, reconcile pass, provenance) | [`responder/core.py`](../src/responder/core.py), `sessions` table in [`store/`](../src/store/); native SID/day validation at the Thyca boundary in [`thyca/validation.py`](../src/thyca/validation.py) |
 | Trusted frame and untrusted JSON rendering | [`thyca/prompt.py`](../src/thyca/prompt.py) |
-| MCP context/declaration tools | [`server/`](../src/server/core.py), [tool contracts](TOOLS.md) |
+| MCP context/declaration tools | [`server/core.py`](../src/server/core.py) (registration + audit closures), correlated send cluster in [`server/correlated.py`](../src/server/correlated.py), [tool contracts](TOOLS.md) |
 
 Relevant source tests run offline with fake identities/providers and owned TMP
 state; synthetic local HTTP loopback is allowed:
