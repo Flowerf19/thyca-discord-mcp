@@ -87,8 +87,8 @@ _SAFE_TERMINAL = _ALL_TERMINAL
 # Jev routing: participation values that POST to native Thyca. ``observe``
 # never POSTs (durable zero-send terminal instead).
 _ROUTED_POST_PARTICIPATIONS = frozenset({"respond", "need_context"})
-# _VALID_PARTICIPATIONS + _sha256_hex canonical in responder_submit
-# (imported above for internal use).
+# _VALID_PARTICIPATIONS canonical in responder_submit; _sha256_hex canonical
+# in validate (both imported above for internal use).
 
 
 def _ho_chi_minh_today() -> str:

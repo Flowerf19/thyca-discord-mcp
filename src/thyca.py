@@ -10,7 +10,6 @@ poll remains). Import from here, e.g.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import http.client
 import ipaddress
 import json
@@ -24,8 +23,12 @@ from datetime import date as _date
 from typing import Any
 
 from conversation import new_message_reply_status, project_conversation_state
+from validate import ID_MAX
+from validate import is_sha256_hex as _is_sha256_hex
 from validate import is_strict_int as _is_strict_int
 from validate import is_strict_positive_int as _is_strict_positive_int
+from validate import sha256_hex as _sha256_hex
+from validate import validate_id_string as _validate_id_string
 
 # === merged from thyca_errors.py (verbatim) ===
 
@@ -284,10 +287,6 @@ def _as_discord_id(value: Any) -> int | None:
     return None
 
 
-def _sha256_hex(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 def _turn_slice_counts(messages: list[dict]) -> tuple[int, list[int], int | None]:
     """Authoritative user-turn grouping (mirrors native turn_slices).
 
@@ -501,7 +500,6 @@ def sync_http_request(
 
 PROMPT_MAX = 4000
 CONTENT_MAX = 2000
-ID_MAX = 128
 
 __all__ = [
     "CONTENT_MAX",
@@ -514,20 +512,6 @@ __all__ = [
 
 class ThycaPromptError(ValueError):
     """Bounded prompt failure (never carries raw bodies or provider text)."""
-
-
-def _validate_id_string(value: Any) -> str | None:
-    """Nonce guard mirroring the existing native bound: 1..128, no whitespace."""
-    if not isinstance(value, str):
-        return None
-    if not (1 <= len(value) <= ID_MAX):
-        return None
-    if value.strip() != value or not value:
-        return None
-    for ch in value:
-        if ch.isspace():
-            return None
-    return value
 
 
 _POLICY = (
@@ -587,16 +571,6 @@ def _routed_task(participation: str, context_sha256: str) -> str:
         "agent-owned send only, no plain fallback. NEVER ack/start/stop/remove "
         "tasks, NEVER create sessions, NEVER filesystem profiles."
     )
-
-
-def _is_sha256_hex(value: Any) -> bool:
-    """Exact 64-char hex (context fingerprint); stdlib-free manual check."""
-    if not isinstance(value, str) or len(value) != 64:
-        return False
-    for ch in value:
-        if ch not in "0123456789abcdefABCDEF":
-            return False
-    return True
 
 
 def _validated_frame(

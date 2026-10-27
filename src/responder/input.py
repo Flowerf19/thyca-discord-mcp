@@ -1,10 +1,13 @@
 """Pure responder input validation (no I/O, no Root state).
 
 Canonical owner of :class:`ResponderError`, the strict metadata helpers,
-``ID_MAX``, and the pure historical/entry frame predicates. The orchestrator
-(:mod:`responder`) imports and re-exports these names so
-existing ``responder.ResponderError`` / ``responder._is_strict_*`` imports
-keep working with identical object identity.
+and the pure historical/entry frame predicates. ``ID_MAX`` and
+``_validate_id_string`` are re-exported from :mod:`validate` (the shared
+stdlib-only home) so existing ``responder.*`` imports keep working with
+identical object identity. The orchestrator (:mod:`responder`) imports
+and re-exports these names so existing ``responder.ResponderError`` /
+``responder._is_strict_*`` imports keep working with identical object
+identity.
 
 No I/O and no private Root is passed here: callers supply explicit UIDs.
 """
@@ -14,27 +17,16 @@ from __future__ import annotations
 from typing import Any
 
 from identity import classify_actor
+from validate import ID_MAX  # noqa: F401 - re-exported via responder
 from validate import is_strict_int as _is_strict_int  # noqa: F401 - re-exported via responder
 from validate import is_strict_positive_int as _is_strict_positive_int
-
-ID_MAX = 128
+from validate import (
+    validate_id_string as _validate_id_string,  # noqa: F401 - re-exported via responder
+)
 
 
 class ResponderError(ValueError):
     """Coarse responder failure (never carries raw bodies or provider text)."""
-
-
-def _validate_id_string(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    if not (1 <= len(value) <= ID_MAX):
-        return None
-    if value.strip() != value or not value:
-        return None
-    for ch in value:
-        if ch.isspace():
-            return None
-    return value
 
 
 def validate_entry(entry: Any, *, bot_uid: int, owner_uid: int) -> dict[str, Any]:

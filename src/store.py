@@ -75,6 +75,8 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+from collections.abc import Callable, Collection, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -425,6 +427,70 @@ class Store:
 
     # -- internal helpers (sync, never across await) --
 
+    @contextmanager
+    def _txn(self):
+        """One BEGIN IMMEDIATE/COMMIT block with best-effort ROLLBACK (internal).
+
+        Same caller-visible semantics as the hand-rolled blocks it replaces:
+        ``BEGIN IMMEDIATE`` on entry, ``COMMIT`` on clean exit, best-effort
+        ``ROLLBACK`` + re-raise on any exception (including a ``COMMIT``
+        failure). One internal difference: snapshot reads that HEAD ran
+        after a mid-body COMMIT now run inside the txn, and durability lands
+        at the exit COMMIT. Unobservable under the single-instance /
+        single-loop connection model; crash outcomes converge via the
+        idempotent transitions + the restart sweep. Never held across an
+        ``await``.
+        """
+        self._conn.execute("BEGIN IMMEDIATE;")
+        try:
+            yield
+            self._conn.execute("COMMIT;")
+        except Exception:
+            try:
+                self._conn.execute("ROLLBACK;")
+            except Exception:
+                pass
+            raise
+
+    def _transition_job(
+        self,
+        channel_id: int,
+        message_id: int,
+        *,
+        allowed: Collection[str],
+        stage_error: Callable[[object], str],
+        statements: Sequence[tuple[str, tuple[Any, ...]]],
+        extra_guard: Callable[[sqlite3.Row], None] | None = None,
+        race_error: str | None = None,
+        idempotent: Callable[[sqlite3.Row], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Shared job-transition skeleton: require row -> stage guard -> write -> dict.
+
+        One transaction: require the job row, return the snapshot early when
+        ``idempotent`` matches (already in the target state), deny stages
+        outside ``allowed`` via ``stage_error(stage)``, run caller-specific
+        pre-write checks (``extra_guard``), execute ``statements`` in order,
+        re-read and return the job dict. When ``race_error`` is given the
+        LAST statement must affect exactly one row. Every denial message is
+        built by the caller, so guards stay explicit at each call site.
+        """
+        with self._txn():
+            row = self._require_job_row(channel_id, message_id)
+            if idempotent is not None and idempotent(row):
+                return self._job_dict(row)
+            if row["stage"] not in allowed:
+                raise StoreError(stage_error(row["stage"]))
+            if extra_guard is not None:
+                extra_guard(row)
+            cur = None
+            for sql, params in statements:
+                cur = self._conn.execute(sql, params)
+            if race_error is not None and (cur is None or cur.rowcount != 1):
+                raise StoreError(race_error)
+            updated = self._get_job_row(channel_id, message_id)
+            assert updated is not None
+            return self._job_dict(updated)
+
     def _state(self) -> tuple[int, int]:
         row = self._conn.execute("SELECT acked, seq_high_water FROM state WHERE id=1;").fetchone()
         if row is None:
@@ -554,19 +620,11 @@ class Store:
         missing = [name for name in _REQUIRED_ENTRY_FIELDS if name not in fields]
         if missing:
             raise StoreError(f"append_entry missing required fields: {', '.join(missing)}")
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
+        with self._txn():
             _acked, high_water = self._state()
             entry, _new_high = self._insert_one(dict(fields), high_water)
             assert entry is not None
-            self._conn.execute("COMMIT;")
             return entry
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
 
     def append_poll_batch(
         self, channel_id: int, items: list[dict[str, Any]], last_message_id: int
@@ -586,8 +644,7 @@ class Store:
             or last_message_id < 0
         ):
             raise StoreError(f"poll cursor must be a non-negative int, got {last_message_id!r}")
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
+        with self._txn():
             _acked, high_water = self._state()
             out: list[dict[str, Any]] = []
             for fields in items:
@@ -605,14 +662,7 @@ class Store:
                     " SET last_message_id=excluded.last_message_id;",
                     (channel_id, last_message_id),
                 )
-            self._conn.execute("COMMIT;")
             return out
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
 
     def read_entries(self, limit: int = 50, unread_only: bool = True) -> dict[str, Any]:
         """Read entries ascending by seq (oldest first when truncated).
@@ -654,22 +704,14 @@ class Store:
             raise StoreError(f"ack up_to_seq must be an int, got {type(up_to_seq).__name__}")
         if up_to_seq < 0:
             raise StoreError(f"ack up_to_seq must be >= 0, got {up_to_seq}")
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
+        with self._txn():
             acked, high_water = self._state()
             if up_to_seq > high_water:
                 raise StoreError(f"ack up_to_seq {up_to_seq} beyond latest seq {high_water}")
             new_acked = max(acked, up_to_seq)
             if new_acked != acked:
                 self._conn.execute("UPDATE state SET acked=? WHERE id=1;", (new_acked,))
-            self._conn.execute("COMMIT;")
             return new_acked
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
 
     def get_poll_cursor(self, channel_id: int) -> int | None:
         """Last polled message id for a channel, or None when never polled."""
@@ -684,8 +726,7 @@ class Store:
             raise StoreError(f"poll channel_id must be an int, got {type(channel_id).__name__}")
         if isinstance(last_id, bool) or not isinstance(last_id, int) or last_id < 0:
             raise StoreError(f"poll cursor must be a non-negative int, got {last_id!r}")
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
+        with self._txn():
             self._conn.execute(
                 "INSERT INTO poll_cursors (channel_id, last_message_id)"
                 " VALUES (?, ?)"
@@ -693,14 +734,7 @@ class Store:
                 " SET last_message_id=excluded.last_message_id;",
                 (channel_id, last_id),
             )
-            self._conn.execute("COMMIT;")
             return last_id
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
 
     # -- jobs API (v2) --
 
@@ -722,8 +756,7 @@ class Store:
             raise StoreError(f"store {self._path}: invalid skip_reason {skip_reason!r}")
         stage = "skipped" if skip_reason is not None else "queued"
         now = _now_iso()
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
+        with self._txn():
             try:
                 self._conn.execute(
                     "INSERT INTO jobs (channel_id, message_id, seq, stage, skip_reason,"
@@ -734,14 +767,7 @@ class Store:
                 raise StoreError(f"store {self._path}: cannot enqueue job ({exc})") from None
             row = self._get_job_row(channel_id, message_id)
             assert row is not None
-            self._conn.execute("COMMIT;")
             return self._job_dict(row)
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
 
     def get_job(self, channel_id: int, message_id: int) -> dict[str, Any] | None:
         """Return the job snapshot (with send evidence + Jev row), or None."""
@@ -823,29 +849,21 @@ class Store:
             or pre_turn_index < 0
         ):
             raise StoreError(f"store {self._path}: pre_turn_index must be None or seq >= 0")
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
-            row = self._require_job_row(channel_id, message_id)
-            if row["stage"] != "queued":
-                raise StoreError(f"store {self._path}: cannot submit job in stage {row['stage']!r}")
-            cur = self._conn.execute(
-                "UPDATE jobs SET stage='submitted', job_ref=?, native_sid=?,"
-                " pre_turn_index=?, updated_at=? WHERE channel_id=? AND message_id=?"
-                " AND stage='queued';",
-                (job_ref, native_sid, pre_turn_index, _now_iso(), channel_id, message_id),
-            )
-            if cur.rowcount != 1:
-                raise StoreError(f"store {self._path}: submit lost a race")
-            updated = self._get_job_row(channel_id, message_id)
-            assert updated is not None
-            self._conn.execute("COMMIT;")
-            return self._job_dict(updated)
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
+        return self._transition_job(
+            channel_id,
+            message_id,
+            allowed={"queued"},
+            stage_error=lambda stage: f"store {self._path}: cannot submit job in stage {stage!r}",
+            statements=[
+                (
+                    "UPDATE jobs SET stage='submitted', job_ref=?, native_sid=?,"
+                    " pre_turn_index=?, updated_at=? WHERE channel_id=? AND message_id=?"
+                    " AND stage='queued';",
+                    (job_ref, native_sid, pre_turn_index, _now_iso(), channel_id, message_id),
+                )
+            ],
+            race_error=f"store {self._path}: submit lost a race",
+        )
 
     def requeue(self, channel_id: int, message_id: int) -> dict[str, Any]:
         """Move ``submitted`` -> ``queued`` after a definitive native 409.
@@ -855,30 +873,25 @@ class Store:
         attempt mints a fresh nonce. An already-``queued`` job fails
         explicitly (never a silent reset).
         """
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
-            row = self._require_job_row(channel_id, message_id)
-            if row["stage"] != "submitted":
-                raise StoreError(
-                    f"store {self._path}: cannot requeue job in stage {row['stage']!r}"
-                )
+
+        def _no_sends(row: sqlite3.Row) -> None:
             if self._sends_for(channel_id, message_id):
                 raise StoreError(f"store {self._path}: cannot requeue job with sends")
-            self._conn.execute(
-                "UPDATE jobs SET stage='queued', job_ref=NULL, pre_turn_index=NULL,"
-                " updated_at=? WHERE channel_id=? AND message_id=? AND stage='submitted';",
-                (_now_iso(), channel_id, message_id),
-            )
-            updated = self._get_job_row(channel_id, message_id)
-            assert updated is not None
-            self._conn.execute("COMMIT;")
-            return self._job_dict(updated)
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
+
+        return self._transition_job(
+            channel_id,
+            message_id,
+            allowed={"submitted"},
+            stage_error=lambda stage: f"store {self._path}: cannot requeue job in stage {stage!r}",
+            statements=[
+                (
+                    "UPDATE jobs SET stage='queued', job_ref=NULL, pre_turn_index=NULL,"
+                    " updated_at=? WHERE channel_id=? AND message_id=? AND stage='submitted';",
+                    (_now_iso(), channel_id, message_id),
+                )
+            ],
+            extra_guard=_no_sends,
+        )
 
     def record_send(
         self, channel_id: int, message_id: int, *, job_ref: str, sent_message_id: int
@@ -899,31 +912,30 @@ class Store:
             or sent_message_id <= 0
         ):
             raise StoreError(f"store {self._path}: sent_message_id must be a positive int")
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
-            row = self._require_job_row(channel_id, message_id)
-            if row["job_ref"] != job_ref or row["stage"] not in ("submitted", "sent"):
+
+        def _ref_match(row: sqlite3.Row) -> None:
+            if row["job_ref"] != job_ref:
                 raise StoreError(f"store {self._path}: send not eligible (stage {row['stage']!r})")
-            self._conn.execute(
-                "UPDATE jobs SET stage='sent', updated_at=? WHERE channel_id=?"
-                " AND message_id=? AND job_ref=? AND stage IN ('submitted','sent');",
-                (_now_iso(), channel_id, message_id, job_ref),
-            )
-            self._conn.execute(
-                "INSERT OR IGNORE INTO sends (channel_id, message_id, sent_message_id,"
-                " created_at) VALUES (?, ?, ?, ?);",
-                (channel_id, message_id, sent_message_id, _now_iso()),
-            )
-            updated = self._get_job_row(channel_id, message_id)
-            assert updated is not None
-            self._conn.execute("COMMIT;")
-            return self._job_dict(updated)
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
+
+        return self._transition_job(
+            channel_id,
+            message_id,
+            allowed={"submitted", "sent"},
+            stage_error=lambda stage: f"store {self._path}: send not eligible (stage {stage!r})",
+            statements=[
+                (
+                    "UPDATE jobs SET stage='sent', updated_at=? WHERE channel_id=?"
+                    " AND message_id=? AND job_ref=? AND stage IN ('submitted','sent');",
+                    (_now_iso(), channel_id, message_id, job_ref),
+                ),
+                (
+                    "INSERT OR IGNORE INTO sends (channel_id, message_id, sent_message_id,"
+                    " created_at) VALUES (?, ?, ?, ?);",
+                    (channel_id, message_id, sent_message_id, _now_iso()),
+                ),
+            ],
+            extra_guard=_ref_match,
+        )
 
     def skip_job(self, channel_id: int, message_id: int, *, reason: str) -> dict[str, Any]:
         """Move to ``skipped`` with zero send evidence (one conditional txn).
@@ -934,36 +946,34 @@ class Store:
         """
         if reason not in SKIP_REASONS:
             raise StoreError(f"store {self._path}: invalid skip_reason {reason!r}")
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
-            row = self._require_job_row(channel_id, message_id)
-            if row["stage"] == "skipped" and row["skip_reason"] == reason:
-                self._conn.execute("COMMIT;")
-                return self._job_dict(row)
-            if row["stage"] not in ("queued", "submitted", "sent"):
-                raise StoreError(f"store {self._path}: cannot skip job in stage {row['stage']!r}")
+
+        def _no_sends(row: sqlite3.Row) -> None:
             if self._sends_for(channel_id, message_id):
                 raise StoreError(f"store {self._path}: cannot skip job with sends")
-            self._conn.execute(
-                "UPDATE jobs SET stage='skipped', skip_reason=?, updated_at=?"
-                " WHERE channel_id=? AND message_id=?"
-                " AND stage IN ('queued','submitted','sent')"
-                " AND NOT EXISTS (SELECT 1 FROM sends s WHERE s.channel_id=jobs.channel_id"
-                " AND s.message_id=jobs.message_id);",
-                (reason, _now_iso(), channel_id, message_id),
-            )
-            updated = self._get_job_row(channel_id, message_id)
-            assert updated is not None
-            if updated["stage"] != "skipped":
-                raise StoreError(f"store {self._path}: skip lost a race")
-            self._conn.execute("COMMIT;")
-            return self._job_dict(updated)
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
+
+        return self._transition_job(
+            channel_id,
+            message_id,
+            allowed={"queued", "submitted", "sent"},
+            stage_error=lambda stage: f"store {self._path}: cannot skip job in stage {stage!r}",
+            statements=[
+                (
+                    "UPDATE jobs SET stage='skipped', skip_reason=?, updated_at=?"
+                    " WHERE channel_id=? AND message_id=?"
+                    " AND stage IN ('queued','submitted','sent')"
+                    " AND NOT EXISTS (SELECT 1 FROM sends s WHERE s.channel_id=jobs.channel_id"
+                    " AND s.message_id=jobs.message_id);",
+                    (reason, _now_iso(), channel_id, message_id),
+                )
+            ],
+            extra_guard=_no_sends,
+            # The original re-read ``updated["stage"] != "skipped"`` check is
+            # expressed as a rowcount check: the conditional UPDATE above is
+            # the sole in-txn writer, so ``rowcount != 1`` holds exactly when
+            # the re-read would not show ``skipped``. Same message.
+            race_error=f"store {self._path}: skip lost a race",
+            idempotent=lambda row: row["stage"] == "skipped" and row["skip_reason"] == reason,
+        )
 
     def mark_failed(
         self,
@@ -986,31 +996,24 @@ class Store:
             isinstance(http_status, bool) or not isinstance(http_status, int)
         ):
             raise StoreError(f"store {self._path}: http_status must be an int or None")
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
-            row = self._require_job_row(channel_id, message_id)
-            if row["stage"] == "failed":
-                self._conn.execute("COMMIT;")
-                return self._job_dict(row)
-            if row["stage"] not in ("queued", "submitted", "sent"):
-                raise StoreError(f"store {self._path}: cannot fail job in stage {row['stage']!r}")
-            self._conn.execute(
-                "UPDATE jobs SET stage='failed', fail_kind=?, http_status=?, updated_at=?"
-                " WHERE channel_id=? AND message_id=? AND stage IN ('queued','submitted','sent');",
-                (kind, http_status, _now_iso(), channel_id, message_id),
-            )
-            updated = self._get_job_row(channel_id, message_id)
-            assert updated is not None
-            if updated["stage"] != "failed":
-                raise StoreError(f"store {self._path}: fail lost a race")
-            self._conn.execute("COMMIT;")
-            return self._job_dict(updated)
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
+        return self._transition_job(
+            channel_id,
+            message_id,
+            allowed={"queued", "submitted", "sent"},
+            stage_error=lambda stage: f"store {self._path}: cannot fail job in stage {stage!r}",
+            statements=[
+                (
+                    "UPDATE jobs SET stage='failed', fail_kind=?, http_status=?,"
+                    " updated_at=? WHERE channel_id=? AND message_id=?"
+                    " AND stage IN ('queued','submitted','sent');",
+                    (kind, http_status, _now_iso(), channel_id, message_id),
+                )
+            ],
+            # As in skip_job: the original re-read ``!= "failed"`` check is
+            # exactly the conditional UPDATE affecting zero rows. Same message.
+            race_error=f"store {self._path}: fail lost a race",
+            idempotent=lambda row: row["stage"] == "failed",
+        )
 
     def complete_job(self, channel_id: int, message_id: int, *, outcome: str) -> dict[str, Any]:
         """Close a job as ``done`` with a terminal outcome (stage-guarded txn).
@@ -1024,39 +1027,39 @@ class Store:
         """
         if outcome not in JOB_OUTCOMES:
             raise StoreError(f"store {self._path}: invalid outcome {outcome!r}")
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
-            row = self._require_job_row(channel_id, message_id)
-            if row["stage"] == "done" and row["outcome"] == outcome:
-                self._conn.execute("COMMIT;")
-                return self._job_dict(row)
+
+        def _deny(stage: object) -> str:
+            return (
+                f"store {self._path}: cannot complete job in stage"
+                f" {stage!r} with outcome {outcome!r}"
+            )
+
+        def _eligible(row: sqlite3.Row) -> None:
             sends = self._sends_for(channel_id, message_id)
             if outcome == "sent":
-                eligible = row["stage"] in ("submitted", "sent") and len(sends) >= 1
+                ok = row["stage"] in ("submitted", "sent") and len(sends) >= 1
             elif outcome == "no_reply":
-                eligible = row["stage"] in ("submitted", "sent") and len(sends) == 0
+                ok = row["stage"] in ("submitted", "sent") and len(sends) == 0
             else:  # observed
-                eligible = row["stage"] == "queued"
-            if not eligible:
-                raise StoreError(
-                    f"store {self._path}: cannot complete job in stage"
-                    f" {row['stage']!r} with outcome {outcome!r}"
+                ok = row["stage"] == "queued"
+            if not ok:
+                raise StoreError(_deny(row["stage"]))
+
+        return self._transition_job(
+            channel_id,
+            message_id,
+            allowed={"queued", "submitted", "sent"},
+            stage_error=_deny,
+            statements=[
+                (
+                    "UPDATE jobs SET stage='done', outcome=?, updated_at=?"
+                    " WHERE channel_id=? AND message_id=?;",
+                    (outcome, _now_iso(), channel_id, message_id),
                 )
-            self._conn.execute(
-                "UPDATE jobs SET stage='done', outcome=?, updated_at=?"
-                " WHERE channel_id=? AND message_id=?;",
-                (outcome, _now_iso(), channel_id, message_id),
-            )
-            updated = self._get_job_row(channel_id, message_id)
-            assert updated is not None
-            self._conn.execute("COMMIT;")
-            return self._job_dict(updated)
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
+            ],
+            extra_guard=_eligible,
+            idempotent=lambda row: row["stage"] == "done" and row["outcome"] == outcome,
+        )
 
     def sweep_submitted_failed(self) -> int:
         """Restart recovery: fail jobs left ``submitted`` (never resume/re-POST).
@@ -1065,22 +1068,14 @@ class Store:
         once at responder startup, never inside ``Store.open`` (opens
         happen per operation; sweeping on open would fail live jobs).
         """
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
+        with self._txn():
             cur = self._conn.execute(
                 "UPDATE jobs SET stage='failed', fail_kind='restart', http_status=NULL,"
                 " updated_at=? WHERE stage='submitted';",
                 (_now_iso(),),
             )
             count = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
-            self._conn.execute("COMMIT;")
             return count
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
 
     # -- sessions / native SID --
 
@@ -1110,8 +1105,7 @@ class Store:
             _check_sid(expected_current, self._path)
         _check_sid(new_sid, self._path)
         _check_day(day, self._path)
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
+        with self._txn():
             row = self._conn.execute("SELECT native_sid FROM state WHERE id=1;").fetchone()
             if row is None:
                 raise StoreError(f"corrupt database {self._path}: missing singleton state row")
@@ -1131,14 +1125,7 @@ class Store:
                 " adopted_at=excluded.adopted_at;",
                 (day, new_sid, now),
             )
-            self._conn.execute("COMMIT;")
             return new_sid
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
 
     # -- Jev decisions --
 
@@ -1179,8 +1166,7 @@ class Store:
             raise StoreError(f"store {self._path}: invalid attempt_id")
         _check_day(attempted_day, self._path)
         now = _now_iso()
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
+        with self._txn():
             try:
                 self._conn.execute(
                     "INSERT INTO jev_decisions (channel_id, message_id, context_sha256,"
@@ -1205,14 +1191,7 @@ class Store:
                 (channel_id, message_id),
             ).fetchone()
             assert row is not None
-            self._conn.execute("COMMIT;")
             return _row_to_jev(row)
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
 
     def bump_jev_retry(
         self,
@@ -1233,8 +1212,7 @@ class Store:
         if not isinstance(new_attempt_id, str) or not new_attempt_id:
             raise StoreError(f"store {self._path}: invalid attempt_id")
         _check_day(attempted_day, self._path)
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
+        with self._txn():
             self._require_job_row(channel_id, message_id)
             cur = self._conn.execute(
                 "UPDATE jev_decisions SET attempts=2, attempt_id=?, attempted_day=?,"
@@ -1256,14 +1234,7 @@ class Store:
                 (channel_id, message_id),
             ).fetchone()
             assert row is not None
-            self._conn.execute("COMMIT;")
             return _row_to_jev(row)
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
 
     def resolve_jev(
         self,
@@ -1307,8 +1278,7 @@ class Store:
             participation = None
         if answers_json is not None and not isinstance(answers_json, str):
             raise StoreError(f"store {self._path}: answers_json must be a string or None")
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
+        with self._txn():
             self._require_job_row(channel_id, message_id)
             cur = self._conn.execute(
                 "UPDATE jev_decisions SET status=?, participation=?, input_tokens=?,"
@@ -1333,14 +1303,7 @@ class Store:
                 (channel_id, message_id),
             ).fetchone()
             assert row is not None
-            self._conn.execute("COMMIT;")
             return _row_to_jev(row)
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
 
     def mark_jev_observe(
         self,
@@ -1360,8 +1323,7 @@ class Store:
         for the same ``(channel_id, message_id)``. Already-observed is
         idempotent.
         """
-        self._conn.execute("BEGIN IMMEDIATE;")
-        try:
+        with self._txn():
             row = self._require_job_row(channel_id, message_id)
             jev_row = self._conn.execute(
                 "SELECT * FROM jev_decisions WHERE channel_id=? AND message_id=?;",
@@ -1375,7 +1337,8 @@ class Store:
                 and row["stage"] == "done"
                 and row["outcome"] == "observed"
             ):
-                self._conn.execute("COMMIT;")
+                # Idempotent early return: the single exit COMMIT covers it,
+                # so no mid-body COMMIT is needed.
                 return _row_to_jev(jev_row)
             for name, value in (("input_tokens", input_tokens), ("output_tokens", output_tokens)):
                 if value is not None and (
@@ -1405,14 +1368,7 @@ class Store:
                 (channel_id, message_id),
             ).fetchone()
             assert updated is not None
-            self._conn.execute("COMMIT;")
             return _row_to_jev(updated)
-        except Exception:
-            try:
-                self._conn.execute("ROLLBACK;")
-            except Exception:
-                pass
-            raise
 
     def jev_cost_for_day(self, day: str) -> str:
         """Canonical cost string for one billing day (decided + known + lower-bound)."""

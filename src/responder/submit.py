@@ -4,8 +4,9 @@ Owns the submit-path methods: the after-await freshness guard, the routing
 snapshot and ledger decision validators, the participation-hold mapper,
 the zero-send observe terminal, the queued submit driver, and the
 definitive-409 busy requeue. Also canonical owner of
-``_VALID_PARTICIPATIONS`` and ``_sha256_hex`` (``responder`` re-exports
-both so existing imports keep working with identical object identity).
+``_VALID_PARTICIPATIONS`` (``responder`` re-exports it so existing imports
+keep working with identical object identity); ``_sha256_hex`` is
+re-exported from :mod:`validate` (the shared stdlib-only home).
 
 The Jev paid decision resolves inside the ledger (conditional
 pending->decided/failed over the store); the job side needs no separate
@@ -30,7 +31,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import uuid
 from typing import Any
 
@@ -57,6 +57,7 @@ from thyca import (
     ThycaSubmissionUncertainError,
     build_conversation_prompt,
 )
+from validate import sha256_hex as _sha256_hex  # noqa: F401 - re-exported via responder
 
 from .input import ResponderError, _is_strict_int, _validate_id_string
 
@@ -65,10 +66,6 @@ from .input import ResponderError, _is_strict_int, _validate_id_string
 # from the provider (its criteria are respond|observe) but stays valid:
 # seeded flows and the agent contract reference the turn shape.
 _VALID_PARTICIPATIONS = frozenset({"respond", "observe", "need_context"})
-
-
-def _sha256_hex(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _source_message_of(projected: Any, message_id: int) -> dict[str, Any] | None:
